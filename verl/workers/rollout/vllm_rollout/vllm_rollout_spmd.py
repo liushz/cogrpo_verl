@@ -826,24 +826,31 @@ class vLLMRollout(BaseRollout):
             return DataProto(batch=empty_batch, non_tensor_batch={}, meta_info=meta_info)
         
         # Route to appropriate intervention mode
-        if intervention_mode == "by_response":
-            return self._dual_stream_rollout_by_response(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask, 
-                position_ids, eos_token_id, batch_size, **kwargs
-            )
-        elif intervention_mode == "by_token":
-            return self._dual_stream_rollout_by_token(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-                position_ids, eos_token_id, batch_size, token_check_interval,
-                entropy_threshold, use_entropy_filter, **kwargs
-            )
-        elif intervention_mode == "by_step":
+        # TEMP: Disable by_response and by_token to focus on debugging by_step
+        # if intervention_mode == "by_response":
+        #     return self._dual_stream_rollout_by_response(
+        #         prompts, timing_info, start_time, tokenizer, idx, attention_mask,
+        #         position_ids, eos_token_id, batch_size, **kwargs
+        #     )
+        # elif intervention_mode == "by_token":
+        #     return self._dual_stream_rollout_by_token(
+        #         prompts, timing_info, start_time, tokenizer, idx, attention_mask,
+        #         position_ids, eos_token_id, batch_size, token_check_interval,
+        #         entropy_threshold, use_entropy_filter, **kwargs
+        #     )
+        # elif intervention_mode == "by_step":
+        if intervention_mode == "by_step":
             return self._dual_stream_rollout_by_step(
                 prompts, timing_info, start_time, tokenizer, idx, attention_mask,
                 position_ids, eos_token_id, batch_size, **kwargs
             )
         else:
-            raise ValueError(f"Unknown intervention_mode: {intervention_mode}. Must be one of: by_response, by_token, by_step")
+            # Fallback: Force by_step mode for debugging
+            logger.warning(f"intervention_mode={intervention_mode} not supported yet, forcing by_step mode")
+            return self._dual_stream_rollout_by_step(
+                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
+                position_ids, eos_token_id, batch_size, **kwargs
+            )
     
     def _dual_stream_rollout_by_response(
         self, prompts, timing_info, start_time, tokenizer, idx, attention_mask,
@@ -881,25 +888,13 @@ class vLLMRollout(BaseRollout):
         else:
             control_kwargs = {}
 
-        # 2. Co-GRPO double repetition detection and correction
+        # 2. Co-GRPO: Force n=1 to avoid double repetition
+        # In Co-GRPO, trainer already repeats gen_batch BEFORE calling dual_stream_rollout
+        # So we MUST use n=1 here, otherwise vLLM will repeat again causing batch_size mismatch
         if do_sample and not is_validate and self.sampling_params.n > 1:
             target_n = self.sampling_params.n
-            # Use function parameter batch_size - it's the most accurate tensor dimension
-            current_batch_size = batch_size
-
-            # Detection logic:
-            # If current batch size is a multiple of target_n AND >= target_n,
-            # we have high confidence that Trainer already did repeat operation
-            if current_batch_size >= target_n and current_batch_size % target_n == 0:
-                logger.info(f"Co-GRPO: Detected pre-repeated batch (size={current_batch_size}, n={target_n}). "
-                            f"Forcing vLLM n=1 to avoid double repetition.")
-                control_kwargs["n"] = 1
-            else:
-                # If not a multiple relationship, this might be a raw batch needing vLLM to do n-times sampling
-                # Note: This is rare in Co-GRPO training but may happen during inference or debugging small batches
-                logger.info(f"Co-GRPO: Detected raw batch (size={current_batch_size}, n={target_n}). "
-                            f"Delegating repetition to vLLM.")
-                control_kwargs["n"] = target_n
+            logger.info(f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})")
+            control_kwargs["n"] = 1
 
         # =================================================================
         # FIX END
@@ -1563,12 +1558,12 @@ class vLLMRollout(BaseRollout):
         # Full incremental generation requires vLLM API changes
         logger.warning(
             "by_token mode is not fully implemented yet due to vLLM API limitations. "
-            "Falling back to by_response mode. "
+            "Falling back to by_step mode. "
             "Full implementation requires incremental generation support."
         )
-        
-        # Use by_response as fallback
-        return self._dual_stream_rollout_by_response(
+
+        # Use by_step as fallback
+        return self._dual_stream_rollout_by_step(
             prompts, timing_info, start_time, tokenizer, idx, attention_mask,
             position_ids, eos_token_id, batch_size, **kwargs
         )
@@ -1614,25 +1609,13 @@ class vLLMRollout(BaseRollout):
         else:
             control_kwargs = {}
 
-        # 2. Co-GRPO double repetition detection and correction
+        # 2. Co-GRPO: Force n=1 to avoid double repetition
+        # In Co-GRPO, trainer already repeats gen_batch BEFORE calling dual_stream_rollout
+        # So we MUST use n=1 here, otherwise vLLM will repeat again causing batch_size mismatch
         if do_sample and not is_validate and self.sampling_params.n > 1:
             target_n = self.sampling_params.n
-            # Use function parameter batch_size - it's the most accurate tensor dimension
-            current_batch_size = batch_size
-
-            # Detection logic:
-            # If current batch size is a multiple of target_n AND >= target_n,
-            # we have high confidence that Trainer already did repeat operation
-            if current_batch_size >= target_n and current_batch_size % target_n == 0:
-                logger.info(f"Co-GRPO: Detected pre-repeated batch (size={current_batch_size}, n={target_n}). "
-                            f"Forcing vLLM n=1 to avoid double repetition.")
-                control_kwargs["n"] = 1
-            else:
-                # If not a multiple relationship, this might be a raw batch needing vLLM to do n-times sampling
-                # Note: This is rare in Co-GRPO training but may happen during inference or debugging small batches
-                logger.info(f"Co-GRPO: Detected raw batch (size={current_batch_size}, n={target_n}). "
-                            f"Delegating repetition to vLLM.")
-                control_kwargs["n"] = target_n
+            logger.info(f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})")
+            control_kwargs["n"] = 1
 
         # =================================================================
         # FIX END
@@ -1690,11 +1673,10 @@ class vLLMRollout(BaseRollout):
         # 1. 获取停止配置
         stop_config = self._get_step_boundary_stop_config(tokenizer, eos_token_id)
         if not stop_config['stop_sequences'] and not stop_config['stop_token_ids']:
-            logger.warning("No stop sequences found, falling back to by_response mode")
-            return self._dual_stream_rollout_by_response(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-                position_ids, eos_token_id, batch_size, **kwargs
-            )
+            logger.warning("No stop sequences found, using full generation without step boundaries")
+            # Fall back to simple full generation (continue without step interruption)
+            # Don't fallback to by_response as it's disabled for debugging
+            pass  # Continue with full generation
         
         logger.info(f"Stop config: token_ids={stop_config['stop_token_ids']}, sequences={stop_config['stop_sequences']}")
         
@@ -2299,290 +2281,302 @@ class vLLMAsyncRollout:
             return DataProto(batch=empty_batch, non_tensor_batch={}, meta_info=meta_info)
         
         # Route to appropriate intervention mode
-        if intervention_mode == "by_response":
-            return self._dual_stream_rollout_by_response(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask, 
-                position_ids, eos_token_id, batch_size, **kwargs
-            )
-        elif intervention_mode == "by_step":
+        # TEMP: Disable by_response and by_token to focus on debugging by_step
+        # if intervention_mode == "by_response":
+        #     return self._dual_stream_rollout_by_response(
+        #         prompts, timing_info, start_time, tokenizer, idx, attention_mask,
+        #         position_ids, eos_token_id, batch_size, **kwargs
+        #     )
+        # elif intervention_mode == "by_token":
+        #     return self._dual_stream_rollout_by_token(
+        #         prompts, timing_info, start_time, tokenizer, idx, attention_mask,
+        #         position_ids, eos_token_id, batch_size, token_check_interval,
+        #         entropy_threshold, use_entropy_filter, **kwargs
+        #     )
+        # elif intervention_mode == "by_step":
+        if intervention_mode == "by_step":
             return self._dual_stream_rollout_by_step(
                 prompts, timing_info, start_time, tokenizer, idx, attention_mask,
                 position_ids, eos_token_id, batch_size, **kwargs
             )
-        elif intervention_mode == "by_token":
-            logger.warning(
-                "by_token mode is not fully implemented yet. Falling back to by_response mode."
-            )
-
-    def _dual_stream_rollout_by_response(
-        self, prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-        position_ids, eos_token_id, batch_size, **kwargs
-    ) -> DataProto:
-        """
-        Original by_response mode: Generate complete response, then Verifier intervenes.
-        This is the default implementation.
-        """
-        # ========== Control Stream: Policy generates without guidance ==========
-        idx_list = []
-        for i in range(batch_size):
-            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
-
-        do_sample = prompts.meta_info.get("do_sample", True)
-        is_validate = prompts.meta_info.get("validate", False)
-
-        # =================================================================
-        # FIX START: Robust Batch Size Check for Co-GRPO
-        # =================================================================
-
-        # 1. Basic configuration
-        if not do_sample:
-            control_kwargs = {
-                "best_of": 1, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
-                "temperature": 0, "n": 1,
-            }
-        elif is_validate:
-            control_kwargs = {
-                "top_k": self.config.val_kwargs.top_k,
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
-                "n": 1,
-            }
         else:
-            control_kwargs = {}
-
-        # 2. Co-GRPO double repetition detection and correction
-        if do_sample and not is_validate and self.sampling_params.n > 1:
-            target_n = self.sampling_params.n
-            # Use function parameter batch_size - it's the most accurate tensor dimension
-            current_batch_size = batch_size
-
-            # Detection logic:
-            # If current batch size is a multiple of target_n AND >= target_n,
-            # we have high confidence that Trainer already did repeat operation
-            if current_batch_size >= target_n and current_batch_size % target_n == 0:
-                logger.info(f"Co-GRPO: Detected pre-repeated batch (size={current_batch_size}, n={target_n}). "
-                            f"Forcing vLLM n=1 to avoid double repetition.")
-                control_kwargs["n"] = 1
-            else:
-                # If not a multiple relationship, this might be a raw batch needing vLLM to do n-times sampling
-                # Note: This is rare in Co-GRPO training but may happen during inference or debugging small batches
-                logger.info(f"Co-GRPO: Detected raw batch (size={current_batch_size}, n={target_n}). "
-                            f"Delegating repetition to vLLM.")
-                control_kwargs["n"] = target_n
-
-        # =================================================================
-        # FIX END
-        # =================================================================
-
-        # Generate control responses (no LoRA)
-        control_start = time.time()
-        with self.update_sampling_params(**control_kwargs):
-            control_output = self.inference_engine.generate(
-                prompts=None,
-                sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
-                lora_request=None,  # No LoRA for control stream
-                use_tqdm=False,
+            # Fallback: Force by_step mode for debugging
+            logger.warning(f"intervention_mode={intervention_mode} not supported yet, forcing by_step mode")
+            return self._dual_stream_rollout_by_step(
+                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
+                position_ids, eos_token_id, batch_size, **kwargs
             )
-        
-        control_responses, control_log_probs = _extract_vllm_outputs(
-            control_output, self.pad_token_id, self.config.response_length, idx.device
-        )
-        timing_info["control_gen"] = time.time() - control_start
 
-        # Handle num_generation_per_prompt > 1 case
-        # IMPORTANT: Check if batch was already repeated by trainer (for Co-GRPO)
-        # In Co-GRPO, trainer repeats gen_batch before calling dual_stream_rollout
-        # So we should NOT repeat again here to avoid double repetition
-        if self.sampling_params.n > 1 and do_sample:
-            n = self.sampling_params.n
-            # Check if batch was already repeated by checking if batch_size is a multiple of n
-            # If batch_size >= n and is divisible by n, it was likely pre-repeated by trainer
-            if batch_size % n == 0 and batch_size >= n:
-                # Batch was already repeated by trainer, don't repeat again
-                logger.info(f"Co-GRPO: Batch already repeated by trainer (size={batch_size}, n={n}), skipping rollout-side repeat")
-            else:
-                # Normal case: repeat batch in rollout
-                idx = _repeat_interleave(idx, n)
-                attention_mask = _repeat_interleave(attention_mask, n)
-                position_ids = _repeat_interleave(position_ids, n)
-                # Repeat idx_list to match the expanded batch size
-                idx_list = idx_list * n
-                batch_size = batch_size * n
-                logger.info(f"Co-GRPO: Repeated batch in rollout (new size={batch_size})")
+    # def _dual_stream_rollout_by_response(
+    #     self, prompts, timing_info, start_time, tokenizer, idx, attention_mask,
+    #     position_ids, eos_token_id, batch_size, **kwargs
+    # ) -> DataProto:
+    #     """
+    #     Original by_response mode: Generate complete response, then Verifier intervenes.
+    #     This is the default implementation.
+    #     """
+    #     # ========== Control Stream: Policy generates without guidance ==========
+    #     idx_list = []
+    #     for i in range(batch_size):
+    #         idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
-        # ========== Experimental Stream: Policy -> Verifier -> Policy ==========
-        # Step 1: Policy generates initial draft (CoT)
-        draft_start = time.time()
-        draft_kwargs = control_kwargs.copy()
-        # IMPORTANT: After batch expansion, we need n=1 for experimental stream
-        # to avoid generating too many responses
-        if do_sample and not is_validate:
-            draft_kwargs["n"] = 1
-        logger.info(f"DEBUG by_response: draft_kwargs={draft_kwargs}, len(idx_list)={len(idx_list)}, sampling_params.n={self.sampling_params.n}")
-        with self.update_sampling_params(**draft_kwargs):
-            logger.info(f"DEBUG by_response: INSIDE context - sampling_params.n={self.sampling_params.n}")
-            draft_output = self.inference_engine.generate(
-                prompts=None,
-                sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
-                lora_request=None,  # No LoRA for initial draft
-                use_tqdm=False,
-            )
-            logger.info(f"DEBUG by_response: AFTER draft generation - len(draft_output)={len(draft_output)}")
-        
-        draft_responses, draft_log_probs = _extract_vllm_outputs(
-            draft_output, self.pad_token_id, self.config.response_length, idx.device
-        )
-        
-        if draft_responses.shape[1] < self.config.response_length:
-            draft_responses = pad_sequence_to_length(draft_responses, self.config.response_length, self.pad_token_id)
-            draft_log_probs = pad_sequence_to_length(draft_log_probs, self.config.response_length, self.pad_token_id)
-        timing_info["draft_gen"] = time.time() - draft_start
+    #     do_sample = prompts.meta_info.get("do_sample", True)
+    #     is_validate = prompts.meta_info.get("validate", False)
 
-        # Step 2: Decode draft responses and construct Verifier input
-        # Format: System prompt + Task instruction + Question + Student Response
-        draft_texts = []
-        prompt_texts = []
-        for i in range(batch_size):
-            prompt_text = tokenizer.decode(idx[i][attention_mask[i].bool()], skip_special_tokens=True)
-            draft_text = tokenizer.decode(draft_responses[i], skip_special_tokens=True)
-            prompt_texts.append(prompt_text)
-            draft_texts.append(draft_text)
+    #     # =================================================================
+    #     # FIX START: Robust Batch Size Check for Co-GRPO
+    #     # =================================================================
+
+    #     # 1. Basic configuration
+    #     if not do_sample:
+    #         control_kwargs = {
+    #             "best_of": 1, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
+    #             "temperature": 0, "n": 1,
+    #         }
+    #     elif is_validate:
+    #         control_kwargs = {
+    #             "top_k": self.config.val_kwargs.top_k,
+    #             "top_p": self.config.val_kwargs.top_p,
+    #             "temperature": self.config.val_kwargs.temperature,
+    #             "n": 1,
+    #         }
+    #     else:
+    #         control_kwargs = {}
+
+    #     # 2. Co-GRPO double repetition detection and correction
+    #     if do_sample and not is_validate and self.sampling_params.n > 1:
+    #         target_n = self.sampling_params.n
+    #         # Use function parameter batch_size - it's the most accurate tensor dimension
+    #         current_batch_size = batch_size
+
+    #         # Detection logic:
+    #         # If current batch size is a multiple of target_n AND >= target_n,
+    #         # we have high confidence that Trainer already did repeat operation
+    #         if current_batch_size >= target_n and current_batch_size % target_n == 0:
+    #             logger.info(f"Co-GRPO: Detected pre-repeated batch (size={current_batch_size}, n={target_n}). "
+    #                         f"Forcing vLLM n=1 to avoid double repetition.")
+    #             control_kwargs["n"] = 1
+    #         else:
+    #             # If not a multiple relationship, this might be a raw batch needing vLLM to do n-times sampling
+    #             # Note: This is rare in Co-GRPO training but may happen during inference or debugging small batches
+    #             logger.info(f"Co-GRPO: Detected raw batch (size={current_batch_size}, n={target_n}). "
+    #                         f"Delegating repetition to vLLM.")
+    #             control_kwargs["n"] = target_n
+
+    #     # =================================================================
+    #     # FIX END
+    #     # =================================================================
+
+    #     # Generate control responses (no LoRA)
+    #     control_start = time.time()
+    #     with self.update_sampling_params(**control_kwargs):
+    #         control_output = self.inference_engine.generate(
+    #             prompts=None,
+    #             sampling_params=self.sampling_params,
+    #             prompt_token_ids=idx_list,
+    #             lora_request=None,  # No LoRA for control stream
+    #             use_tqdm=False,
+    #         )
         
-        # Construct Verifier input with system prompt and task instruction
-        # Format matches format_training_data.py: system -> user (intervene_prompt + question + student response)
-        verifier_inputs = []
-        for prompt, draft in zip(prompt_texts, draft_texts):
-            # Construct user content: intervene_prompt + question + student response
-            user_content = f"{VERIFIER_INTERVENE_PROMPT} Question: {prompt}\n\nStudent Response: {draft}"
+    #     control_responses, control_log_probs = _extract_vllm_outputs(
+    #         control_output, self.pad_token_id, self.config.response_length, idx.device
+    #     )
+    #     timing_info["control_gen"] = time.time() - control_start
+
+    #     # Handle num_generation_per_prompt > 1 case
+    #     # IMPORTANT: Check if batch was already repeated by trainer (for Co-GRPO)
+    #     # In Co-GRPO, trainer repeats gen_batch before calling dual_stream_rollout
+    #     # So we should NOT repeat again here to avoid double repetition
+    #     if self.sampling_params.n > 1 and do_sample:
+    #         n = self.sampling_params.n
+    #         # Check if batch was already repeated by checking if batch_size is a multiple of n
+    #         # If batch_size >= n and is divisible by n, it was likely pre-repeated by trainer
+    #         if batch_size % n == 0 and batch_size >= n:
+    #             # Batch was already repeated by trainer, don't repeat again
+    #             logger.info(f"Co-GRPO: Batch already repeated by trainer (size={batch_size}, n={n}), skipping rollout-side repeat")
+    #         else:
+    #             # Normal case: repeat batch in rollout
+    #             idx = _repeat_interleave(idx, n)
+    #             attention_mask = _repeat_interleave(attention_mask, n)
+    #             position_ids = _repeat_interleave(position_ids, n)
+    #             # Repeat idx_list to match the expanded batch size
+    #             idx_list = idx_list * n
+    #             batch_size = batch_size * n
+    #             logger.info(f"Co-GRPO: Repeated batch in rollout (new size={batch_size})")
+
+    #     # ========== Experimental Stream: Policy -> Verifier -> Policy ==========
+    #     # Step 1: Policy generates initial draft (CoT)
+    #     draft_start = time.time()
+    #     draft_kwargs = control_kwargs.copy()
+    #     # IMPORTANT: After batch expansion, we need n=1 for experimental stream
+    #     # to avoid generating too many responses
+    #     if do_sample and not is_validate:
+    #         draft_kwargs["n"] = 1
+    #     logger.info(f"DEBUG by_response: draft_kwargs={draft_kwargs}, len(idx_list)={len(idx_list)}, sampling_params.n={self.sampling_params.n}")
+    #     with self.update_sampling_params(**draft_kwargs):
+    #         logger.info(f"DEBUG by_response: INSIDE context - sampling_params.n={self.sampling_params.n}")
+    #         draft_output = self.inference_engine.generate(
+    #             prompts=None,
+    #             sampling_params=self.sampling_params,
+    #             prompt_token_ids=idx_list,
+    #             lora_request=None,  # No LoRA for initial draft
+    #             use_tqdm=False,
+    #         )
+    #         logger.info(f"DEBUG by_response: AFTER draft generation - len(draft_output)={len(draft_output)}")
+        
+    #     draft_responses, draft_log_probs = _extract_vllm_outputs(
+    #         draft_output, self.pad_token_id, self.config.response_length, idx.device
+    #     )
+        
+    #     if draft_responses.shape[1] < self.config.response_length:
+    #         draft_responses = pad_sequence_to_length(draft_responses, self.config.response_length, self.pad_token_id)
+    #         draft_log_probs = pad_sequence_to_length(draft_log_probs, self.config.response_length, self.pad_token_id)
+    #     timing_info["draft_gen"] = time.time() - draft_start
+
+    #     # Step 2: Decode draft responses and construct Verifier input
+    #     # Format: System prompt + Task instruction + Question + Student Response
+    #     draft_texts = []
+    #     prompt_texts = []
+    #     for i in range(batch_size):
+    #         prompt_text = tokenizer.decode(idx[i][attention_mask[i].bool()], skip_special_tokens=True)
+    #         draft_text = tokenizer.decode(draft_responses[i], skip_special_tokens=True)
+    #         prompt_texts.append(prompt_text)
+    #         draft_texts.append(draft_text)
+        
+    #     # Construct Verifier input with system prompt and task instruction
+    #     # Format matches format_training_data.py: system -> user (intervene_prompt + question + student response)
+    #     verifier_inputs = []
+    #     for prompt, draft in zip(prompt_texts, draft_texts):
+    #         # Construct user content: intervene_prompt + question + student response
+    #         user_content = f"{VERIFIER_INTERVENE_PROMPT} Question: {prompt}\n\nStudent Response: {draft}"
             
-            # For vLLM, concatenate system and user prompts
-            verifier_prompt = f"{VERIFIER_SYSTEM_PROMPT}\n\n{user_content}"
-            verifier_inputs.append(verifier_prompt)
+    #         # For vLLM, concatenate system and user prompts
+    #         verifier_prompt = f"{VERIFIER_SYSTEM_PROMPT}\n\n{user_content}"
+    #         verifier_inputs.append(verifier_prompt)
         
-        # Tokenize Verifier inputs
-        verifier_encoded = tokenizer(
-            verifier_inputs,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.prompt_length + self.config.response_length,
-        )
-        verifier_input_ids = verifier_encoded["input_ids"].to(idx.device)
-        verifier_attention_mask = verifier_encoded["attention_mask"].to(idx.device)
+    #     # Tokenize Verifier inputs
+    #     verifier_encoded = tokenizer(
+    #         verifier_inputs,
+    #         return_tensors="pt",
+    #         padding=True,
+    #         truncation=True,
+    #         max_length=self.config.prompt_length + self.config.response_length,
+    #     )
+    #     verifier_input_ids = verifier_encoded["input_ids"].to(idx.device)
+    #     verifier_attention_mask = verifier_encoded["attention_mask"].to(idx.device)
         
-        # Convert to list format for vLLM
-        verifier_idx_list = []
-        for i in range(batch_size):
-            verifier_idx_list.append(_pre_process_inputs(self.pad_token_id, verifier_input_ids[i]))
+    #     # Convert to list format for vLLM
+    #     verifier_idx_list = []
+    #     for i in range(batch_size):
+    #         verifier_idx_list.append(_pre_process_inputs(self.pad_token_id, verifier_input_ids[i]))
 
-        # Step 3: Verifier generates Critique + Hint (using Verifier LoRA)
-        verifier_start = time.time()
-        if self.verifier_lora_int_id is None:
-            self._register_verifier_lora()
+    #     # Step 3: Verifier generates Critique + Hint (using Verifier LoRA)
+    #     verifier_start = time.time()
+    #     if self.verifier_lora_int_id is None:
+    #         self._register_verifier_lora()
         
-        verifier_lora_requests = None
-        if self.verifier_lora_int_id is not None:
-            verifier_lora_requests = [
-                LoRARequest(
-                    lora_name=self.verifier_lora_name,
-                    lora_int_id=self.verifier_lora_int_id,
-                            lora_path=getattr(self, 'verifier_lora_path', None)  # Use actual Verifier LoRA path
-                )
-            ] * batch_size
+    #     verifier_lora_requests = None
+    #     if self.verifier_lora_int_id is not None:
+    #         verifier_lora_requests = [
+    #             LoRARequest(
+    #                 lora_name=self.verifier_lora_name,
+    #                 lora_int_id=self.verifier_lora_int_id,
+    #                         lora_path=getattr(self, 'verifier_lora_path', None)  # Use actual Verifier LoRA path
+    #             )
+    #         ] * batch_size
         
-        with self.update_sampling_params(**control_kwargs):
-            verifier_output = self.inference_engine.generate(
-                prompts=None,
-                sampling_params=self.sampling_params,
-                prompt_token_ids=verifier_idx_list,
-                lora_request=verifier_lora_requests,
-                use_tqdm=False,
-            )
+    #     with self.update_sampling_params(**control_kwargs):
+    #         verifier_output = self.inference_engine.generate(
+    #             prompts=None,
+    #             sampling_params=self.sampling_params,
+    #             prompt_token_ids=verifier_idx_list,
+    #             lora_request=verifier_lora_requests,
+    #             use_tqdm=False,
+    #         )
         
-        verifier_responses, verifier_log_probs = _extract_vllm_outputs(
-            verifier_output, self.pad_token_id, self.config.response_length, idx.device
-        )
+    #     verifier_responses, verifier_log_probs = _extract_vllm_outputs(
+    #         verifier_output, self.pad_token_id, self.config.response_length, idx.device
+    #     )
         
-        if verifier_responses.shape[1] < self.config.response_length:
-            verifier_responses = pad_sequence_to_length(verifier_responses, self.config.response_length, self.pad_token_id)
-            verifier_log_probs = pad_sequence_to_length(verifier_log_probs, self.config.response_length, self.pad_token_id)
+    #     if verifier_responses.shape[1] < self.config.response_length:
+    #         verifier_responses = pad_sequence_to_length(verifier_responses, self.config.response_length, self.pad_token_id)
+    #         verifier_log_probs = pad_sequence_to_length(verifier_log_probs, self.config.response_length, self.pad_token_id)
 
-        # Decode Verifier outputs and extract actual hints (remove think blocks, extract <GO> or <WAIT> content)
-        verifier_texts = []  # Full output for logging
-        hints = []  # Extracted hints for actual use
-        for i in range(batch_size):
-            verifier_text = tokenizer.decode(verifier_responses[i].tolist(), skip_special_tokens=True)
-            verifier_texts.append(verifier_text)
-            # Extract actual hint (removes think blocks, extracts <GO> or <WAIT> content)
-            hint = self._extract_verifier_hint(verifier_text)
-            hints.append(hint)
-        timing_info["verifier_gen"] = time.time() - verifier_start
+    #     # Decode Verifier outputs and extract actual hints (remove think blocks, extract <GO> or <WAIT> content)
+    #     verifier_texts = []  # Full output for logging
+    #     hints = []  # Extracted hints for actual use
+    #     for i in range(batch_size):
+    #         verifier_text = tokenizer.decode(verifier_responses[i].tolist(), skip_special_tokens=True)
+    #         verifier_texts.append(verifier_text)
+    #         # Extract actual hint (removes think blocks, extracts <GO> or <WAIT> content)
+    #         hint = self._extract_verifier_hint(verifier_text)
+    #         hints.append(hint)
+    #     timing_info["verifier_gen"] = time.time() - verifier_start
         
-        # Step 4: Policy generates final answer with Verifier guidance
-        # Use extracted hints (without think blocks)
-        final_inputs = []
-        for prompt, hint in zip(prompt_texts, hints):
-            final_prompt = f"Prompt: {prompt}\n\nHint: {hint}\n\nFinal Answer:"
-            final_inputs.append(final_prompt)
+    #     # Step 4: Policy generates final answer with Verifier guidance
+    #     # Use extracted hints (without think blocks)
+    #     final_inputs = []
+    #     for prompt, hint in zip(prompt_texts, hints):
+    #         final_prompt = f"Prompt: {prompt}\n\nHint: {hint}\n\nFinal Answer:"
+    #         final_inputs.append(final_prompt)
         
-        final_encoded = tokenizer(
-            final_inputs,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.prompt_length + self.config.response_length,
-        )
-        final_input_ids = final_encoded["input_ids"].to(idx.device)
-        final_attention_mask = final_encoded["attention_mask"].to(idx.device)
+    #     final_encoded = tokenizer(
+    #         final_inputs,
+    #         return_tensors="pt",
+    #         padding=True,
+    #         truncation=True,
+    #         max_length=self.config.prompt_length + self.config.response_length,
+    #     )
+    #     final_input_ids = final_encoded["input_ids"].to(idx.device)
+    #     final_attention_mask = final_encoded["attention_mask"].to(idx.device)
         
-        final_idx_list = []
-        for i in range(batch_size):
-            final_idx_list.append(_pre_process_inputs(self.pad_token_id, final_input_ids[i]))
+    #     final_idx_list = []
+    #     for i in range(batch_size):
+    #         final_idx_list.append(_pre_process_inputs(self.pad_token_id, final_input_ids[i]))
 
-        # Generate final responses (no LoRA, back to Policy)
-        final_start = time.time()
-        with self.update_sampling_params(**control_kwargs):
-            final_output = self.inference_engine.generate(
-                prompts=None,
-                sampling_params=self.sampling_params,
-                prompt_token_ids=final_idx_list,
-                lora_request=None,  # No LoRA for final generation
-                use_tqdm=False,
-            )
+    #     # Generate final responses (no LoRA, back to Policy)
+    #     final_start = time.time()
+    #     with self.update_sampling_params(**control_kwargs):
+    #         final_output = self.inference_engine.generate(
+    #             prompts=None,
+    #             sampling_params=self.sampling_params,
+    #             prompt_token_ids=final_idx_list,
+    #             lora_request=None,  # No LoRA for final generation
+    #             use_tqdm=False,
+    #         )
         
-        exp_responses, exp_log_probs = _extract_vllm_outputs(
-            final_output, self.pad_token_id, self.config.response_length, idx.device
-        )
+    #     exp_responses, exp_log_probs = _extract_vllm_outputs(
+    #         final_output, self.pad_token_id, self.config.response_length, idx.device
+    #     )
         
-        if exp_responses.shape[1] < self.config.response_length:
-            exp_responses = pad_sequence_to_length(exp_responses, self.config.response_length, self.pad_token_id)
-            exp_log_probs = pad_sequence_to_length(exp_log_probs, self.config.response_length, self.pad_token_id)
-        timing_info["final_gen"] = time.time() - final_start
+    #     if exp_responses.shape[1] < self.config.response_length:
+    #         exp_responses = pad_sequence_to_length(exp_responses, self.config.response_length, self.pad_token_id)
+    #         exp_log_probs = pad_sequence_to_length(exp_log_probs, self.config.response_length, self.pad_token_id)
+    #     timing_info["final_gen"] = time.time() - final_start
 
-        # Store the actual prompts used for experimental stream
-        # This is important for correct response mask calculation later
-        exp_prompt_ids = final_input_ids
-        exp_prompt_attention_mask = final_attention_mask
-        exp_prompt_length = exp_prompt_attention_mask.sum(dim=1)
+    #     # Store the actual prompts used for experimental stream
+    #     # This is important for correct response mask calculation later
+    #     exp_prompt_ids = final_input_ids
+    #     exp_prompt_attention_mask = final_attention_mask
+    #     exp_prompt_length = exp_prompt_attention_mask.sum(dim=1)
 
-        # ========== Prepare output DataProto ==========
-        # Store hints and critiques in non_tensor_batch
-        # Use extracted hints (without think blocks) for actual use
-        hints_array = np.array(hints, dtype=object)
-        critiques = np.array(verifier_texts, dtype=object)  # Keep full output for logging/critique
+    #     # ========== Prepare output DataProto ==========
+    #     # Store hints and critiques in non_tensor_batch
+    #     # Use extracted hints (without think blocks) for actual use
+    #     hints_array = np.array(hints, dtype=object)
+    #     critiques = np.array(verifier_texts, dtype=object)  # Keep full output for logging/critique
         
-        # Store intervention statistics for penalty calculation
-        # In by_response mode, each sample has 1 intervention (the verifier output)
-        num_interventions = np.ones(batch_size, dtype=np.int32)
-        # Calculate token counts based on extracted hints (not full verifier output)
-        hint_token_counts = np.array([
-            len(tokenizer.encode(hint, add_special_tokens=False)) for hint in hints
-        ], dtype=np.int32)
+    #     # Store intervention statistics for penalty calculation
+    #     # In by_response mode, each sample has 1 intervention (the verifier output)
+    #     num_interventions = np.ones(batch_size, dtype=np.int32)
+    #     # Calculate token counts based on extracted hints (not full verifier output)
+    #     hint_token_counts = np.array([
+    #         len(tokenizer.encode(hint, add_special_tokens=False)) for hint in hints
+    #     ], dtype=np.int32)
         
-        # Combine control and experimental responses
-        # Helper function to get last valid position id
+    #     # Combine control and experimental responses
+    #     # Helper function to get last valid position id
+    
     def _dual_stream_rollout_by_step(
         self, prompts, timing_info, start_time, tokenizer, idx, attention_mask,
         position_ids, eos_token_id, batch_size, **kwargs
@@ -2624,25 +2618,13 @@ class vLLMAsyncRollout:
         else:
             control_kwargs = {}
 
-        # 2. Co-GRPO double repetition detection and correction
+        # 2. Co-GRPO: Force n=1 to avoid double repetition
+        # In Co-GRPO, trainer already repeats gen_batch BEFORE calling dual_stream_rollout
+        # So we MUST use n=1 here, otherwise vLLM will repeat again causing batch_size mismatch
         if do_sample and not is_validate and self.sampling_params.n > 1:
             target_n = self.sampling_params.n
-            # Use function parameter batch_size - it's the most accurate tensor dimension
-            current_batch_size = batch_size
-
-            # Detection logic:
-            # If current batch size is a multiple of target_n AND >= target_n,
-            # we have high confidence that Trainer already did repeat operation
-            if current_batch_size >= target_n and current_batch_size % target_n == 0:
-                logger.info(f"Co-GRPO: Detected pre-repeated batch (size={current_batch_size}, n={target_n}). "
-                            f"Forcing vLLM n=1 to avoid double repetition.")
-                control_kwargs["n"] = 1
-            else:
-                # If not a multiple relationship, this might be a raw batch needing vLLM to do n-times sampling
-                # Note: This is rare in Co-GRPO training but may happen during inference or debugging small batches
-                logger.info(f"Co-GRPO: Detected raw batch (size={current_batch_size}, n={target_n}). "
-                            f"Delegating repetition to vLLM.")
-                control_kwargs["n"] = target_n
+            logger.info(f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})")
+            control_kwargs["n"] = 1
 
         # =================================================================
         # FIX END
@@ -2700,11 +2682,10 @@ class vLLMAsyncRollout:
         # 1. 获取停止配置
         stop_config = self._get_step_boundary_stop_config(tokenizer, eos_token_id)
         if not stop_config['stop_sequences'] and not stop_config['stop_token_ids']:
-            logger.warning("No stop sequences found, falling back to by_response mode")
-            return self._dual_stream_rollout_by_response(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-                position_ids, eos_token_id, batch_size, **kwargs
-            )
+            logger.warning("No stop sequences found, using full generation without step boundaries")
+            # Fall back to simple full generation (continue without step interruption)
+            # Don't fallback to by_response as it's disabled for debugging
+            pass  # Continue with full generation
         
         logger.info(f"Stop config: token_ids={stop_config['stop_token_ids']}, sequences={stop_config['stop_sequences']}")
         
