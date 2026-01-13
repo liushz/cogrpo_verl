@@ -120,9 +120,70 @@ class NaiveRewardManager:
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
-            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+            # ========== Co-GRPO Diagnostic: Stream Detection ==========
+            # Both control and exp batches contain the same metadata structure.
+            # Heuristic: Check if exp_hints/exp_critiques lists are populated
+            exp_hints_val = data_item.non_tensor_batch.get('exp_hints', [])
+            exp_critiques_val = data_item.non_tensor_batch.get('exp_critiques', [])
+            has_exp_metadata = (isinstance(exp_hints_val, list) and any(exp_hints_val)) or \
+                               (isinstance(exp_critiques_val, list) and any(c and c != 'No interventions' for c in exp_critiques_val))
+            is_exp_stream = has_exp_metadata
 
-            data_source = data_item.non_tensor_batch[self.reward_fn_key]
+            # Get ground_truth before if-else
+            ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", "")
+            data_source = data_item.non_tensor_batch.get(self.reward_fn_key, "")
+
+            if is_exp_stream:
+                # Experimental stream
+                print(f"\n{'='*70}", file=sys.stderr)
+                print(f"[EXP_STREAM] Sample {i}", file=sys.stderr)
+                print(f"{'='*70}", file=sys.stderr)
+                print(f"[Full Response]:\n{response_str}\n", file=sys.stderr)
+
+                # Dump to file
+                import json, os
+                dump_dir = '/mnt/shared-storage-user/liuhongwei/main_works/temp_debug/verifier_outputs'
+                os.makedirs(dump_dir, exist_ok=True)
+
+                exp_data = {
+                    'sample_idx': i,
+                    'stream_type': 'exp',
+                    'full_response': response_str,
+                    'exp_hints': data_item.non_tensor_batch.get('exp_hints', ''),
+                    'exp_critiques': data_item.non_tensor_batch.get('exp_critiques', ''),
+                    'ground_truth': ground_truth,
+                    'data_source': data_source,
+                }
+
+                dump_file = os.path.join(dump_dir, f'exp_sample_{i}.json')
+                with open(dump_file, 'w', encoding='utf-8') as f:
+                    json.dump(exp_data, f, ensure_ascii=False, indent=2)
+
+                print(f"[DUMP] Saved to: {dump_file}\n", file=sys.stderr)
+                print(f"{'='*70}\n", file=sys.stderr)
+            else:
+                # Control stream (or couldn't determine)
+                print(f"\n[CONTROL_STREAM] Sample {i}", file=sys.stderr)
+                print(f"[Response]:\n{response_str}\n", file=sys.stderr)
+
+                # Dump to file
+                import json, os
+                dump_dir = '/mnt/shared-storage-user/liuhongwei/main_works/temp_debug/control_outputs'
+                os.makedirs(dump_dir, exist_ok=True)
+
+                control_data = {
+                    'sample_idx': i,
+                    'stream_type': 'control',
+                    'response': response_str,
+                    'ground_truth': ground_truth,
+                    'data_source': data_source,
+                }
+
+                dump_file = os.path.join(dump_dir, f'control_sample_{i}.json')
+                with open(dump_file, 'w', encoding='utf-8') as f:
+                    json.dump(control_data, f, ensure_ascii=False, indent=2)
+
+                print(f"[DUMP] Saved to: {dump_file}\n", file=sys.stderr)
 
             extra_info = data_item.non_tensor_batch.get("extra_info", None)
 

@@ -978,18 +978,29 @@ class vLLMRollout(BaseRollout):
         
         # Construct Verifier input with system prompt and task instruction
         # Format matches format_training_data.py: system -> user (intervene_prompt + question + student response)
-        verifier_inputs = []
+        # CRITICAL FIX: Use separate system and user messages to match training data format
+        verifier_chat_inputs = []
         for prompt, draft in zip(prompt_texts, draft_texts):
             # Construct user content: intervene_prompt + question + student response
             user_content = f"{VERIFIER_INTERVENE_PROMPT} Question: {prompt}\n\nStudent Response: {draft}"
-            
-            # For vLLM, concatenate system and user prompts
-            verifier_prompt = f"{VERIFIER_SYSTEM_PROMPT}\n\n{user_content}"
-            verifier_inputs.append(verifier_prompt)
-        
-        # Tokenize Verifier inputs
+
+            # Format as separate system and user messages (matches training data)
+            messages = [
+                {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content}
+            ]
+
+            # Apply chat template to get final text
+            chat_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            verifier_chat_inputs.append(chat_text)
+
+        # Tokenize Verifier inputs using chat template
         verifier_encoded = tokenizer(
-            verifier_inputs,
+            verifier_chat_inputs,  # Already chat-formatted
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -1017,8 +1028,15 @@ class vLLMRollout(BaseRollout):
                             lora_path=getattr(self, 'verifier_lora_path', None)  # Use actual Verifier LoRA path
                 )
             ] * batch_size
-        
-        with self.update_sampling_params(**control_kwargs):
+
+        # CRITICAL: Verifier must use temperature=0 for deterministic tag output
+        # Override sampling params to force greedy decoding for Verifier
+        verifier_kwargs = control_kwargs.copy()
+        verifier_kwargs["temperature"] = 0
+        verifier_kwargs["top_p"] = 1.0
+        verifier_kwargs["top_k"] = -1
+
+        with self.update_sampling_params(**verifier_kwargs):
             verifier_output = self.inference_engine.generate(
                 prompts=None,
                 sampling_params=self.sampling_params,
@@ -1297,10 +1315,22 @@ class vLLMRollout(BaseRollout):
             # Register Verifier LoRA if needed
             if self.verifier_lora_int_id is None:
                 self._register_verifier_lora()
-            
+
+            # CRITICAL FIX: Use chat template to format inputs
+            # Verifier was trained with chat format, must use apply_chat_template
+            verifier_chat_inputs = []
+            for verifier_prompt in verifier_inputs:
+                messages = [{"role": "user", "content": verifier_prompt}]
+                chat_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                verifier_chat_inputs.append(chat_text)
+
             # 批量 tokenize
             verifier_encoded = tokenizer(
-                verifier_inputs,
+                verifier_chat_inputs,  # Use chat-formatted inputs
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
@@ -1323,9 +1353,15 @@ class vLLMRollout(BaseRollout):
                                 lora_path=getattr(self, 'verifier_lora_path', None)  # Use actual Verifier LoRA path
                     )
                 ] * len(verifier_inputs)
-            
+
+            # CRITICAL: Verifier must use temperature=0 for deterministic tag output
+            verifier_kwargs = exp_kwargs.copy()
+            verifier_kwargs["temperature"] = 0
+            verifier_kwargs["top_p"] = 1.0
+            verifier_kwargs["top_k"] = -1
+
             # 批量生成 Verifier 响应
-            with self.update_sampling_params(**exp_kwargs):
+            with self.update_sampling_params(**verifier_kwargs):
                 verifier_output = self.inference_engine.generate(
                     prompts=None,
                     sampling_params=self.sampling_params,
@@ -1872,6 +1908,12 @@ class vLLMRollout(BaseRollout):
                 if hit_stop:
                     # 在 boundary 处停止，需要 Verifier 判断
                     current_reasoning = tokenizer.decode(state['response_tokens'], skip_special_tokens=True)
+
+                    # TODO: by_token 模式的 Verifier prompt 格式与训练数据不一致
+                    # 当前格式: "Prompt: ...\nCurrent Reasoning: ...\nShould I intervene?"
+                    # 训练数据格式: [system message] + [user message with VERIFIER_INTERVENE_PROMPT + Question + Student Response]
+                    # 这可能导致 Verifier 输出不稳定的标签
+                    # by_token 模式暂时不使用，等后续修复
                     verifier_input = (
                         f"Prompt: {state['prompt_text']}\n\n"
                         f"Current Reasoning: {current_reasoning}\n\n"
@@ -2163,10 +2205,22 @@ class vLLMAsyncRollout:
             # Register Verifier LoRA if needed
             if self.verifier_lora_int_id is None:
                 self._register_verifier_lora()
-            
+
+            # CRITICAL FIX: Use chat template to format inputs
+            # Verifier was trained with chat format, must use apply_chat_template
+            verifier_chat_inputs = []
+            for verifier_prompt in verifier_inputs:
+                messages = [{"role": "user", "content": verifier_prompt}]
+                chat_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                verifier_chat_inputs.append(chat_text)
+
             # 批量 tokenize
             verifier_encoded = tokenizer(
-                verifier_inputs,
+                verifier_chat_inputs,  # Use chat-formatted inputs
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
@@ -2189,9 +2243,15 @@ class vLLMAsyncRollout:
                                 lora_path=getattr(self, 'verifier_lora_path', None)  # Use actual Verifier LoRA path
                     )
                 ] * len(verifier_inputs)
-            
+
+            # CRITICAL: Verifier must use temperature=0 for deterministic tag output
+            verifier_kwargs = exp_kwargs.copy()
+            verifier_kwargs["temperature"] = 0
+            verifier_kwargs["top_p"] = 1.0
+            verifier_kwargs["top_k"] = -1
+
             # 批量生成 Verifier 响应
-            with self.update_sampling_params(**exp_kwargs):
+            with self.update_sampling_params(**verifier_kwargs):
                 verifier_output = self.inference_engine.generate(
                     prompts=None,
                     sampling_params=self.sampling_params,
@@ -2881,6 +2941,12 @@ class vLLMAsyncRollout:
                 if hit_stop:
                     # 在 boundary 处停止，需要 Verifier 判断
                     current_reasoning = tokenizer.decode(state['response_tokens'], skip_special_tokens=True)
+
+                    # TODO: by_token 模式的 Verifier prompt 格式与训练数据不一致
+                    # 当前格式: "Prompt: ...\nCurrent Reasoning: ...\nShould I intervene?"
+                    # 训练数据格式: [system message] + [user message with VERIFIER_INTERVENE_PROMPT + Question + Student Response]
+                    # 这可能导致 Verifier 输出不稳定的标签
+                    # by_token 模式暂时不使用，等后续修复
                     verifier_input = (
                         f"Prompt: {state['prompt_text']}\n\n"
                         f"Current Reasoning: {current_reasoning}\n\n"

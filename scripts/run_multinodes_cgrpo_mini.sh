@@ -134,7 +134,7 @@ curriculum_start_weight=0.3  # Early: 30% control, 70% exp (rely on verifier)
 curriculum_end_weight=0.7    # Late: 70% control, 30% exp (independent)
 
 # data related (Mini version - smaller batch sizes)
-response_n=8  # keep 32k response to avoid truncation, use 8k to debug
+response_n=16  # keep 32k response to avoid truncation, use 8k to debug
 train_batch_size=4  # Must satisfy: (train_batch_size * n) % (n_gpus) == 0
                       # With n=4 and 16 GPUs: 4*4=16, 16%16=0 ✓
 max_prompt_length=$((1024 * 2))

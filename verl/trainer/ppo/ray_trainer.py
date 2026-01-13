@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import sys
 import time
 import uuid
 from collections import defaultdict
@@ -1331,7 +1332,45 @@ class RayPPOTrainer:
                             else:
                                 control_reward_tensor, _ = compute_reward(control_batch, self.reward_fn)
                                 exp_reward_tensor, _ = compute_reward(exp_batch, self.reward_fn)
-                            
+
+                            # ========== Co-GRPO Diagnostic: Batch Comparison ==========
+                            print(f"\n{'='*80}", file=sys.stderr)
+                            print(f"[Co-GRPO Batch Statistics] After Reward Computation", file=sys.stderr)
+                            print(f"{'='*80}", file=sys.stderr)
+
+                            # Print sample comparison
+                            sample_idx = 0
+                            control_resp = self.tokenizer.decode(
+                                batch.batch['control_responses'][sample_idx][:batch.batch['control_attention_mask'][sample_idx].sum()],
+                                skip_special_tokens=True
+                            )
+                            exp_resp = self.tokenizer.decode(
+                                batch.batch['exp_responses'][sample_idx][:batch.batch['exp_attention_mask'][sample_idx].sum()],
+                                skip_special_tokens=True
+                            )
+
+                            print(f"\n[Control Sample {sample_idx}] (first 500 chars):\n{control_resp[:500]}...\n", file=sys.stderr)
+                            print(f"[Exp Sample {sample_idx}] (first 500 chars):\n{exp_resp[:500]}...\n", file=sys.stderr)
+
+                            # Intervention stats
+                            if 'num_interventions' in batch.non_tensor_batch:
+                                interventions = batch.non_tensor_batch['num_interventions']
+                                print(f"[Intervention Stats]:", file=sys.stderr)
+                                print(f"  Mean: {float(np.mean(interventions)):.2f}", file=sys.stderr)
+                                print(f"  Max: {int(np.max(interventions))}", file=sys.stderr)
+                                print(f"  Min: {int(np.min(interventions))}", file=sys.stderr)
+
+                            # Reward comparison
+                            control_outcome_early = control_reward_tensor.squeeze() if control_reward_tensor.dim() > 1 else control_reward_tensor
+                            exp_outcome_early = exp_reward_tensor.squeeze() if exp_reward_tensor.dim() > 1 else exp_reward_tensor
+
+                            print(f"[Reward Comparison]:", file=sys.stderr)
+                            print(f"  Control reward: {float(control_outcome_early.mean()):.4f} ± {float(control_outcome_early.std()):.4f}", file=sys.stderr)
+                            print(f"  Exp reward: {float(exp_outcome_early.mean()):.4f} ± {float(exp_outcome_early.std()):.4f}", file=sys.stderr)
+                            print(f"  Gap (exp - control): {float(exp_outcome_early.mean() - control_outcome_early.mean()):.4f}", file=sys.stderr)
+                            print(f"{'='*80}\n", file=sys.stderr)
+                            # ========== End Co-GRPO Diagnostic ==========
+
                             # Ensure rewards are token-level (expand to match response length)
                             control_resp_len = batch.batch["control_responses"].size(1)
                             exp_resp_len = batch.batch["exp_responses"].size(1)
