@@ -90,14 +90,18 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
     _debug_call_count += 1
     call_id = _debug_call_count
 
-    # ========== DEBUG: Print function entry ==========
-    print(f"[CompassVerifier #{call_id}] ENTER compute_score", file=sys.stderr)
-    print(f"[CompassVerifier #{call_id}] reward_model_clients type: {type(reward_model_clients)}", file=sys.stderr)
-    print(f"[CompassVerifier #{call_id}] reward_model_clients: {reward_model_clients}", file=sys.stderr)
+    # Debug verbosity (opt-in via env)
+    debug_enabled = bool(os.environ.get("VERL_DEBUG"))
+
+    if debug_enabled:
+        print(f"[CompassVerifier #{call_id}] ENTER compute_score", file=sys.stderr)
+        print(f"[CompassVerifier #{call_id}] reward_model_clients type: {type(reward_model_clients)}", file=sys.stderr)
+        print(f"[CompassVerifier #{call_id}] reward_model_clients: {reward_model_clients}", file=sys.stderr)
 
     # 检查 reward_model_clients；离线或未配置时直接返回0，避免训练中断
     if not reward_model_clients or not isinstance(reward_model_clients, list):
-        print(f"[CompassVerifier #{call_id}] reward_model_clients missing or invalid, returning 0", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] reward_model_clients missing or invalid, returning 0", file=sys.stderr)
         print("reward_model_clients missing or invalid, returning 0 reward to continue training")
         return 0
     
@@ -111,16 +115,19 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
         except Exception:
             continue
     if not valid_clients:
-        print(f"[CompassVerifier #{call_id}] No valid reward model clients after filtering, returning 0", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] No valid reward model clients after filtering, returning 0", file=sys.stderr)
         print("No valid reward model clients after filtering, returning 0 reward")
         return 0
 
-    print(f"[CompassVerifier #{call_id}] Found {len(valid_clients)} valid clients", file=sys.stderr)
+    if debug_enabled:
+        print(f"[CompassVerifier #{call_id}] Found {len(valid_clients)} valid clients", file=sys.stderr)
 
     # 随机选择一个客户端
     api_client = random.choice(valid_clients)
     api_base_url = getattr(getattr(api_client, "_client", None), "base_url", None)
-    print(f"[CompassVerifier #{call_id}] Using API endpoint: {api_base_url}", file=sys.stderr)
+    if debug_enabled:
+        print(f"[CompassVerifier #{call_id}] Using API endpoint: {api_base_url}", file=sys.stderr)
     
     # 构建 prompt
     try:
@@ -131,7 +138,8 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
     
     # API 调用，添加错误处理
     try:
-        print(f"[CompassVerifier #{call_id}] Calling API...", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] Calling API...", file=sys.stderr)
         response = api_client.chat.completions.create(
             model="cv-32b",
             messages=[
@@ -139,34 +147,42 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
             ],
             temperature=0.0,
         )
-        print(f"[CompassVerifier #{call_id}] API response received", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] API response received", file=sys.stderr)
     except Exception as e:
-        print(f"[CompassVerifier #{call_id}] API call FAILED: {e}", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] API call FAILED: {e}", file=sys.stderr)
         raise RuntimeError(f"API call failed: {e}")
 
     # 检查响应有效性
     if not response or not hasattr(response, 'choices') or not response.choices:
-        print(f"[CompassVerifier #{call_id}] Invalid API response: no choices", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] Invalid API response: no choices", file=sys.stderr)
         raise RuntimeError("Invalid API response: no choices")
 
     if not response.choices[0] or not hasattr(response.choices[0], 'message'):
-        print(f"[CompassVerifier #{call_id}] Invalid API response: no message", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] Invalid API response: no message", file=sys.stderr)
         raise RuntimeError("Invalid API response: no message")
 
     content = response.choices[0].message.content
     if not content:
-        print(f"[CompassVerifier #{call_id}] Invalid API response: empty content", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] Invalid API response: empty content", file=sys.stderr)
         raise RuntimeError("Invalid API response: empty content")
 
-    print(f"[CompassVerifier #{call_id}] API returned: '{content.strip()}'", file=sys.stderr)
+    if debug_enabled:
+        print(f"[CompassVerifier #{call_id}] API returned: '{content.strip()}'", file=sys.stderr)
 
     # 判断结果：A (CORRECT) 返回 1，其他返回 0
     content_upper = content.strip().upper()
     if content_upper == "A" or "CORRECT" in content_upper:
-        print(f"[CompassVerifier #{call_id}] RETURNING 1 (CORRECT)", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] RETURNING 1 (CORRECT)", file=sys.stderr)
         return 1
     else:
-        print(f"[CompassVerifier #{call_id}] RETURNING 0 (INCORRECT)", file=sys.stderr)
+        if debug_enabled:
+            print(f"[CompassVerifier #{call_id}] RETURNING 0 (INCORRECT)", file=sys.stderr)
         return 0
 
 

@@ -32,7 +32,9 @@ def set_basic_config(level):
     except:
         rank = 0
 
-    log_file = os.path.join(log_dir, f"verl_log_rank{rank}.txt")
+    # Allow caller to override log filename prefix via env (e.g., to inject timestamp/experiment id)
+    log_prefix = os.environ.get("VERL_LOG_PREFIX", "verl_log")
+    log_file = os.path.join(log_dir, f"{log_prefix}_rank{rank}.txt")
 
     # Configure root logger with both file and stream handlers
     root_logger = logging.getLogger()

@@ -90,6 +90,8 @@ export HYDRA_FULL_ERROR=1
 model=$1
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
+# Use timestamped log prefix; actual files will append _rank{rank}.txt
+export VERL_LOG_PREFIX="verl_log_${timestamp}"
 
 # co-grpo related
 adv_estimator=co_grpo
@@ -112,49 +114,67 @@ verifier_lora_alpha=128
 verifier_lora_dropout=0.05
 verifier_lr=1e-5
 verifier_loss_weight=1.0
-verifier_lora_path="/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit/xtuner_train/verifier-interns1-lora-cold-010819/checkpoint-960"  # Path to pretrained verifier LoRA, empty to train from scratch
+verifier_lora_path="/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit/xtuner_train/verifier-interns1-lora-cold-011316/checkpoint-486"  # Path to pretrained verifier LoRA, empty to train from scratch
 
 # verifier intervention mode: "by_response" or "by_step"
 verifier_intervention_mode=by_step
 
 # by_step mode parameters
-token_check_interval=5
+
+token_check_interval=1024  # Check verifier every N tokens
+min_step_tokens=1024  # Minimum tokens before honoring stop boundaries
+
 entropy_threshold=0.5
 use_entropy_filter=True
-max_interventions=5  # Mini version: more interventions allowed
+max_interventions=5
 confidence_threshold=0.7
-
+# Minimum tokens before honoring stop boundaries (defaults to token_check_interval if not set)
+ 
 # intervention penalty (prevent over-intervention)
-intervention_penalty_freq_coef=0.1
-intervention_penalty_len_coef=0.01
+intervention_penalty_freq_coef=0.01
+intervention_penalty_len_coef=0.001
 
 # curriculum learning (dynamic control/exp weight)
 use_curriculum_weighting=True
-curriculum_start_weight=0.3  # Early: 30% control, 70% exp (rely on verifier)
-curriculum_end_weight=0.7    # Late: 70% control, 30% exp (independent)
+curriculum_start_weight=0.7  # Early: 70% control, 30% exp (rely on policy)
+curriculum_end_weight=0.3    # Late: 30% control, 70% exp (rely on verifier)
 
 # data related (Mini version - smaller batch sizes)
-response_n=16  # keep 32k response to avoid truncation, use 8k to debug
-train_batch_size=4  # Must satisfy: (train_batch_size * n) % (n_gpus) == 0
+response_n=32  # keep 32k response to avoid truncation, use 8k to debug
+train_batch_size=8  # Must satisfy: (train_batch_size * n) % (n_gpus) == 0
                       # With n=4 and 16 GPUs: 4*4=16, 16%16=0 ✓
 max_prompt_length=$((1024 * 2))
 max_response_length=$((1024 * $response_n))
 max_model_len=$((max_prompt_length + max_response_length))
+# vLLM scheduler safety:
+# max_num_batched_tokens is the total token budget for one scheduling batch in vLLM.
+# Setting it too large (e.g. 2*(prompt+response) here) can cause vLLM to pack too much work and OOM.
+# Keep it close to max_model_len to bound peak KV/cache usage.
+rollout_max_num_batched_tokens="${max_model_len}"
 
 nnodes=$2
 n_gpus_per_node=$3
 
-use_dynamic_bsz=True
-actor_ppo_max_token_len=$((2 * max_prompt_length + 2 * max_response_length))
-ref_ppo_max_token_len=$((2 * max_prompt_length + 2 * max_response_length))
+# Disable dynamic bsz and explicitly set micro batch size per GPU
+# Note: micro=2 was used before and caused OOM/NCCL timeout at ~150GB
+#       micro=1 would be safer (~75GB) but slower
+#       micro=2 with offload=True might work, but monitor carefully
+use_dynamic_bsz=False
+ppo_micro_batch_size_per_gpu=1  # Each GPU processes 2 samples
+ref_log_prob_micro_batch_size_per_gpu=1  # Ref model micro batch size
+rollout_log_prob_micro_batch_size_per_gpu=1  # Rollout log_prob micro batch size
+# actor_ppo_max_token_len=$((2 * max_prompt_length + 2 * max_response_length))
+# ref_ppo_max_token_len=$((2 * max_prompt_length + 2 * max_response_length))
+actor_ppo_max_token_len=$((ppo_micro_batch_size_per_gpu * (max_prompt_length + max_response_length)))
+ref_ppo_max_token_len=$((ref_log_prob_micro_batch_size_per_gpu * (max_prompt_length + max_response_length)))
 
-offload=False
+offload=True
 
 sp=1
 
 gen_tp=$4
 gpu_memory_utilization=$5
-num_generation_per_prompt=4  # Must satisfy: (train_batch_size * n) % n_gpus == 0
+num_generation_per_prompt=8  # Must satisfy: (train_batch_size * n) % n_gpus == 0
                              # With train_batch_size=4, n=4: 4*4=16, 16%16=0 ✓
 
 train_file_name=$6
@@ -179,7 +199,7 @@ else
 fi
 
 
-LOG_FILE=/mnt/shared-storage-user/liuhongwei/main_works/temp_debug/logs/verl_log_rank0_${timestamp}.txt
+LOG_FILE=/mnt/shared-storage-user/liuhongwei/main_works/temp_debug/logs/${VERL_LOG_PREFIX}_rank0.txt
 
 if [ $NODE_RANK == 0 ]
 then
@@ -187,6 +207,7 @@ ray start --head --port=8266 &
 
 echo "=== Log will be saved to: $LOG_FILE ==="
 export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-DEBUG}
+export VERL_EXPERIMENT_ID="${exp_name}"
 
 TARGET_GPU=$((nnodes * n_gpus_per_node))
 CHECK_INTERVAL=10
@@ -225,6 +246,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${train_batch_size}" \
     actor_rollout_ref.actor.use_dynamic_bsz="${use_dynamic_bsz}" \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${ppo_micro_batch_size_per_gpu}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${actor_ppo_max_token_len}" \
     actor_rollout_ref.actor.use_kl_loss="${use_kl_loss}" \
     actor_rollout_ref.actor.kl_loss_coef="${kl_loss_coef}" \
@@ -238,7 +260,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload="${offload}" \
     +actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz="${use_dynamic_bsz}" \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${ref_log_prob_micro_batch_size_per_gpu}" \
     actor_rollout_ref.rollout.disable_log_stats=True \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.temperature=$temperature \
@@ -250,10 +273,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.response_length="${max_response_length}" \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${ref_ppo_max_token_len}" \
     actor_rollout_ref.rollout.n="${num_generation_per_prompt}" \
-    actor_rollout_ref.rollout.max_num_batched_tokens="${actor_ppo_max_token_len}" \
+    actor_rollout_ref.rollout.max_num_batched_tokens="${rollout_max_num_batched_tokens}" \
     actor_rollout_ref.rollout.load_format=safetensors \
     +actor_rollout_ref.rollout.stop_token_ids=[151645] \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz="${use_dynamic_bsz}" \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${rollout_log_prob_micro_batch_size_per_gpu}" \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
@@ -270,6 +294,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.token_check_interval="${token_check_interval}" \
     algorithm.entropy_threshold="${entropy_threshold}" \
     algorithm.use_entropy_filter="${use_entropy_filter}" \
+    +algorithm.min_step_tokens="${min_step_tokens}" \
     +algorithm.max_interventions="${max_interventions}" \
     +algorithm.confidence_threshold="${confidence_threshold}" \
     +algorithm.intervention_penalty.freq_coef="${intervention_penalty_freq_coef}" \
@@ -301,6 +326,13 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=20 \
     2>&1 | tee "$LOG_FILE"
+
+    # === Memory safety knobs === \
+    # vLLM swap must be under engine_kwargs.vllm to take effect \
+    # +actor_rollout_ref.rollout.engine_kwargs.vllm.swap_space=64 \
+    # Verifier offload to CPU (requires Hydra + key to create subtree) \
+    # +verifier.fsdp_config.param_offload=True \
+    # +verifier.fsdp_config.optimizer_offload=True \
 
 else
 # init worker

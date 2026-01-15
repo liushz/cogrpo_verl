@@ -133,31 +133,38 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
+    # Helper function to safely compute max/min on potentially empty tensors
+    def safe_max(tensor):
+        return tensor.max().item() if tensor.numel() > 0 else 0.0
+
+    def safe_min(tensor):
+        return tensor.min().item() if tensor.numel() > 0 else 0.0
+
     metrics = {
         # score
         "critic/score/mean": torch.mean(sequence_score).detach().item(),
-        "critic/score/max": torch.max(sequence_score).detach().item(),
-        "critic/score/min": torch.min(sequence_score).detach().item(),
+        "critic/score/max": safe_max(sequence_score.detach()),
+        "critic/score/min": safe_min(sequence_score.detach()),
         # reward
         "critic/rewards/mean": torch.mean(sequence_reward).detach().item(),
-        "critic/rewards/max": torch.max(sequence_reward).detach().item(),
-        "critic/rewards/min": torch.min(sequence_reward).detach().item(),
+        "critic/rewards/max": safe_max(sequence_reward.detach()),
+        "critic/rewards/min": safe_min(sequence_reward.detach()),
         # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/mean": torch.mean(valid_adv).detach().item() if valid_adv.numel() > 0 else 0.0,
+        "critic/advantages/max": safe_max(valid_adv.detach()),
+        "critic/advantages/min": safe_min(valid_adv.detach()),
         # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns/mean": torch.mean(valid_returns).detach().item() if valid_returns.numel() > 0 else 0.0,
+        "critic/returns/max": safe_max(valid_returns.detach()),
+        "critic/returns/min": safe_min(valid_returns.detach()),
         **(
             {
                 # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
+                "critic/values/mean": torch.mean(valid_values).detach().item() if valid_values.numel() > 0 else 0.0,
+                "critic/values/max": safe_max(valid_values.detach()),
+                "critic/values/min": safe_min(valid_values.detach()),
                 # vf explained var
-                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item() if valid_returns.numel() > 0 and valid_values.numel() > 0 else 0.0,
             }
             if use_critic
             else {}
@@ -227,7 +234,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
                 "co_grpo/verifier_returns/max": torch.max(valid_verifier_returns).detach().item(),
                 "co_grpo/verifier_returns/min": torch.min(valid_verifier_returns).detach().item(),
             })
-    
+
     return metrics
 
 
@@ -266,7 +273,7 @@ def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Di
 
     return {
         **{f"timing_s/{name}": value for name, value in timing_raw.items()},
-        **{f"timing_per_token_ms/{name}": timing_raw[name] * 1000 / num_tokens_of_section[name] for name in set(num_tokens_of_section.keys()) & set(timing_raw.keys())},
+        **{f"timing_per_token_ms/{name}": (timing_raw[name] * 1000 / num_tokens_of_section[name]) if num_tokens_of_section[name] > 0 else 0.0 for name in set(num_tokens_of_section.keys()) & set(timing_raw.keys())},
     }
 
 

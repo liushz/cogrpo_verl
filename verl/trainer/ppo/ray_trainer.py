@@ -1292,10 +1292,26 @@ class RayPPOTrainer:
                         # For Co-GRPO, compute rewards for both control and experimental streams
                         if use_co_grpo:
                             # Compute rewards for control stream
+                            # [CORRECT FIX] Exclude exp-specific metadata to avoid logging confusion
+                            exp_specific_fields = {
+                                'num_interventions',
+                                'hint_token_counts',
+                                'hints',
+                                'critiques',
+                                # exp-only diagnostics from by_step rollout
+                                'prompt_len',
+                                'response_len',
+                                'gen_len',
+                                'hint_len',
+                                'last_finish_reason',
+                                'context_exhausted',
+                                'first_step_tokens_len',
+                            }
+                            control_non_tensor_keys = [k for k in batch.non_tensor_batch.keys() if k not in exp_specific_fields]
+
                             control_batch = batch.select(
                                 batch_keys=["control_input_ids", "control_attention_mask", "control_position_ids"],
-                                # Preserve all non-tensor fields (reward_model, data_source, etc.) for reward_fn
-                                non_tensor_batch_keys=list(batch.non_tensor_batch.keys())
+                                non_tensor_batch_keys=control_non_tensor_keys
                             )
                             control_batch.batch["input_ids"] = control_batch.batch.pop("control_input_ids")
                             control_batch.batch["attention_mask"] = control_batch.batch.pop("control_attention_mask")
@@ -1305,23 +1321,42 @@ class RayPPOTrainer:
                             if "prompts" in batch.batch.keys():
                                 control_batch.batch["prompts"] = batch.batch["prompts"]
                             else:
-                                control_prompt_len = control_batch.batch["input_ids"].size(1) - batch.batch["control_responses"].size(1)
-                                control_batch.batch["prompts"] = control_batch.batch["input_ids"][..., :control_prompt_len]
-                            
+                                # [CORRECT FIX] Calculate prompt length using masks to handle padding correctly
+                                # input_valid_len = prompt + response
+                                input_valid_len = control_batch.batch["attention_mask"].sum(dim=1)
+                                # control_response_mask is already computed above
+                                resp_valid_len = batch.batch["control_response_mask"].sum(dim=1)
+                                
+                                # Derive prompt lengths
+                                prompt_lens = (input_valid_len - resp_valid_len)
+                                
+                                # Safe truncation: use the minimum valid prompt length in the batch
+                                # (Assuming left-padded or consistent prompt lengths in batch)
+                                min_prompt_len = int(prompt_lens.min().item())
+                                control_batch.batch["prompts"] = control_batch.batch["input_ids"][:, :min_prompt_len]
+                            # Mark stream type for reward manager dump
+                            # CRITICAL FIX: Must be a list, not a scalar, to avoid IndexError in protocol.py:275
+                            control_batch.non_tensor_batch["stream_type"] = ["control"] * control_batch.batch.size(0)
+
                             # Compute rewards for experimental stream
                             exp_batch = batch.select(
-                                batch_keys=["exp_input_ids", "exp_attention_mask", "exp_position_ids"],
+                                batch_keys=["exp_input_ids", "exp_attention_mask", "exp_position_ids", "exp_loss_mask"],
                                 non_tensor_batch_keys=list(batch.non_tensor_batch.keys())
                             )
                             exp_batch.batch["input_ids"] = exp_batch.batch.pop("exp_input_ids")
                             exp_batch.batch["attention_mask"] = exp_batch.batch.pop("exp_attention_mask")
                             exp_batch.batch["position_ids"] = exp_batch.batch.pop("exp_position_ids")
                             exp_batch.batch["responses"] = batch.batch["exp_responses"]
+                            # exp_loss_mask is needed for reward computation to filter out hint tokens
+                            # It will be renamed to exp_loss_mask in the final batch (kept as-is)
                             if "exp_prompts" in batch.batch.keys():
                                 exp_batch.batch["prompts"] = batch.batch["exp_prompts"]
                             else:
                                 exp_prompt_len = exp_batch.batch["input_ids"].size(1) - batch.batch["exp_responses"].size(1)
                                 exp_batch.batch["prompts"] = exp_batch.batch["input_ids"][..., :exp_prompt_len]
+                            # Mark stream type for reward manager dump
+                            # CRITICAL FIX: Must be a list, not a scalar, to avoid IndexError in protocol.py:275
+                            exp_batch.non_tensor_batch["stream_type"] = ["exp"] * exp_batch.batch.size(0)
                             
                             if self.config.reward_model.launch_reward_fn_async:
                                 tokenizer_name_or_path = self.tokenizer.name_or_path
@@ -1349,8 +1384,8 @@ class RayPPOTrainer:
                                 skip_special_tokens=True
                             )
 
-                            print(f"\n[Control Sample {sample_idx}] (first 500 chars):\n{control_resp[:500]}...\n", file=sys.stderr)
-                            print(f"[Exp Sample {sample_idx}] (first 500 chars):\n{exp_resp[:500]}...\n", file=sys.stderr)
+                            # print(f"\n[Control Sample {sample_idx}] (first 500 chars):\n{control_resp[:500]}...\n", file=sys.stderr)
+                            # print(f"[Exp Sample {sample_idx}] (first 500 chars):\n{exp_resp[:500]}...\n", file=sys.stderr)
 
                             # Intervention stats
                             if 'num_interventions' in batch.non_tensor_batch:
@@ -1461,8 +1496,22 @@ class RayPPOTrainer:
                             metrics['co_grpo/verifier_reward_std'] = verifier_outcome_rewards.std().item()
                             
                             # Log improvement ratio (how much exp improves over control)
-                            improvement_ratio = (exp_outcome - control_outcome) / (control_outcome.abs() + 1e-6)
+                            # FIX: Use log ratio to avoid division by near-zero values
+                            # Add small constant to both numerator and denominator to avoid log(0)
+                            # This provides a more stable metric than the original ratio calculation
+                            ratio = (exp_outcome + 0.1) / (control_outcome.abs() + 0.1)
+                            improvement_ratio = torch.log(ratio)
+                            # Clamp to reasonable range for visualization
+                            improvement_ratio = torch.clamp(improvement_ratio, min=-5.0, max=5.0)
                             metrics['co_grpo/improvement_ratio_mean'] = improvement_ratio.mean().item()
+                            # Log improvement ratio distribution for better monitoring
+                            metrics['co_grpo/improvement_ratio_median'] = improvement_ratio.median().item()
+                            metrics['co_grpo/improvement_ratio_std'] = improvement_ratio.std().item()
+                            metrics['co_grpo/improvement_ratio_min'] = improvement_ratio.min().item()
+                            metrics['co_grpo/improvement_ratio_max'] = improvement_ratio.max().item()
+                            # Log control reward zero ratio (detect control stream failures)
+                            control_zero_ratio = (control_outcome.abs() < 0.01).float().mean().item()
+                            metrics['co_grpo/control_zero_ratio'] = control_zero_ratio
                             
                             # Expand to token level for verifier
                             batch.batch["verifier_token_level_rewards"] = verifier_outcome_rewards.unsqueeze(-1).expand(-1, exp_resp_len)
