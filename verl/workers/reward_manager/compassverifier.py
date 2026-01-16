@@ -13,6 +13,7 @@
 # limitations under the License.
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import threading
+import os
 from typing import Dict, Any
 
 from collections import defaultdict
@@ -36,6 +37,10 @@ class CompassVerifierRewardManager:
 
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
+
+        # Debug verbosity (opt-in via env). Keep default runs quiet.
+        debug_enabled = os.environ.get("VERL_RM_DEBUG", "").lower() in ("1", "true", "yes")
+        should_print_examine = debug_enabled and self.num_examine > 0
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
@@ -93,20 +98,21 @@ class CompassVerifierRewardManager:
             else:
                 reward = score
             
-            with print_lock:
-                if data_source not in already_print_data_sources:
-                    already_print_data_sources[data_source] = 0
+            if should_print_examine:
+                with print_lock:
+                    if data_source not in already_print_data_sources:
+                        already_print_data_sources[data_source] = 0
 
-                if already_print_data_sources[data_source] < self.num_examine:
-                    already_print_data_sources[data_source] += 1
-                    print("[prompt]", prompt_str)
-                    print("[response]", response_str)
-                    print("[ground_truth]", ground_truth)
-                    if isinstance(score, dict):
-                        for key, value in score.items():
-                            print(f"[{key}]", value)
-                    else:
-                        print(f"[score]", score)  
+                    if already_print_data_sources[data_source] < self.num_examine:
+                        already_print_data_sources[data_source] += 1
+                        print("[prompt]", prompt_str)
+                        print("[response]", response_str)
+                        print("[ground_truth]", ground_truth)
+                        if isinstance(score, dict):
+                            for key, value in score.items():
+                                print(f"[{key}]", value)
+                        else:
+                            print(f"[score]", score)  
             return i, reward, valid_response_length, reward_extra_info
 
         # Process items in parallel using ThreadPoolExecutor

@@ -49,9 +49,9 @@ class NaiveRewardManager:
 
         import sys
         import os
-        # Debug verbosity (opt-in via env). Limit how many samples print deep debug.
-        debug_enabled = bool(os.environ.get("VERL_DEBUG"))
-        debug_limit = int(os.environ.get("VERL_DEBUG_LIMIT", 0))
+        # Debug verbosity (opt-in via env). Separate from VERL_DEBUG which may be used elsewhere.
+        debug_enabled = os.environ.get("VERL_RM_DEBUG", "").lower() in ("1", "true", "yes")
+        debug_limit = int(os.environ.get("VERL_RM_DEBUG_LIMIT", 0))
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():

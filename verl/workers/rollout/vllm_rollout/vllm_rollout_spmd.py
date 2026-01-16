@@ -26,7 +26,6 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
-import json
 import logging
 import os
 import re
@@ -245,23 +244,7 @@ class vLLMRollout(BaseRollout):
         verifier_lora_path = kwargs.pop("verifier_lora_path", None)
         
         # #region agent log
-        import json
-        import time
-        with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "LoRA",
-                "location": "vllm_rollout_spmd.py:257",
-                "message": "Before LLM initialization: lora_kwargs",
-                "data": {
-                    "lora_kwargs": lora_kwargs,
-                    "has_enable_lora": "enable_lora" in lora_kwargs,
-                    "has_max_loras": "max_loras" in lora_kwargs,
-                    "has_max_lora_rank": "max_lora_rank" in lora_kwargs
-                },
-                "timestamp": int(time.time() * 1000)
-            }) + "\n")
+        # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
         # #endregion
         
         # KV Cache optimization: enable prefix caching for by_step mode
@@ -335,20 +318,7 @@ class vLLMRollout(BaseRollout):
         )
         
         # #region agent log
-        with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "LoRA",
-                "location": "vllm_rollout_spmd.py:278",
-                "message": "After LLM initialization: check lora_manager",
-                "data": {
-                    "has_llm_engine": hasattr(self.inference_engine, "llm_engine"),
-                    "has_model_executor": hasattr(self.inference_engine, "llm_engine") and hasattr(self.inference_engine.llm_engine, "model_executor"),
-                    "has_workers": hasattr(self.inference_engine, "llm_engine") and hasattr(self.inference_engine.llm_engine, "model_executor") and hasattr(self.inference_engine.llm_engine.model_executor, "workers"),
-                },
-                "timestamp": int(time.time() * 1000)
-            }) + "\n")
+        # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
         # #endregion
 
         # Offload vllm model to reduce peak memory usage
@@ -375,7 +345,7 @@ class vLLMRollout(BaseRollout):
         if "stop_token_ids" in kwargs and kwargs["stop_token_ids"] is not None and not isinstance(kwargs["stop_token_ids"], list):
             kwargs["stop_token_ids"] = list(kwargs["stop_token_ids"])
 
-        print(f"kwargs: {kwargs}")
+        # print(f"kwargs: {kwargs}")  # debug-only
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
@@ -405,63 +375,20 @@ class vLLMRollout(BaseRollout):
                         )
                         logger.info(f"Successfully loaded Verifier LoRA from {self.verifier_lora_path}")
                         # #region agent log
-                        import json
-                        import time
-                        with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                            f.write(json.dumps({
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "LoRA",
-                                "location": "vllm_rollout_spmd.py:403",
-                                "message": "After verifier_lora_path setup: trying to load Verifier LoRA",
-                                "data": {
-                                    "verifier_lora_path": self.verifier_lora_path,
-                                    "verifier_lora_name": self.verifier_lora_name,
-                                    "has_add_lora": hasattr(self.inference_engine, "add_lora"),
-                                },
-                                "timestamp": int(time.time() * 1000)
-                            }) + "\n")
+                        # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                         # #endregion
                         # Put engine back to sleep
                         self.inference_engine.sleep(level=1)
                     except Exception as e:
                         logger.warning(f"Failed to load Verifier LoRA via add_lora: {e}")
                         # #region agent log
-                        import json
-                        import time
-                        with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                            f.write(json.dumps({
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "LoRA",
-                                "location": "vllm_rollout_spmd.py:403",
-                                "message": "Failed to load Verifier LoRA via add_lora",
-                                "data": {
-                                    "error": str(e),
-                                    "error_type": type(e).__name__
-                                },
-                                "timestamp": int(time.time() * 1000)
-                            }) + "\n")
+                        # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                         # #endregion
                         self.inference_engine.sleep(level=1)
             except Exception as e:
                 logger.warning(f"Error trying to load Verifier LoRA: {e}")
                 # #region agent log
-                import json
-                import time
-                with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "LoRA",
-                        "location": "vllm_rollout_spmd.py:403",
-                        "message": "Error trying to load Verifier LoRA",
-                        "data": {
-                            "error": str(e),
-                            "error_type": type(e).__name__
-                        },
-                        "timestamp": int(time.time() * 1000)
-                    }) + "\n")
+                # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                 # #endregion
 
     @contextmanager
@@ -672,24 +599,7 @@ class vLLMRollout(BaseRollout):
         """
         try:
             # #region agent log
-            import json
-            import time
-            with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "LoRA",
-                    "location": "vllm_rollout_spmd.py:625",
-                    "message": "_register_verifier_lora: checking inference_engine structure",
-                    "data": {
-                        "has_inference_engine": hasattr(self, "inference_engine"),
-                        "has_llm_engine": hasattr(self.inference_engine, "llm_engine") if hasattr(self, "inference_engine") else False,
-                        "has_worker": hasattr(self.inference_engine, "worker") if hasattr(self, "inference_engine") else False,
-                        "verifier_lora_path": self.verifier_lora_path if hasattr(self, "verifier_lora_path") else None,
-                        "verifier_lora_name": self.verifier_lora_name if hasattr(self, "verifier_lora_name") else None,
-                    },
-                    "timestamp": int(time.time() * 1000)
-                }) + "\n")
+            # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
             # #endregion
             
             # Strategy: Check if LoRA is enabled via lora_kwargs, then use fallback strategy
@@ -705,21 +615,7 @@ class vLLMRollout(BaseRollout):
                 max_loras = self.lora_kwargs.get("max_loras", 0)
             
             # #region agent log
-            with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "LoRA",
-                    "location": "vllm_rollout_spmd.py:661",
-                    "message": "_register_verifier_lora: checking LoRA config",
-                    "data": {
-                        "lora_enabled": lora_enabled,
-                        "max_loras": max_loras,
-                        "has_lora_kwargs": hasattr(self, "lora_kwargs"),
-                        "verifier_lora_path": self.verifier_lora_path if hasattr(self, "verifier_lora_path") else None,
-                    },
-                    "timestamp": int(time.time() * 1000)
-                }) + "\n")
+            # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
             # #endregion
             
             # If LoRA is enabled and max_loras > 1, use LoRA ID 1 for Verifier
@@ -728,59 +624,20 @@ class vLLMRollout(BaseRollout):
                 self.verifier_lora_int_id = 1
                 logger.info(f"Using LoRA ID 1 for Verifier (enable_lora={lora_enabled}, max_loras={max_loras}, verifier_lora_name={self.verifier_lora_name})")
                 # #region agent log
-                with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "LoRA",
-                        "location": "vllm_rollout_spmd.py:680",
-                        "message": "_register_verifier_lora: using LoRA ID 1",
-                        "data": {
-                            "verifier_lora_int_id": 1,
-                            "max_loras": max_loras
-                        },
-                        "timestamp": int(time.time() * 1000)
-                    }) + "\n")
+                # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                 # #endregion
             else:
                 self.verifier_lora_int_id = None
                 logger.warning(f"LoRA not enabled or max_loras <= 1 (enable_lora={lora_enabled}, max_loras={max_loras}). Verifier will use base model.")
                 # #region agent log
-                with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "LoRA",
-                        "location": "vllm_rollout_spmd.py:690",
-                        "message": "_register_verifier_lora: LoRA not enabled, using base model",
-                        "data": {
-                            "verifier_lora_int_id": None,
-                            "lora_enabled": lora_enabled,
-                            "max_loras": max_loras
-                        },
-                        "timestamp": int(time.time() * 1000)
-                    }) + "\n")
+                # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                 # #endregion
         except Exception as e:
             logger.warning(f"Error in _register_verifier_lora: {e}")
             import traceback
             logger.warning(traceback.format_exc())
             # #region agent log
-            import json
-            import time
-            with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "LoRA",
-                    "location": "vllm_rollout_spmd.py:625",
-                    "message": "_register_verifier_lora: exception caught",
-                    "data": {
-                        "error": str(e),
-                        "error_type": type(e).__name__
-                    },
-                    "timestamp": int(time.time() * 1000)
-                }) + "\n")
+            # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
             # #endregion
             # Fallback: If max_loras > 1, use LoRA ID 1
             if hasattr(self, "lora_kwargs") and self.lora_kwargs.get("max_loras", 0) > 1:
@@ -1826,6 +1683,7 @@ class vLLMRollout(BaseRollout):
         # Dynamic max_steps calculation based on response_budget and token_check_interval
         # This ensures we can generate up to response_budget tokens (not limited by hardcoded max_steps)
         token_check_interval = int(kwargs.get('token_check_interval', 1024))
+        min_step_tokens = int(kwargs.get('min_step_tokens', token_check_interval))  # FIX: Extract from kwargs
         default_max_steps = (response_budget // token_check_interval) + 1  # +1 to handle remainder
         max_steps = int(kwargs.get('max_steps', default_max_steps))
 
@@ -1838,7 +1696,7 @@ class vLLMRollout(BaseRollout):
         context_budget = prompt_budget + response_budget + hint_headroom
 
         logger.info(f"[BY_STEP] max_steps={max_steps} (response_budget={response_budget}, token_check_interval={token_check_interval}, "
-                    f"context_budget={context_budget}, hint_headroom={hint_headroom})")
+                    f"min_step_tokens={min_step_tokens}, context_budget={context_budget}, hint_headroom={hint_headroom})")
 
         # 6. 批量增量生成循环
         for global_step in range(max_steps):
@@ -1895,45 +1753,64 @@ class vLLMRollout(BaseRollout):
             if not batch_inputs:
                 break
             
-            # 6.3 计算统一的 max_tokens（关键修正）
-            # CRITICAL FIX: Use token_check_interval to limit step size
-            # This ensures Verifier is called at regular intervals, not just at the end
-            # Only count model-generated tokens against the response budget; hints do not consume budget.
+            # 6.3 计算统一的 max_tokens（FIX: 使用 max 而不是 min）
+            #
+            # 问题：之前使用 min(gen_remaining_list) 导致 batch 中任何一个样本接近完成时，
+            #      所有其他样本也被限制，只能生成很少的 tokens
+            #
+            # 解决：使用 max(gen_remaining_list)，让预算多的样本能生成更多
+            #       然后通过后处理截断，防止超出单个样本的 budget
+            #
             if not gen_remaining_list or not context_remaining_list:
                 break
 
-            # Use the tightest remaining budget across the batch to avoid over-running any sample
-            context_budget_remaining = min(context_remaining_list)
-            # Note: token_check_interval already defined above (line ~1842), don't redefine here
-            min_step_tokens = int(kwargs.get('min_step_tokens', token_check_interval))  # Ignore stop signals until this many tokens since last boundary
-            raw_max_remaining = min(min(gen_remaining_list), context_budget_remaining)
+            # 使用最大的剩余 budget（而不是最小的）
+            # 这样预算多的样本不会被预算少的样本拖累
+            # FIX: gen_remaining 和 context_remaining 都用 max()
+            active_gen_remaining = [r for r in gen_remaining_list if r > 0]
+            if not active_gen_remaining:
+                break
+            active_context_remaining = [r for r in context_remaining_list if r > 0]
+            if not active_context_remaining:
+                break
+
+            max_gen_remaining = max(active_gen_remaining)
+            max_context_remaining = max(active_context_remaining)  # FIX: min → max
+            raw_max_remaining = min(max_gen_remaining, max_context_remaining)
             max_remaining = min(token_check_interval, raw_max_remaining)
 
-            if max_remaining <= 0:
-                # Should not happen because we filter per-sample remaining > 0 above.
-                logger.error(f"[BY_STEP] Step {global_step}: max_remaining<=0 after filtering; breaking. raw_max_remaining={raw_max_remaining}")
-                break
-            
-            # 6.4 批量生成到下一个 boundary
-            try:
-                # 转换格式
-                batch_inputs_processed = []
-                for inp in batch_inputs:
-                    batch_inputs_processed.append(
-                        _pre_process_inputs(self.pad_token_id, torch.tensor(inp, device=idx.device))
-                    )
+            # Debug log: 显示剩余 budget 分布
+            if len(gen_remaining_list) > 1:
+                logger.info(
+                    f"[BY_STEP] Step {global_step}: gen_remaining=[min={min(gen_remaining_list)}, max={max_gen_remaining}], "
+                    f"context_remaining=[min={min(context_remaining_list)}, max={max_context_remaining}], "
+                    f"max_remaining={max_remaining}"
+                )
 
-                # 使用统一的 sampling_params（修正）
+            if max_remaining <= 0:
+                logger.error(f"[BY_STEP] Step {global_step}: max_remaining<=0; breaking.")
+                break
+
+            # 6.4 批量生成到下一个 boundary
+            batch_inputs_processed = []
+            for inp in batch_inputs:
+                batch_inputs_processed.append(
+                    _pre_process_inputs(self.pad_token_id, torch.tensor(inp, device=idx.device))
+                )
+
+            try:
                 sampling_override = dict(
-                    stop=[],  # handle stop locally to enforce min_step_tokens gap
+                    stop=[],  # handle stop locally
                     stop_token_ids=[],
                     max_tokens=max_remaining,
-                    include_stop_str_in_output=True,  # Keep stop symbols in text/token_ids for training/logging
+                    include_stop_str_in_output=True,
                     **exp_kwargs,
                 )
-                # Defensive: only pass ignore_eos if supported by current vLLM SamplingParams
-                if hasattr(self.sampling_params, "ignore_eos"):
-                    sampling_override["ignore_eos"] = True
+                # FIX: Don't ignore EOS to prevent infinite loops
+                # Previously set ignore_eos=True which caused models to continue generating
+                # after producing EOS, leading to repetitive output
+                # if hasattr(self.sampling_params, "ignore_eos"):
+                #     sampling_override["ignore_eos"] = True
 
                 with self.update_sampling_params(**sampling_override):
                     step_output = self.inference_engine.generate(
@@ -1946,24 +1823,19 @@ class vLLMRollout(BaseRollout):
             except Exception as e:
                 logger.error(f"Generation error at step {global_step}: {e}")
                 metrics['errors'] += len(batch_indices)
-                # 标记失败样本为完成
                 for b in batch_indices:
                     sample_states[b]['is_complete'] = True
                     sample_states[b]['error'] = str(e)
                 continue
 
             # 6.5 提取新生成的 tokens（批量处理）
-            # CRITICAL FIX: Do NOT use _extract_vllm_outputs because it pads to max_length
-            # In by_step incremental generation, we only want the actual generated tokens,
-            # NOT the padded ones! Otherwise PAD tokens get added to response_tokens.
             step_responses = []
             step_log_probs = []
-            step_finish_reasons = []  # CRITICAL: Track finish_reason to fix stop detection
+            step_finish_reasons = []
             for output in step_output:
                 for sample_id in range(len(output.outputs)):
-                    # Extract unpadded token_ids directly from vLLM output
                     response_ids = output.outputs[sample_id].token_ids
-                    step_responses.append(response_ids)  # Keep as list (unpadded)
+                    step_responses.append(response_ids)
 
                     # Extract logprobs
                     curr_log_prob = []
@@ -1971,11 +1843,11 @@ class vLLMRollout(BaseRollout):
                         curr_log_prob.append(logprob[response_ids[i]].logprob)
                     step_log_probs.append(curr_log_prob)
 
-                    # Extract finish_reason for diagnostics (stop is handled locally)
+                    # Extract finish_reason
                     finish_reason = output.outputs[sample_id].finish_reason
                     step_finish_reasons.append(finish_reason)
 
-            # CRITICAL DIAGNOSTIC: Verify vLLM output count matches input count
+            # 6.6 更新每个样本的状态并检测停止
             if len(step_responses) != len(batch_indices):
                 logger.error(
                     f"[MISMATCH] vLLM output count != input count! "
@@ -1996,11 +1868,19 @@ class vLLMRollout(BaseRollout):
 
             for i, b in enumerate(batch_indices):
                 state = sample_states[b]
-                step_tokens = step_responses[i]  # vLLM 返回的 token 列表
+                step_tokens = list(step_responses[i])  # FIX: 确保是 list，vLLM 可能返回 tuple
                 finish_reason = step_finish_reasons[i]  # 获取结束原因
                 state['last_finish_reason'] = finish_reason  # Track last finish reason
                 if state.get('first_step_tokens_len') is None:
                     state['first_step_tokens_len'] = len(step_tokens)
+
+                # 获取该样本的剩余 budget
+                gen_len = sum(1 for m in state['loss_masks'] if m == 1)
+                sample_gen_remaining = response_budget - gen_len
+
+                # 获取该样本的剩余 context budget（FIX: 也需要检查，防止超出 context budget）
+                current_input_len = len(state['prompt_tokens']) + len(state['response_tokens'])
+                sample_context_remaining = context_budget - current_input_len
 
                 # 获取实际发送给 vLLM 的输入（去 padding 后），用于前缀检测
                 sent_input_ids = batch_inputs_processed[i]
@@ -2012,25 +1892,51 @@ class vLLMRollout(BaseRollout):
                 else:
                     new_tokens = step_tokens
 
+                # ========== 后处理截断：防止超出该样本的 budget ==========
+                # FIX: 由于使用 max() 而不是 min()，预算少的样本可能被超额生成
+                # 需要截断到该样本的实际剩余 budget
+                # 同时检查 gen_budget 和 context_budget，取最小值
+                effective_budget = min(sample_gen_remaining, sample_context_remaining)
+
+                # 边界检查：如果 effective_budget <= 0，说明该样本已经超出预算
+                if effective_budget <= 0:
+                    logger.warning(
+                        f"[BUDGET OVERFLOW] Step {global_step}, Sample {b}: effective_budget={effective_budget} <= 0 "
+                        f"(gen={sample_gen_remaining}, context={sample_context_remaining}), discarding new_tokens."
+                    )
+                    state['is_complete'] = True
+                    state['last_finish_reason'] = 'budget_overflow'
+                    continue
+
+                truncated = False
+                if len(new_tokens) > effective_budget:
+                    logger.info(
+                        f"[TRUNCATE] Step {global_step}, Sample {b}: Generated {len(new_tokens)} > effective_budget {effective_budget} "
+                        f"(gen={sample_gen_remaining}, context={sample_context_remaining}), truncating."
+                    )
+                    new_tokens = new_tokens[:effective_budget]
+                    truncated = True
+                    # 注意：不在这里设置 is_complete，等添加 tokens 后再设置
+
                 # ========== 空响应诊断 ==========
                 if len(new_tokens) == 0:
                     logger.warning(
                         f"[EMPTY RESPONSE] Step {global_step}, Sample {b}: finish_reason='{finish_reason}', "
                         f"input_len={len(sent_input_ids)}, step_tokens_len={len(step_tokens)}, "
-                        f"max_remaining={max_remaining}, response_budget={response_budget}, "
-                        f"prompt_tail={sent_input_ids[-5:]}, raw_output_snippet={step_tokens[:10]}..."
+                        f"sample_gen_remaining={sample_gen_remaining}, sample_context_remaining={sample_context_remaining}, "
+                        f"max_remaining={max_remaining}, prompt_tail={sent_input_ids[-5:]}, raw_output_snippet={step_tokens[:10]}..."
                     )
                     if finish_reason == 'length':
                         logger.error(
                             f"[CRITICAL] Step {global_step}, Sample {b}: length stop with 0 new tokens. "
                             f"state_response_len={len(state['response_tokens'])}, budget={response_budget}, "
-                            f"total_context={len(sent_input_ids)}"
+                            f"total_context={current_input_len}"
                         )
 
                 # 调试日志 - 增强版
-                current_input_len = len(state['prompt_tokens']) + len(state['response_tokens'])
                 logger.debug(f"Step {global_step}, Sample {b}: step_tokens_len={len(step_tokens)}, new_tokens_len={len(new_tokens)}, "
-                            f"finish_reason={finish_reason}, current_input_len={current_input_len}")
+                            f"finish_reason={finish_reason}, current_input_len={current_input_len}, "
+                            f"sample_gen_remaining={sample_gen_remaining}, sample_context_remaining={sample_context_remaining}")
 
                 # CRITICAL DIAGNOSTIC: Check for PAD tokens in new_tokens
                 if self.pad_token_id in new_tokens:
@@ -2073,6 +1979,16 @@ class vLLMRollout(BaseRollout):
                 state['step_count'] += 1
                 state['tokens_since_boundary'] += len(new_tokens)
 
+                # ========== 处理截断后的完成状态 ==========
+                # FIX: 在添加 tokens 后再标记完成，确保截断的 tokens 不会丢失
+                if truncated:
+                    state['is_complete'] = True
+                    if effective_budget == sample_gen_remaining:
+                        state['last_finish_reason'] = 'gen_budget_exhausted'
+                    else:
+                        state['last_finish_reason'] = 'context_budget_exhausted'
+                    continue  # 跳过 Verifier 调用
+
                 # 检查是否应该结束
                 if eos_token_id is not None and eos_token_id in new_tokens:
                     state['is_complete'] = True
@@ -2102,7 +2018,8 @@ class vLLMRollout(BaseRollout):
                 # CRITICAL FIX: ALWAYS call Verifier at each step boundary (unless max_interventions reached)
                 # This ensures Verifier is called regularly, not just when stop sequence is hit
                 # Without this fix, Verifier was almost never called → hints empty → EXP_STREAM detection failed
-                if len(state['hints']) < intervention_policy.max_interventions:
+                # FIX: Also skip if sample is already complete (e.g., after truncation)
+                if not state.get('is_complete', False) and len(state['hints']) < intervention_policy.max_interventions:
                     # Prepare Verifier input
                     current_reasoning = tokenizer.decode(state['response_tokens'], skip_special_tokens=True)
 
