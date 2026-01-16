@@ -369,11 +369,16 @@ class vLLMRollout(BaseRollout):
                 if hasattr(self.inference_engine, "add_lora"):
                     # vLLM supports runtime LoRA loading via add_lora
                     try:
-                        self.inference_engine.add_lora(
+                        lora_ret = self.inference_engine.add_lora(
                             adapter_name=self.verifier_lora_name,
                             adapter_path=self.verifier_lora_path
                         )
-                        logger.info(f"Successfully loaded Verifier LoRA from {self.verifier_lora_path}")
+                        if isinstance(lora_ret, int):
+                            self.verifier_lora_int_id = lora_ret
+                        else:
+                            # If add_lora doesn't return ID, register to get stable ID
+                            self._register_verifier_lora()
+                        logger.info(f"Successfully loaded Verifier LoRA from {self.verifier_lora_path} with ID={self.verifier_lora_int_id}")
                         # #region agent log
                         # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                         # #endregion
@@ -381,6 +386,11 @@ class vLLMRollout(BaseRollout):
                         self.inference_engine.sleep(level=1)
                     except Exception as e:
                         logger.warning(f"Failed to load Verifier LoRA via add_lora: {e}")
+                        # Fallback: try to register anyway
+                        try:
+                            self._register_verifier_lora()
+                        except Exception as reg_e:
+                            logger.warning(f"Failed to register Verifier LoRA in fallback: {reg_e}")
                         # #region agent log
                         # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                         # #endregion
@@ -489,12 +499,9 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
+        # IMPORTANT: Don't apply any loaded LoRA by default for normal rollout generation.
+        # In Co-GRPO, Verifier LoRA is applied explicitly only during Verifier generation calls.
         lora_requests = None
-        if self.lora_kwargs:
-            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
-                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path=self.verifier_lora_path)] * batch_size
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -598,6 +605,8 @@ class vLLMRollout(BaseRollout):
         that LoRA loading is needed.
         """
         try:
+            if self.verifier_lora_int_id is not None:
+                return
             # #region agent log
             # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
             # #endregion
@@ -618,17 +627,21 @@ class vLLMRollout(BaseRollout):
             # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
             # #endregion
             
-            # If LoRA is enabled and max_loras > 1, use LoRA ID 1 for Verifier
-            # This is a safe fallback that avoids accessing lora_manager
-            if lora_enabled and max_loras > 1:
+            # If LoRA is enabled, use a stable LoRA ID for Verifier requests.
+            # NOTE: vLLM's LoRARequest requires an int id; we use 1 by convention.
+            if lora_enabled and max_loras >= 1:
                 self.verifier_lora_int_id = 1
-                logger.info(f"Using LoRA ID 1 for Verifier (enable_lora={lora_enabled}, max_loras={max_loras}, verifier_lora_name={self.verifier_lora_name})")
+                logger.info(
+                    f"Using LoRA ID 1 for Verifier (enable_lora={lora_enabled}, max_loras={max_loras}, verifier_lora_name={self.verifier_lora_name})"
+                )
                 # #region agent log
                 # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                 # #endregion
             else:
                 self.verifier_lora_int_id = None
-                logger.warning(f"LoRA not enabled or max_loras <= 1 (enable_lora={lora_enabled}, max_loras={max_loras}). Verifier will use base model.")
+                logger.warning(
+                    f"LoRA not enabled or max_loras < 1 (enable_lora={lora_enabled}, max_loras={max_loras}). Verifier will use base model."
+                )
                 # #region agent log
                 # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                 # #endregion
@@ -645,6 +658,53 @@ class vLLMRollout(BaseRollout):
                 logger.info(f"Fallback: Using LoRA ID 1 for Verifier (max_loras={self.lora_kwargs.get('max_loras')})")
             else:
                 self.verifier_lora_int_id = None
+
+    def reload_verifier_lora(self, verifier_lora_path: str):
+        """Hot-reload verifier LoRA in the vLLM engine (best-effort)."""
+        if not verifier_lora_path:
+            logger.warning("reload_verifier_lora called with empty path; skipping")
+            return False
+
+        self.verifier_lora_path = verifier_lora_path
+        prev_lora_int_id = self.verifier_lora_int_id
+        try:
+            if hasattr(self.inference_engine, "wake_up"):
+                self.inference_engine.wake_up()
+            if hasattr(self.inference_engine, "remove_lora"):
+                try:
+                    self.inference_engine.remove_lora(adapter_name=self.verifier_lora_name)
+                except Exception:
+                    pass
+            if hasattr(self.inference_engine, "add_lora"):
+                lora_ret = self.inference_engine.add_lora(adapter_name=self.verifier_lora_name, adapter_path=self.verifier_lora_path)
+                if isinstance(lora_ret, int):
+                    self.verifier_lora_int_id = lora_ret
+                else:
+                    # Keep a stable ID if the backend doesn't return one.
+                    self.verifier_lora_int_id = prev_lora_int_id
+                self._register_verifier_lora()
+
+                # Verify LoRA is actually loaded
+                if hasattr(self.inference_engine, 'list_loras'):
+                    try:
+                        loaded_loras = self.inference_engine.list_loras()
+                        lora_names = [lora.lora_name for lora in loaded_loras]
+                        if self.verifier_lora_name not in lora_names:
+                            logger.error(f"Verifier LoRA {self.verifier_lora_name} not found in loaded LoRAs: {lora_names}")
+                            return False
+                        logger.info(f"Verified Verifier LoRA {self.verifier_lora_name} is loaded with ID={self.verifier_lora_int_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to verify LoRA loading: {e}")
+
+                return True
+            logger.warning("vLLM engine does not support add_lora; cannot reload verifier LoRA")
+            return False
+        finally:
+            if hasattr(self.inference_engine, "sleep"):
+                try:
+                    self.inference_engine.sleep(level=1)
+                except Exception:
+                    pass
 
     @GPUMemoryLogger(role="vllm dual stream rollout", logger=logger)
     @torch.no_grad()
@@ -914,16 +974,21 @@ class vLLMRollout(BaseRollout):
                 LoRARequest(
                     lora_name=self.verifier_lora_name,
                     lora_int_id=self.verifier_lora_int_id,
-                            lora_path=getattr(self, 'verifier_lora_path', None)  # Use actual Verifier LoRA path
+                    lora_path=getattr(self, "verifier_lora_path", None),
                 )
-            ] * batch_size
+                for _ in range(batch_size)
+            ]
 
-        # CRITICAL: Verifier must use temperature=0 for deterministic tag output
-        # Override sampling params to force greedy decoding for Verifier
+        # Use verifier-specific sampling params.
         verifier_kwargs = control_kwargs.copy()
-        verifier_kwargs["temperature"] = 0
+        verifier_cfg = self.config.get("verifier", {})
+        verifier_temperature = float(verifier_cfg.get("temperature", 1.0))
+        if verifier_temperature <= 0:
+            verifier_temperature = 1.0
+        verifier_kwargs["temperature"] = verifier_temperature
         verifier_kwargs["top_p"] = 1.0
-        verifier_kwargs["top_k"] = -1
+        # Deterministic decode by default (stable tags): sample from top-1.
+        verifier_kwargs["top_k"] = 1
 
         with self.update_sampling_params(**verifier_kwargs):
             verifier_output = self.inference_engine.generate(
@@ -1185,7 +1250,7 @@ class vLLMRollout(BaseRollout):
         }
 
 
-    def _run_verifier_inference(self, verifier_inputs, tokenizer, idx_device, exp_kwargs):
+    def _run_verifier_inference(self, verifier_inputs, tokenizer, idx_device, exp_kwargs, return_trajectories: bool = False):
         """
         批量调用 Verifier 进行推理。
         
@@ -1196,46 +1261,96 @@ class vLLMRollout(BaseRollout):
             exp_kwargs: Sampling parameters
         
         Returns:
-            List[dict]: 每个输入的决策结果，包含 'action', 'hint', 'critique'
+            If return_trajectories is False:
+                List[dict]: 每个输入的决策结果，包含 'action', 'hint', 'critique'
+            If return_trajectories is True:
+                Tuple[List[dict], Dict[str, Any]]: (decisions, trajectories)
         """
         if not verifier_inputs:
-            return []
+            return ([], {}) if return_trajectories else []
         
         try:
             # Register Verifier LoRA if needed
             if self.verifier_lora_int_id is None:
                 self._register_verifier_lora()
 
-            # CRITICAL FIX: Use chat template to format inputs
-            # Verifier was trained with chat format, must use apply_chat_template
-            # CRITICAL: Use separate system and user messages to match training data format
-            verifier_chat_inputs = []
+            verifier_cfg = self.config.get("verifier", {})
+            verifier_max_new_tokens = int(verifier_cfg.get("max_new_tokens", 512))
+            verifier_logprobs = int(verifier_cfg.get("logprobs", 1))
+
+            max_model_len = int(self.config.max_model_len or (self.config.prompt_length + self.config.response_length))
+            verifier_max_prompt_length = int(verifier_cfg.get("max_prompt_length", max_model_len - verifier_max_new_tokens))
+            # vLLM requires: len(prompt) + max_tokens <= max_model_len
+            verifier_prompt_budget = max(1, min(verifier_max_prompt_length, max_model_len - verifier_max_new_tokens))
+
+            verifier_temperature = float(verifier_cfg.get("temperature", 1.0))
+            if verifier_temperature <= 0:
+                verifier_temperature = 1.0
+
+            verifier_top_p = float(verifier_cfg.get("top_p", 1.0))
+            verifier_top_k = int(verifier_cfg.get("top_k", -1))
+            verifier_do_sample = bool(verifier_cfg.get("do_sample", False))
+            if not verifier_do_sample:
+                # Deterministic decode while keeping temperature valid for PPO logprob computation.
+                verifier_temperature = 1.0
+                verifier_top_p = 1.0
+                verifier_top_k = 1
+
+            # Build per-sample prompt_token_ids without batch padding (avoid OOM).
+            verifier_idx_list = []
+            verifier_prompt_token_ids = []
             for verifier_prompt in verifier_inputs:
+                # Heuristic structured truncation: keep the latest part of "Student Response".
+                prefix_text, sep, student_resp = verifier_prompt.partition("Student Response:")
+                if sep:
+                    user_prefix = f"{prefix_text}Student Response:\n"
+                else:
+                    user_prefix = verifier_prompt
+                    student_resp = ""
+
+                base_messages = [
+                    {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prefix},
+                ]
+                try:
+                    base_ids = tokenizer.apply_chat_template(
+                        base_messages, tokenize=True, add_generation_prompt=True
+                    )
+                except Exception:
+                    base_text = tokenizer.apply_chat_template(
+                        base_messages, tokenize=False, add_generation_prompt=True
+                    )
+                    base_ids = tokenizer.encode(base_text, add_special_tokens=False)
+
+                remaining = verifier_prompt_budget - len(base_ids)
+                if remaining > 0 and student_resp:
+                    tail_ids = tokenizer.encode(student_resp, add_special_tokens=False)
+                    tail_ids = tail_ids[-remaining:]
+                    truncated_student_resp = tokenizer.decode(tail_ids, skip_special_tokens=True)
+                    user_full = user_prefix + truncated_student_resp
+                else:
+                    user_full = user_prefix
+
                 messages = [
                     {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
-                    {"role": "user", "content": verifier_prompt}
+                    {"role": "user", "content": user_full},
                 ]
-                chat_text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                verifier_chat_inputs.append(chat_text)
+                try:
+                    prompt_ids = tokenizer.apply_chat_template(
+                        messages, tokenize=True, add_generation_prompt=True
+                    )
+                except Exception:
+                    prompt_text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
 
-            # 批量 tokenize
-            verifier_encoded = tokenizer(
-                verifier_chat_inputs,  # Use chat-formatted inputs
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.config.prompt_length + self.config.response_length,
-            )
-            verifier_input_ids = verifier_encoded["input_ids"].to(idx_device)
-            
-            # 转换格式
-            verifier_idx_list = []
-            for i in range(len(verifier_inputs)):
-                verifier_idx_list.append(_pre_process_inputs(self.pad_token_id, verifier_input_ids[i]))
+                # Final safety clamp (keep tail if still over budget).
+                if len(prompt_ids) > verifier_prompt_budget:
+                    prompt_ids = prompt_ids[-verifier_prompt_budget:]
+
+                verifier_idx_list.append(prompt_ids)
+                verifier_prompt_token_ids.append(prompt_ids)
             
             # 准备 LoRA requests
             verifier_lora_requests = None
@@ -1244,15 +1359,18 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(
                         lora_name=self.verifier_lora_name,
                         lora_int_id=self.verifier_lora_int_id,
-                                lora_path=getattr(self, 'verifier_lora_path', None)  # Use actual Verifier LoRA path
+                        lora_path=getattr(self, "verifier_lora_path", None),
                     )
-                ] * len(verifier_inputs)
+                    for _ in range(len(verifier_inputs))
+                ]
 
-            # CRITICAL: Verifier must use temperature=0 for deterministic tag output
             verifier_kwargs = exp_kwargs.copy()
-            verifier_kwargs["temperature"] = 0
-            verifier_kwargs["top_p"] = 1.0
-            verifier_kwargs["top_k"] = -1
+            verifier_kwargs["temperature"] = verifier_temperature
+            verifier_kwargs["top_p"] = verifier_top_p
+            verifier_kwargs["top_k"] = verifier_top_k
+            verifier_kwargs["n"] = 1
+            verifier_kwargs["max_tokens"] = verifier_max_new_tokens
+            verifier_kwargs["logprobs"] = verifier_logprobs
 
             # 批量生成 Verifier 响应
             with self.update_sampling_params(**verifier_kwargs):
@@ -1265,7 +1383,7 @@ class vLLMRollout(BaseRollout):
                 )
             
             verifier_responses, verifier_log_probs = _extract_vllm_outputs(
-                verifier_output, self.pad_token_id, self.config.response_length, idx_device
+                verifier_output, self.pad_token_id, verifier_max_new_tokens, idx_device
             )
             
             # 解析所有 Verifier 输出
@@ -1275,13 +1393,23 @@ class vLLMRollout(BaseRollout):
                 verifier_text = tokenizer.decode(verifier_response.tolist(), skip_special_tokens=True)
                 decision = self._parse_verifier_decision(verifier_text)
                 decisions.append(decision)
-            
-            return decisions
+            if not return_trajectories:
+                return decisions
+
+            trajectories = {
+                "prompt_token_ids": verifier_prompt_token_ids,
+                "responses": verifier_responses,
+                "old_log_probs": verifier_log_probs,
+                "temperature": verifier_temperature,
+                "max_new_tokens": verifier_max_new_tokens,
+            }
+            return decisions, trajectories
             
         except Exception as e:
             logger.warning(f"Verifier inference failed: {e}")
             # 返回默认决策（Pass）
-            return [{'action': 'Pass', 'hint': None, 'critique': f'[Error: {str(e)}]'} for _ in verifier_inputs]
+            fallback = [{'action': 'Pass', 'hint': None, 'critique': f'[Error: {str(e)}]'} for _ in verifier_inputs]
+            return (fallback, {}) if return_trajectories else fallback
     
     def _extract_verifier_hint(self, verifier_text: str) -> str:
         """
@@ -1678,6 +1806,21 @@ class vLLMRollout(BaseRollout):
             'stop_sequence_hits': 0,
             'errors': 0,
         }
+
+        # Verifier PPO trajectories (only intervention steps are used for training).
+        prompt_uids = None
+        prompt_sample_uids = None
+        if getattr(prompts, "non_tensor_batch", None) is not None:
+            if "uid" in prompts.non_tensor_batch:
+                prompt_uids = prompts.non_tensor_batch["uid"]
+            if "sample_uid" in prompts.non_tensor_batch:
+                prompt_sample_uids = prompts.non_tensor_batch["sample_uid"]
+        verifier_train_prompt_token_ids = []
+        verifier_train_response_ids = []
+        verifier_train_old_log_probs = []
+        verifier_train_parent_uids = []
+        verifier_train_parent_sample_uids = []
+        verifier_train_step_indices = []
         
         exp_start = time.time()
         # Dynamic max_steps calculation based on response_budget and token_check_interval
@@ -2033,8 +2176,8 @@ class vLLMRollout(BaseRollout):
 
             # 6.7 批量调用 Verifier
             if verifier_inputs:
-                decisions = self._run_verifier_inference(
-                    verifier_inputs, tokenizer, idx.device, exp_kwargs
+                decisions, verifier_traj = self._run_verifier_inference(
+                    verifier_inputs, tokenizer, idx.device, exp_kwargs, return_trajectories=True
                 )
 
                 for i, (b, step_idx) in enumerate(verifier_input_map):
@@ -2050,6 +2193,24 @@ class vLLMRollout(BaseRollout):
                         hint = decision['hint']
                         state['hints'].append(hint)
                         metrics['total_interventions'] += 1
+
+                        # Record verifier trajectories for training (prompt + full response + old logprobs).
+                        try:
+                            if verifier_traj:
+                                parent_uid = str(prompt_uids[b]) if prompt_uids is not None else str(b)
+                                parent_sample_uid = str(prompt_sample_uids[b]) if prompt_sample_uids is not None else str(b)
+                                prompt_token_ids = verifier_traj["prompt_token_ids"][i]
+                                response_ids = verifier_traj["responses"][i].detach().to("cpu")
+                                old_log_probs = verifier_traj["old_log_probs"][i].detach().to("cpu").to(torch.float32)
+
+                                verifier_train_prompt_token_ids.append(prompt_token_ids)
+                                verifier_train_response_ids.append(response_ids)
+                                verifier_train_old_log_probs.append(old_log_probs)
+                                verifier_train_parent_uids.append(parent_uid)
+                                verifier_train_parent_sample_uids.append(parent_sample_uid)
+                                verifier_train_step_indices.append(int(step_idx))
+                        except Exception as e:
+                            logger.warning(f"Failed to record verifier trajectory (b={b}, step_idx={step_idx}): {e}")
 
                         # 关键：将 hint 追加到 response_tokens，并设置 loss_mask 为 0
                         hint_text = f"\n\n[Guide]: {hint}\n\n"
@@ -2303,6 +2464,52 @@ class vLLMRollout(BaseRollout):
         meta_info = prompts.meta_info.copy()
         meta_info["timing"] = timing_info
 
+        # Build verifier training batch (separate DataProto) to avoid mixing batch sizes.
+        if verifier_train_prompt_token_ids:
+            verifier_cfg = self.config.get("verifier", {})
+            verifier_temperature = float(verifier_cfg.get("temperature", 1.0))
+            if verifier_temperature <= 0:
+                verifier_temperature = 1.0
+
+            verifier_prompt_len = max(len(p) for p in verifier_train_prompt_token_ids)
+            verifier_prompt_ids = pad_2d_list_to_length(
+                verifier_train_prompt_token_ids, self.pad_token_id, max_length=verifier_prompt_len, left=True
+            ).to("cpu")
+            verifier_prompt_att = (verifier_prompt_ids != self.pad_token_id).to(torch.long)
+
+            verifier_responses = torch.stack(verifier_train_response_ids, dim=0).to("cpu")
+            verifier_old_log_probs = torch.stack(verifier_train_old_log_probs, dim=0).to("cpu").to(torch.float32)
+            verifier_response_att = (verifier_responses != self.pad_token_id).to(torch.long)
+
+            verifier_input_ids = torch.cat([verifier_prompt_ids, verifier_responses], dim=1)
+            verifier_attention_mask = torch.cat([verifier_prompt_att, verifier_response_att], dim=1)
+            verifier_position_ids = (verifier_attention_mask.cumsum(dim=1) - 1) * verifier_attention_mask
+
+            verifier_batch = TensorDict(
+                {
+                    "input_ids": verifier_input_ids,
+                    "attention_mask": verifier_attention_mask,
+                    "position_ids": verifier_position_ids,
+                    "responses": verifier_responses,
+                    "old_log_probs": verifier_old_log_probs,
+                },
+                batch_size=verifier_input_ids.size(0),
+            )
+
+            verifier_non_tensor_batch = {
+                "parent_uid": np.array(verifier_train_parent_uids, dtype=object),
+                "parent_sample_uid": np.array(verifier_train_parent_sample_uids, dtype=object),
+                "step_idx": np.array(verifier_train_step_indices, dtype=np.int32),
+            }
+            verifier_meta_info = {
+                "temperature": verifier_temperature,
+                "verifier_prompt_len": int(verifier_prompt_len),
+                "verifier_response_len": int(verifier_responses.size(1)),
+            }
+            meta_info["verifier_batch"] = DataProto(
+                batch=verifier_batch, non_tensor_batch=verifier_non_tensor_batch, meta_info=verifier_meta_info
+            )
+
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
 
@@ -2418,15 +2625,21 @@ class vLLMAsyncRollout:
                     LoRARequest(
                         lora_name=self.verifier_lora_name,
                         lora_int_id=self.verifier_lora_int_id,
-                                lora_path=getattr(self, 'verifier_lora_path', None)  # Use actual Verifier LoRA path
+                        lora_path=getattr(self, "verifier_lora_path", None),
                     )
-                ] * len(verifier_inputs)
+                    for _ in range(len(verifier_inputs))
+                ]
 
-            # CRITICAL: Verifier must use temperature=0 for deterministic tag output
+            # Use verifier-specific sampling params.
             verifier_kwargs = exp_kwargs.copy()
-            verifier_kwargs["temperature"] = 0
+            verifier_cfg = self.config.get("verifier", {})
+            verifier_temperature = float(verifier_cfg.get("temperature", 1.0))
+            if verifier_temperature <= 0:
+                verifier_temperature = 1.0
+            verifier_kwargs["temperature"] = verifier_temperature
             verifier_kwargs["top_p"] = 1.0
-            verifier_kwargs["top_k"] = -1
+            # Deterministic decode by default (stable tags): sample from top-1.
+            verifier_kwargs["top_k"] = 1
 
             # 批量生成 Verifier 响应
             with self.update_sampling_params(**verifier_kwargs):

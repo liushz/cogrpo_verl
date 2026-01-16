@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import warnings
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Union
 
@@ -152,6 +153,13 @@ class ActorRolloutRefWorker(Worker):
                 self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
 
             if self.config.actor.ppo_micro_batch_size_per_gpu is not None:
+                if not isinstance(self.config.actor.ppo_micro_batch_size_per_gpu, int):
+                    try:
+                        self.config.actor.ppo_micro_batch_size_per_gpu = int(self.config.actor.ppo_micro_batch_size_per_gpu)
+                    except Exception as exc:  # noqa: BLE001
+                        raise TypeError(
+                            f"ppo_micro_batch_size_per_gpu must be int, got {type(self.config.actor.ppo_micro_batch_size_per_gpu)}: {self.config.actor.ppo_micro_batch_size_per_gpu}"
+                        ) from exc
                 assert self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
                 assert self.config.actor.ppo_mini_batch_size // self.config.actor.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
 
@@ -268,6 +276,43 @@ class ActorRolloutRefWorker(Worker):
                 # Convert config to regular Python types before creating PEFT model
                 lora_config = {"task_type": TaskType.CAUSAL_LM, "r": self.config.model.lora_rank, "lora_alpha": self.config.model.lora_alpha, "target_modules": convert_to_regular_types(self.config.model.target_modules), "bias": "none"}
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                # PEFT may create adapter params in fp32; keep FSDP happy by matching base dtype.
+                actor_module.to(torch_dtype)
+
+            # Verifier LoRA (Co-GRPO): keep base trainable for actor, optimize LoRA separately.
+            if role == "actor":
+                verifier_cfg = self.config.get("verifier", None)
+                verifier_lora_rank = int(verifier_cfg.get("lora_rank", 0)) if verifier_cfg is not None else 0
+                verifier_lora_path = verifier_cfg.get("lora_path", None) if verifier_cfg is not None else None
+                if verifier_lora_rank > 0:
+                    if hasattr(actor_module, "peft_config") and self._is_lora:
+                        logger.warning("Actor is already a PEFT LoRA model; verifier LoRA multi-adapter is not enabled in this build.")
+                    else:
+                        from peft import PeftModel
+
+                        actor_module.enable_input_require_grads()
+                        if verifier_lora_path:
+                            # Load a pretrained verifier adapter; PEFT may freeze base by default.
+                            actor_module = PeftModel.from_pretrained(actor_module, verifier_lora_path, is_trainable=True)
+                        else:
+                            verifier_lora_config = {
+                                "task_type": TaskType.CAUSAL_LM,
+                                "r": int(verifier_cfg.get("lora_rank", 0)),
+                                "lora_alpha": int(verifier_cfg.get("lora_alpha", 32)),
+                                "lora_dropout": float(verifier_cfg.get("lora_dropout", 0.0)),
+                                "target_modules": convert_to_regular_types(verifier_cfg.get("target_modules", ["q_proj", "v_proj"])),
+                                "bias": "none",
+                            }
+                            actor_module = get_peft_model(actor_module, LoraConfig(**verifier_lora_config))
+
+                        # Ensure base model params remain trainable for actor full-parameter updates.
+                        for name, param in actor_module.named_parameters():
+                            if "lora_" not in name:
+                                param.requires_grad = True
+                            else:
+                                param.requires_grad = True
+                        # PEFT may create verifier adapter params in fp32; FSDP2 requires uniform original dtypes.
+                        actor_module.to(torch_dtype)
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -351,8 +396,15 @@ class ActorRolloutRefWorker(Worker):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
+            # If verifier LoRA is attached, exclude LoRA params from the actor optimizer (base-only update).
+            verifier_lora_enabled = bool(self.config.get("verifier", {}).get("lora_rank", 0) > 0)
+            if verifier_lora_enabled and not self._is_lora and hasattr(actor_module_fsdp, "named_parameters"):
+                actor_params = [p for n, p in actor_module_fsdp.named_parameters() if p.requires_grad and "lora_" not in n]
+            else:
+                actor_params = [p for p in actor_module_fsdp.parameters() if p.requires_grad]
+
             actor_optimizer = optim.AdamW(
-                actor_module_fsdp.parameters(),
+                actor_params,
                 lr=optim_config.lr,
                 betas=optim_config.get("betas", (0.9, 0.999)),
                 weight_decay=optim_config.get("weight_decay", 1e-2),
@@ -431,28 +483,7 @@ class ActorRolloutRefWorker(Worker):
                 verifier_lora_name = verifier_lora_config.get("lora_name", "verifier_lora")
                 verifier_lora_path = verifier_lora_config.get("lora_path", None)
 
-                # #region agent log
-                import json
-                import time
-                with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "LoRA-FIX",
-                        "location": "fsdp_workers.py:425",
-                        "message": "Verifier LoRA enabled with enable_lora=True, tokenizer_mode=auto in vllm_rollout_spmd",
-                        "data": {
-                            "lora_kwargs": lora_kwargs,
-                            "verifier_lora_rank": verifier_lora_rank,
-                            "verifier_lora_name": verifier_lora_name,
-                            "verifier_lora_path": verifier_lora_path,
-                            "max_loras": max_loras,
-                            "max_lora_rank": max_lora_rank,
-                            "actor_uses_lora": self._is_lora,
-                        },
-                        "timestamp": int(time.time() * 1000)
-                    }) + "\n")
-                # #endregion
+                # NOTE: Disabled ad-hoc debug logging to a fixed file path (not needed in normal runs).
             
             if vllm_mode == "customized":
                 rollout_kwargs = {"lora_kwargs": lora_kwargs}
@@ -589,6 +620,9 @@ class ActorRolloutRefWorker(Worker):
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+                if getattr(self, "verifier_optimizer", None) is not None:
+                    offload_fsdp_optimizer(optimizer=self.verifier_optimizer)
+                    log_gpu_memory_usage("After offload verifier optimizer during init", logger=logger)
 
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
@@ -596,6 +630,57 @@ class ActorRolloutRefWorker(Worker):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
             self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
+
+            # Build verifier optimizer/actor (LoRA-only) if enabled.
+            self.verifier_optimizer = None
+            self.verifier_lr_scheduler = None
+            self.verifier_actor = None
+            verifier_cfg = self.config.get("verifier", {})
+            verifier_lora_enabled = bool(verifier_cfg.get("lora_rank", 0) > 0)
+            if verifier_lora_enabled:
+                from torch import optim
+                from verl.utils.torch_functional import get_constant_schedule_with_warmup
+
+                # Collect LoRA parameters by name.
+                name2param = {n: p for n, p in self.actor_module_fsdp.named_parameters()}
+                lora_param_names = [n for n in name2param.keys() if "lora_" in n]
+                lora_params = [name2param[n] for n in lora_param_names]
+
+                if not lora_params:
+                    logger.warning("verifier.lora_rank > 0 but no LoRA params found on actor model; verifier updates disabled.")
+                else:
+                    # Verifier optimizer on LoRA params only.
+                    self.verifier_optimizer = optim.AdamW(
+                        lora_params,
+                        lr=float(verifier_cfg.get("optim", {}).get("lr", 1e-5)),
+                        betas=verifier_cfg.get("optim", {}).get("betas", (0.9, 0.999)),
+                        weight_decay=float(verifier_cfg.get("optim", {}).get("weight_decay", 0.0)),
+                    )
+                    num_warmup_steps = int(verifier_cfg.get("optim", {}).get("lr_warmup_steps", 0))
+                    self.verifier_lr_scheduler = get_constant_schedule_with_warmup(
+                        optimizer=self.verifier_optimizer, num_warmup_steps=num_warmup_steps
+                    )
+                    if self._is_offload_optimizer:
+                        offload_fsdp_optimizer(optimizer=self.verifier_optimizer)
+                        log_gpu_memory_usage("After offload verifier optimizer during init", logger=logger)
+
+                    # Verifier PPO config: start from actor config, but disable KL.
+                    verifier_actor_cfg = OmegaConf.create(OmegaConf.to_container(self.config.actor, resolve=True))
+                    OmegaConf.set_struct(verifier_actor_cfg, False)
+                    with open_dict(verifier_actor_cfg):
+                        verifier_actor_cfg.use_kl_loss = False
+                        verifier_actor_cfg.kl_loss_coef = 0.0
+                    self.verifier_actor = DataParallelPPOActor(
+                        config=verifier_actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.verifier_optimizer
+                    )
+
+                    # FSDP safety: verifier optimizer must not include base params, and actor optimizer must not include LoRA params.
+                    lora_param_ids = {id(p) for p in lora_params}
+                    actor_opt_param_ids = {id(p) for g in self.actor_optimizer.param_groups for p in g["params"]}
+                    verifier_opt_param_ids = {id(p) for g in self.verifier_optimizer.param_groups for p in g["params"]}
+
+                    assert verifier_opt_param_ids.issubset(lora_param_ids), "verifier_optimizer contains non-LoRA parameters"
+                    assert actor_opt_param_ids.isdisjoint(lora_param_ids), "actor_optimizer must exclude verifier LoRA parameters"
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
@@ -657,7 +742,16 @@ class ActorRolloutRefWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                disable_ctx = nullcontext()
+                if getattr(self, "verifier_optimizer", None) is not None:
+                    target = getattr(self.actor, "actor_module", None) or self.actor_module_fsdp
+                    debug_asserts = os.getenv("VERL_DEBUG_ASSERTS", "0") == "1" or os.getenv("VERL_LOGGING_LEVEL", "").upper() == "DEBUG"
+                    if debug_asserts and dist.get_rank() == 0:
+                        assert hasattr(target, "disable_adapter"), "Verifier LoRA enabled but model does not support disable_adapter()"
+                    if hasattr(target, "disable_adapter"):
+                        disable_ctx = target.disable_adapter()
+                with disable_ctx:
+                    metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -682,6 +776,102 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def update_verifier(self, data: DataProto):
+        """Update verifier LoRA parameters with PPO on verifier trajectories."""
+        data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+
+        assert self._is_actor
+        if getattr(self, "verifier_actor", None) is None or getattr(self, "verifier_optimizer", None) is None:
+            return DataProto(meta_info={"metrics": {"verifier/enabled": 0.0}})
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.verifier_optimizer, device_id=get_device_id())
+
+        # Adjust mini/micro batch sizes to avoid divisibility issues for small verifier batches.
+        bsz = len(data)
+        if bsz == 0:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.verifier_optimizer)
+            return DataProto(meta_info={"metrics": {"verifier/enabled": 0.0}})
+        with open_dict(self.verifier_actor.config):
+            micro = int(getattr(self.verifier_actor.config, "ppo_micro_batch_size_per_gpu", 1))
+            micro = max(1, min(micro, bsz))
+            if bsz % micro != 0:
+                micro = 1
+            mini = int(getattr(self.verifier_actor.config, "ppo_mini_batch_size", bsz))
+            mini = max(micro, min(mini, bsz))
+            if bsz % mini != 0:
+                mini = bsz
+            if mini % micro != 0:
+                micro = 1
+                if mini % micro != 0:
+                    mini = bsz
+            self.verifier_actor.config.ppo_micro_batch_size_per_gpu = micro
+            self.verifier_actor.config.ppo_mini_batch_size = mini
+            if "temperature" not in data.meta_info:
+                verifier_cfg = self.config.get("verifier", {})
+                verifier_temperature = float(verifier_cfg.get("temperature", 1.0))
+                if verifier_temperature <= 0:
+                    verifier_temperature = 1.0
+                data.meta_info["temperature"] = verifier_temperature
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+
+            # Clear any stale grads on base + LoRA params to avoid contaminating actor update.
+            try:
+                self.actor_module_fsdp.zero_grad(set_to_none=True)
+            except TypeError:
+                self.actor_module_fsdp.zero_grad()
+
+            with Timer(name="update_verifier", logger=None) as timer:
+                metrics = self.verifier_actor.update_policy(data=data)
+            _ = timer.last
+
+            debug_asserts = os.getenv("VERL_DEBUG_ASSERTS", "0") == "1" or os.getenv("VERL_LOGGING_LEVEL", "").upper() == "DEBUG"
+            if debug_asserts and dist.get_rank() == 0:
+                # Verify base params don't keep grads after verifier update (they will be cleared below).
+                nonzero = []
+                for name, param in self.actor_module_fsdp.named_parameters():
+                    if "lora_" not in name and param.grad is not None:
+                        nonzero.append(name)
+                        if len(nonzero) >= 8:
+                            break
+                if nonzero:
+                    logger.warning(
+                        f"Base params have non-zero grads after verifier update (expected, will be cleared). "
+                        f"Examples: {nonzero[:8]}"
+                    )
+
+            lr = self.verifier_lr_scheduler.get_last_lr()[0]
+            metrics["verifier/lr"] = lr
+            self.verifier_lr_scheduler.step()
+            metrics["verifier/enabled"] = 1.0
+
+            # Clear grads again to ensure base grads from verifier backward do not leak.
+            try:
+                self.actor_module_fsdp.zero_grad(set_to_none=True)
+            except TypeError:
+                self.actor_module_fsdp.zero_grad()
+
+            output = DataProto(meta_info={"metrics": metrics})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_verifier", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.verifier_optimizer)
+            log_gpu_memory_usage("After offload verifier optimizer during update_verifier", logger=logger)
 
         return output
 
@@ -795,7 +985,14 @@ class ActorRolloutRefWorker(Worker):
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
-        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        disable_for_policy = getattr(self, "verifier_optimizer", None) is not None
+        if is_lora or disable_for_policy:
+            debug_asserts = os.getenv("VERL_DEBUG_ASSERTS", "0") == "1" or os.getenv("VERL_LOGGING_LEVEL", "").upper() == "DEBUG"
+            if debug_asserts and dist.get_rank() == 0:
+                assert hasattr(self.actor.actor_module, "disable_adapter"), "Expected disable_adapter() when LoRA is enabled"
+            adapter_ctx = self.actor.actor_module.disable_adapter()
+        else:
+            adapter_ctx = nullcontext()
         data = data.to(get_device_id())
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
@@ -881,9 +1078,12 @@ class ActorRolloutRefWorker(Worker):
             if dist.get_rank() == 0:
                 os.makedirs(lora_save_path, exist_ok=True)
                 peft_config = asdict(peft_model.peft_config.get("default", {}))
-                peft_config["task_type"] = peft_config["task_type"].value
-                peft_config["peft_type"] = peft_config["peft_type"].value
-                peft_config["target_modules"] = list(peft_config["target_modules"])
+                task_type = peft_config.get("task_type", None)
+                peft_type = peft_config.get("peft_type", None)
+                peft_config["task_type"] = getattr(task_type, "value", task_type)
+                peft_config["peft_type"] = getattr(peft_type, "value", peft_type)
+                target_modules = peft_config.get("target_modules", None)
+                peft_config["target_modules"] = list(target_modules) if target_modules is not None else []
             try:
                 if fsdp_version(self.actor_module_fsdp) > 0:
                     self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
@@ -900,6 +1100,71 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_verifier_lora(self, local_path: str):
+        """Save the current verifier LoRA adapter (PEFT default adapter) to `local_path`."""
+        from verl.utils.logger import log_with_rank
+
+        assert self._is_actor
+        if getattr(self, "verifier_optimizer", None) is None:
+            return
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
+        if not hasattr(peft_model, "peft_config"):
+            log_with_rank("Verifier LoRA save skipped: model has no peft_config", rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
+            return
+
+        lora_save_path = local_path
+        peft_config = {}
+        peft_cfg_obj = peft_model.peft_config.get("default", None)
+        if peft_cfg_obj is None:
+            try:
+                peft_cfg_obj = next(iter(peft_model.peft_config.values()))
+            except StopIteration:
+                peft_cfg_obj = None
+        if peft_cfg_obj is None:
+            log_with_rank("Verifier LoRA save skipped: peft_config has no adapters", rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
+            return
+
+        if dist.get_rank() == 0:
+            os.makedirs(lora_save_path, exist_ok=True)
+            peft_config = asdict(peft_cfg_obj)
+            task_type = peft_config.get("task_type", None)
+            peft_type = peft_config.get("peft_type", None)
+            peft_config["task_type"] = getattr(task_type, "value", task_type)
+            peft_config["peft_type"] = getattr(peft_type, "value", peft_type)
+            target_modules = peft_config.get("target_modules", None)
+            peft_config["target_modules"] = list(target_modules) if target_modules is not None else []
+
+        try:
+            if fsdp_version(self.actor_module_fsdp) > 0:
+                self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
+                lora_params = layered_summon_lora_params(self.actor_module_fsdp)
+                if dist.get_rank() == 0:
+                    save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
+                    with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                        json.dump(peft_config, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            log_with_rank(f"Save Verifier LoRA Adapter Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
+
+        dist.barrier()
+        log_with_rank(f"[rank-{self.rank}]: Saved verifier LoRA adapter to: {lora_save_path}", rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reload_verifier_lora(self, verifier_lora_path: str):
+        """Reload verifier LoRA weights in rollout engines (vLLM)."""
+        if not self._is_rollout:
+            return
+        if hasattr(self.rollout, "reload_verifier_lora"):
+            return self.rollout.reload_verifier_lora(verifier_lora_path)
+        logger.warning(f"Rollout {type(self.rollout)} does not support reload_verifier_lora")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
@@ -955,6 +1220,13 @@ class CriticWorker(Worker):
             self.config.forward_micro_batch_size_per_gpu = self.config.forward_micro_batch_size
 
         if self.config.ppo_micro_batch_size_per_gpu is not None:
+            if not isinstance(self.config.ppo_micro_batch_size_per_gpu, int):
+                try:
+                    self.config.ppo_micro_batch_size_per_gpu = int(self.config.ppo_micro_batch_size_per_gpu)
+                except Exception as exc:  # noqa: BLE001
+                    raise TypeError(
+                        f"ppo_micro_batch_size_per_gpu must be int, got {type(self.config.ppo_micro_batch_size_per_gpu)}: {self.config.ppo_micro_batch_size_per_gpu}"
+                    ) from exc
             assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
         self._is_lora = self.config.model.get("lora_rank", 0) > 0
