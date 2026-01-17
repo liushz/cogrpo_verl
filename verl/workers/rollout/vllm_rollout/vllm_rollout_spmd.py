@@ -670,35 +670,80 @@ class vLLMRollout(BaseRollout):
         try:
             if hasattr(self.inference_engine, "wake_up"):
                 self.inference_engine.wake_up()
+
+            # Try to remove old LoRA first
             if hasattr(self.inference_engine, "remove_lora"):
                 try:
-                    self.inference_engine.remove_lora(adapter_name=self.verifier_lora_name)
-                except Exception:
-                    pass
+                    # Check if it uses LoRARequest or simple name
+                    if hasattr(self.inference_engine.remove_lora, "__code__"):
+                        import inspect
+                        sig = inspect.signature(self.inference_engine.remove_lora)
+                        if "lora_id" in sig.parameters:
+                            # AsyncLLMEngine uses lora_id (int)
+                            self.inference_engine.remove_lora(lora_id=prev_lora_int_id)
+                        else:
+                            # Fallback: try name-based removal
+                            self.inference_engine.remove_lora(lora_name=self.verifier_lora_name)
+                except Exception as e:
+                    logger.debug(f"Failed to remove old LoRA (may not exist): {e}")
+
+            # Try to add new LoRA
             if hasattr(self.inference_engine, "add_lora"):
-                lora_ret = self.inference_engine.add_lora(adapter_name=self.verifier_lora_name, adapter_path=self.verifier_lora_path)
-                if isinstance(lora_ret, int):
-                    self.verifier_lora_int_id = lora_ret
-                else:
-                    # Keep a stable ID if the backend doesn't return one.
-                    self.verifier_lora_int_id = prev_lora_int_id
-                self._register_verifier_lora()
+                try:
+                    # Check if add_lora expects LoRARequest (AsyncLLMEngine) or kwargs (older API)
+                    import inspect
+                    sig = inspect.signature(self.inference_engine.add_lora)
 
-                # Verify LoRA is actually loaded
-                if hasattr(self.inference_engine, 'list_loras'):
-                    try:
-                        loaded_loras = self.inference_engine.list_loras()
-                        lora_names = [lora.lora_name for lora in loaded_loras]
-                        if self.verifier_lora_name not in lora_names:
-                            logger.error(f"Verifier LoRA {self.verifier_lora_name} not found in loaded LoRAs: {lora_names}")
+                    if "lora_request" in sig.parameters:
+                        # AsyncLLMEngine API: add_lora(lora_request: LoRARequest) -> bool
+                        from vllm.lora.request import LoRARequest
+                        lora_req = LoRARequest(
+                            lora_name=self.verifier_lora_name,
+                            lora_int_id=prev_lora_int_id,
+                            lora_path=verifier_lora_path
+                        )
+                        success = self.inference_engine.add_lora(lora_request=lora_req)
+                        if success:
+                            self.verifier_lora_int_id = prev_lora_int_id
+                            logger.info(f"Successfully reloaded Verifier LoRA via AsyncLLMEngine API: {verifier_lora_path}")
+                        else:
+                            logger.error(f"Failed to reload Verifier LoRA: add_lora returned False")
                             return False
-                        logger.info(f"Verified Verifier LoRA {self.verifier_lora_name} is loaded with ID={self.verifier_lora_int_id}")
-                    except Exception as e:
-                        logger.warning(f"Failed to verify LoRA loading: {e}")
+                    else:
+                        # Older/unknown API: try kwargs
+                        lora_ret = self.inference_engine.add_lora(
+                            adapter_name=self.verifier_lora_name,
+                            adapter_path=verifier_lora_path
+                        )
+                        if isinstance(lora_ret, int):
+                            self.verifier_lora_int_id = lora_ret
+                        else:
+                            self.verifier_lora_int_id = prev_lora_int_id
+                        logger.info(f"Successfully reloaded Verifier LoRA via legacy API: {verifier_lora_path}")
 
-                return True
-            logger.warning("vLLM engine does not support add_lora; cannot reload verifier LoRA")
-            return False
+                    self._register_verifier_lora()
+
+                    # Verify LoRA is actually loaded
+                    if hasattr(self.inference_engine, 'list_loras'):
+                        try:
+                            loaded_loras = self.inference_engine.list_loras()
+                            if hasattr(loaded_loras, '__iter__'):
+                                lora_names = [l.lora_name if hasattr(l, 'lora_name') else str(l) for l in loaded_loras]
+                                if self.verifier_lora_name not in lora_names:
+                                    logger.warning(f"Verifier LoRA {self.verifier_lora_name} not found in loaded LoRAs: {lora_names}")
+                                else:
+                                    logger.info(f"Verified Verifier LoRA {self.verifier_lora_name} is loaded with ID={self.verifier_lora_int_id}")
+                        except Exception as e:
+                            logger.debug(f"Could not verify LoRA loading: {e}")
+
+                    return True
+
+                except Exception as e:
+                    logger.error(f"Failed to reload Verifier LoRA via add_lora: {e}")
+                    return False
+            else:
+                logger.warning("vLLM engine does not support add_lora; cannot reload verifier LoRA")
+                return False
         finally:
             if hasattr(self.inference_engine, "sleep"):
                 try:
