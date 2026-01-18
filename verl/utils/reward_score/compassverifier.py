@@ -23,9 +23,14 @@ if _current_dir in sys.path:
 # 导入标准库的 math 和 random
 import math  # 标准库的 math
 import random
+import logging
 
 # ========== DEBUG: Track function calls ==========
 _debug_call_count = 0
+
+# Keep reward scoring quiet by default: these can otherwise flood logs in async reward mode.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 
 verify_prompt = """
 Please as a grading expert, judge whether the final answers given by the candidates below are consistent with the standard answers, that is, whether the candidates answered correctly. 
@@ -90,8 +95,8 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
     _debug_call_count += 1
     call_id = _debug_call_count
 
-    # Debug verbosity (opt-in via env)
-    debug_enabled = bool(os.environ.get("VERL_DEBUG"))
+    # NOTE: Disabled ad-hoc debug printing for stability/clean logs.
+    debug_enabled = False
 
     if debug_enabled:
         print(f"[CompassVerifier #{call_id}] ENTER compute_score", file=sys.stderr)
@@ -100,9 +105,6 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
 
     # 检查 reward_model_clients；离线或未配置时直接返回0，避免训练中断
     if not reward_model_clients or not isinstance(reward_model_clients, list):
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] reward_model_clients missing or invalid, returning 0", file=sys.stderr)
-        print("reward_model_clients missing or invalid, returning 0 reward to continue training")
         return 0
     
     # 过滤掉 None 或无效的客户端
@@ -115,9 +117,6 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
         except Exception:
             continue
     if not valid_clients:
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] No valid reward model clients after filtering, returning 0", file=sys.stderr)
-        print("No valid reward model clients after filtering, returning 0 reward")
         return 0
 
     if debug_enabled:

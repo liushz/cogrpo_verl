@@ -358,48 +358,75 @@ class vLLMRollout(BaseRollout):
         self.verifier_lora_path = verifier_lora_path if verifier_lora_path else self.config.get("verifier", {}).get("lora_path", None)
         self.verifier_lora_int_id = None
         
-        # Try to load Verifier LoRA if path is provided and LoRA is enabled
-        # This initializes lora_manager if it's not already initialized
-        if self.verifier_lora_path and hasattr(self, "lora_kwargs") and self.lora_kwargs.get("enable_lora", False):
-            try:
-                # Wake up engine to load LoRA
+        self._load_verifier_lora_if_needed()
+
+    def _get_lora_engine(self):
+        lora_engine = self.inference_engine
+        if lora_engine is None:
+            return None
+        if not hasattr(lora_engine, "add_lora") and hasattr(lora_engine, "llm_engine"):
+            if hasattr(lora_engine.llm_engine, "add_lora"):
+                lora_engine = lora_engine.llm_engine
+        return lora_engine
+
+    def _load_verifier_lora_if_needed(self):
+        if not self.verifier_lora_path:
+            return
+        if not hasattr(self, "lora_kwargs") or not self.lora_kwargs.get("enable_lora", False):
+            return
+        if self.inference_engine is None:
+            return
+        try:
+            if hasattr(self.inference_engine, "wake_up"):
                 self.inference_engine.wake_up()
-                # Try to add LoRA adapter at initialization time
-                # This will initialize lora_manager if it's not already initialized
-                if hasattr(self.inference_engine, "add_lora"):
-                    # vLLM supports runtime LoRA loading via add_lora
-                    try:
-                        lora_ret = self.inference_engine.add_lora(
-                            adapter_name=self.verifier_lora_name,
-                            adapter_path=self.verifier_lora_path
+            lora_engine = self._get_lora_engine()
+            if lora_engine is None or not hasattr(lora_engine, "add_lora"):
+                return
+            try:
+                import inspect
+                sig = inspect.signature(lora_engine.add_lora)
+                if "lora_request" in sig.parameters:
+                    if self.verifier_lora_int_id is None:
+                        self._register_verifier_lora()
+                    lora_req = LoRARequest(
+                        lora_name=self.verifier_lora_name,
+                        lora_int_id=self.verifier_lora_int_id,
+                        lora_path=self.verifier_lora_path,
+                    )
+                    success = lora_engine.add_lora(lora_request=lora_req)
+                    if success is False:
+                        logger.warning("Failed to load Verifier LoRA: add_lora returned False")
+                    else:
+                        logger.info(
+                            f"Successfully loaded Verifier LoRA from {self.verifier_lora_path} with ID={self.verifier_lora_int_id}"
                         )
-                        if isinstance(lora_ret, int):
-                            self.verifier_lora_int_id = lora_ret
-                        else:
-                            # If add_lora doesn't return ID, register to get stable ID
-                            self._register_verifier_lora()
-                        logger.info(f"Successfully loaded Verifier LoRA from {self.verifier_lora_path} with ID={self.verifier_lora_int_id}")
-                        # #region agent log
-                        # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-                        # #endregion
-                        # Put engine back to sleep
-                        self.inference_engine.sleep(level=1)
-                    except Exception as e:
-                        logger.warning(f"Failed to load Verifier LoRA via add_lora: {e}")
-                        # Fallback: try to register anyway
-                        try:
-                            self._register_verifier_lora()
-                        except Exception as reg_e:
-                            logger.warning(f"Failed to register Verifier LoRA in fallback: {reg_e}")
-                        # #region agent log
-                        # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-                        # #endregion
-                        self.inference_engine.sleep(level=1)
-            except Exception as e:
-                logger.warning(f"Error trying to load Verifier LoRA: {e}")
+                else:
+                    lora_ret = lora_engine.add_lora(
+                        adapter_name=self.verifier_lora_name,
+                        adapter_path=self.verifier_lora_path,
+                    )
+                    if isinstance(lora_ret, int):
+                        self.verifier_lora_int_id = lora_ret
+                    else:
+                        self._register_verifier_lora()
+                    logger.info(f"Successfully loaded Verifier LoRA from {self.verifier_lora_path} with ID={self.verifier_lora_int_id}")
                 # #region agent log
                 # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
                 # #endregion
+            except Exception as e:
+                logger.warning(f"Failed to load Verifier LoRA via add_lora: {e}")
+                try:
+                    self._register_verifier_lora()
+                except Exception as reg_e:
+                    logger.warning(f"Failed to register Verifier LoRA in fallback: {reg_e}")
+        except Exception as e:
+            logger.warning(f"Error trying to load Verifier LoRA: {e}")
+        finally:
+            if hasattr(self.inference_engine, "sleep"):
+                try:
+                    self.inference_engine.sleep(level=1)
+                except Exception:
+                    pass
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -667,32 +694,36 @@ class vLLMRollout(BaseRollout):
 
         self.verifier_lora_path = verifier_lora_path
         prev_lora_int_id = self.verifier_lora_int_id
+        lora_engine = self._get_lora_engine()
+        if lora_engine is None:
+            logger.warning("vLLM engine not ready; cannot reload verifier LoRA")
+            return False
         try:
             if hasattr(self.inference_engine, "wake_up"):
                 self.inference_engine.wake_up()
 
             # Try to remove old LoRA first
-            if hasattr(self.inference_engine, "remove_lora"):
+            if hasattr(lora_engine, "remove_lora"):
                 try:
                     # Check if it uses LoRARequest or simple name
-                    if hasattr(self.inference_engine.remove_lora, "__code__"):
+                    if hasattr(lora_engine.remove_lora, "__code__"):
                         import inspect
-                        sig = inspect.signature(self.inference_engine.remove_lora)
+                        sig = inspect.signature(lora_engine.remove_lora)
                         if "lora_id" in sig.parameters:
                             # AsyncLLMEngine uses lora_id (int)
-                            self.inference_engine.remove_lora(lora_id=prev_lora_int_id)
+                            lora_engine.remove_lora(lora_id=prev_lora_int_id)
                         else:
                             # Fallback: try name-based removal
-                            self.inference_engine.remove_lora(lora_name=self.verifier_lora_name)
+                            lora_engine.remove_lora(lora_name=self.verifier_lora_name)
                 except Exception as e:
                     logger.debug(f"Failed to remove old LoRA (may not exist): {e}")
 
             # Try to add new LoRA
-            if hasattr(self.inference_engine, "add_lora"):
+            if hasattr(lora_engine, "add_lora"):
                 try:
                     # Check if add_lora expects LoRARequest (AsyncLLMEngine) or kwargs (older API)
                     import inspect
-                    sig = inspect.signature(self.inference_engine.add_lora)
+                    sig = inspect.signature(lora_engine.add_lora)
 
                     if "lora_request" in sig.parameters:
                         # AsyncLLMEngine API: add_lora(lora_request: LoRARequest) -> bool
@@ -702,7 +733,7 @@ class vLLMRollout(BaseRollout):
                             lora_int_id=prev_lora_int_id,
                             lora_path=verifier_lora_path
                         )
-                        success = self.inference_engine.add_lora(lora_request=lora_req)
+                        success = lora_engine.add_lora(lora_request=lora_req)
                         if success:
                             self.verifier_lora_int_id = prev_lora_int_id
                             logger.info(f"Successfully reloaded Verifier LoRA via AsyncLLMEngine API: {verifier_lora_path}")
@@ -711,7 +742,7 @@ class vLLMRollout(BaseRollout):
                             return False
                     else:
                         # Older/unknown API: try kwargs
-                        lora_ret = self.inference_engine.add_lora(
+                        lora_ret = lora_engine.add_lora(
                             adapter_name=self.verifier_lora_name,
                             adapter_path=verifier_lora_path
                         )
@@ -724,15 +755,21 @@ class vLLMRollout(BaseRollout):
                     self._register_verifier_lora()
 
                     # Verify LoRA is actually loaded
-                    if hasattr(self.inference_engine, 'list_loras'):
+                    if hasattr(lora_engine, 'list_loras'):
                         try:
-                            loaded_loras = self.inference_engine.list_loras()
+                            loaded_loras = lora_engine.list_loras()
                             if hasattr(loaded_loras, '__iter__'):
-                                lora_names = [l.lora_name if hasattr(l, 'lora_name') else str(l) for l in loaded_loras]
-                                if self.verifier_lora_name not in lora_names:
-                                    logger.warning(f"Verifier LoRA {self.verifier_lora_name} not found in loaded LoRAs: {lora_names}")
+                                if all(isinstance(l, int) for l in loaded_loras):
+                                    if self.verifier_lora_int_id not in loaded_loras:
+                                        logger.warning(f"Verifier LoRA ID {self.verifier_lora_int_id} not found in loaded LoRAs: {loaded_loras}")
+                                    else:
+                                        logger.info(f"Verified Verifier LoRA ID {self.verifier_lora_int_id} is loaded")
                                 else:
-                                    logger.info(f"Verified Verifier LoRA {self.verifier_lora_name} is loaded with ID={self.verifier_lora_int_id}")
+                                    lora_names = [l.lora_name if hasattr(l, 'lora_name') else str(l) for l in loaded_loras]
+                                    if self.verifier_lora_name not in lora_names:
+                                        logger.warning(f"Verifier LoRA {self.verifier_lora_name} not found in loaded LoRAs: {lora_names}")
+                                    else:
+                                        logger.info(f"Verified Verifier LoRA {self.verifier_lora_name} is loaded with ID={self.verifier_lora_int_id}")
                         except Exception as e:
                             logger.debug(f"Could not verify LoRA loading: {e}")
 
@@ -1060,6 +1097,7 @@ class vLLMRollout(BaseRollout):
             verifier_texts.append(verifier_text)
             # Extract actual hint (removes think blocks, extracts <GO> or <WAIT> content)
             hint = self._extract_verifier_hint(verifier_text)
+            hint = self._truncate_verifier_hint_tokens(hint, tokenizer)
             hints.append(hint)
         timing_info["verifier_gen"] = time.time() - verifier_start
         
@@ -1510,6 +1548,30 @@ class vLLMRollout(BaseRollout):
                 hint = ""
         
         return hint.strip()
+
+    def _truncate_verifier_hint_tokens(self, hint: str, tokenizer) -> str:
+        if not hint:
+            return ""
+        verifier_cfg = self.config.get("verifier", {}) if hasattr(self.config, "get") else {}
+        try:
+            max_hint_tokens = verifier_cfg.get("max_hint_tokens", None) if hasattr(verifier_cfg, "get") else None
+        except Exception:
+            max_hint_tokens = None
+        if max_hint_tokens is None:
+            return hint
+        try:
+            max_hint_tokens = int(max_hint_tokens)
+        except Exception:
+            return hint
+        if max_hint_tokens <= 0:
+            return hint
+        try:
+            hint_ids = tokenizer.encode(hint, add_special_tokens=False)
+            if len(hint_ids) <= max_hint_tokens:
+                return hint
+            return tokenizer.decode(hint_ids[:max_hint_tokens], skip_special_tokens=True).strip()
+        except Exception:
+            return hint
     
     def _parse_verifier_decision(self, verifier_text: str) -> dict:
         """
@@ -2228,6 +2290,8 @@ class vLLMRollout(BaseRollout):
                 for i, (b, step_idx) in enumerate(verifier_input_map):
                     state = sample_states[b]
                     decision = decisions[i]
+                    if decision.get("hint"):
+                        decision["hint"] = self._truncate_verifier_hint_tokens(decision["hint"], tokenizer)
 
                     # 记录 critique
                     critique = decision.get('critique', decision.get('hint', ''))
@@ -2558,10 +2622,88 @@ class vLLMRollout(BaseRollout):
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
 
-class vLLMAsyncRollout:
+class vLLMAsyncRollout(vLLMRollout):
     """vLLMAsyncRollout is a thin wrapper of WorkerWrapperBase,
     which is engine in single worker process.
     """
+
+    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
+        # Skip vLLMRollout.__init__ to avoid building a local LLM engine.
+        BaseRollout.__init__(self)
+        self.config = config
+        self.tokenizer = tokenizer
+        assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
+
+        tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
+        max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+
+        if kwargs.get("train_tp") is not None:
+            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
+            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
+            if vllm_version in (
+                "0.5.4",
+                "0.6.3",
+            ):
+                train_tp = kwargs.get("train_tp")
+                num_tp_per_train_tp = train_tp // tensor_parallel_size
+                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
+            else:
+                vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
+
+        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+        if not rope_scaling_config:
+            max_position_embeddings = None
+            if hasattr(model_hf_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.max_position_embeddings
+            elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
+            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
+            if max_position_embeddings is None:
+                raise ValueError("max_position_embeddings not found in model_hf_config")
+
+            assert max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
+
+        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
+        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+            raise ValueError(
+                "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, "
+                "please increase max_num_batched_tokens or disable chunked prefill"
+            )
+
+        self.lora_kwargs = kwargs.pop("lora_kwargs", {})
+        verifier_lora_name = kwargs.pop("verifier_lora_name", None)
+        verifier_lora_path = kwargs.pop("verifier_lora_path", None)
+        self.enable_kv_cache_optimization = kwargs.pop("enable_kv_cache_optimization", True)
+
+        sampling_kwargs = dict(
+            n=1,
+            logprobs=0,
+            max_tokens=config.response_length,
+        )
+        has_stop_params = config.get("stop", None) is not None or config.get("stop_token_ids", None) is not None
+        if vllm_version != "0.3.1":
+            sampling_kwargs["detokenize"] = has_stop_params
+        for k in config.keys():
+            if hasattr(SamplingParams(), str(k)):
+                sampling_kwargs[k] = config.get(k)
+        if "stop_token_ids" in sampling_kwargs and sampling_kwargs["stop_token_ids"] is not None and not isinstance(sampling_kwargs["stop_token_ids"], list):
+            sampling_kwargs["stop_token_ids"] = list(sampling_kwargs["stop_token_ids"])
+        self.sampling_params = SamplingParams(**sampling_kwargs)
+
+        self.pad_token_id = tokenizer.pad_token_id
+        if verifier_lora_name is not None:
+            self.verifier_lora_name = verifier_lora_name
+        else:
+            self.verifier_lora_name = self.config.get("verifier_lora_name", "verifier_lora")
+        self.verifier_lora_path = verifier_lora_path if verifier_lora_path else self.config.get("verifier", {}).get("lora_path", None)
+        self.verifier_lora_int_id = None
+
+        # Engine is deferred to be initialized in init_worker.
+        self.inference_engine: WorkerWrapperBase = None
+        self.sharding_manager = None
+        self.is_sleep = False
 
     def init_worker(self, all_kwargs: List[Dict[str, Any]]):
         """Initialize worker engine."""
@@ -2578,6 +2720,7 @@ class vLLMAsyncRollout:
         # inference engine is initialized now, update sharding manager
         self.sharding_manager.inference_engine = self.inference_engine
         self.sharding_manager.model_runner = self.inference_engine.worker.model_runner
+        self._load_verifier_lora_if_needed()
 
     def sleep(self, *args, **kwargs):
         """Offload model weights and discard kv cache."""

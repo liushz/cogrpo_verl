@@ -38,9 +38,9 @@ class CompassVerifierRewardManager:
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
 
-        # Debug verbosity (opt-in via env). Keep default runs quiet.
-        debug_enabled = os.environ.get("VERL_RM_DEBUG", "").lower() in ("1", "true", "yes")
-        should_print_examine = debug_enabled and self.num_examine > 0
+        # NOTE: Disabled ad-hoc debug printing for stability/clean logs.
+        debug_enabled = False
+        should_print_examine = False
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
@@ -123,7 +123,9 @@ class CompassVerifierRewardManager:
         # Fill reward tensor with results
         reward_extra_info = {}
         for i, score, valid_response_length, sample_reward_extra_info in results:
-            reward_tensor[i, valid_response_length - 1] = score
+            reward_position = max(0, valid_response_length - 1)
+            reward_position = min(reward_position, reward_tensor.size(1) - 1)
+            reward_tensor[i, reward_position] = score
             # Update extra info at the list index
             for key, value in sample_reward_extra_info.items():
                 if key not in reward_extra_info:

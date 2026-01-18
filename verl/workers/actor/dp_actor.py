@@ -85,6 +85,13 @@ class DataParallelPPOActor(BasePPOActor):
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
+        # Safety: temperature may come from rollout/meta_info; treat <=0 as 1.0 (greedy decode semantics).
+        try:
+            temperature = float(temperature)
+        except Exception:  # noqa: BLE001
+            temperature = 1.0
+        if temperature <= 0:
+            temperature = 1.0
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():

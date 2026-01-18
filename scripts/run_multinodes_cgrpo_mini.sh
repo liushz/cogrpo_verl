@@ -88,6 +88,7 @@ export MLFLOW_TRACKING_URI=sqlite:///mlruns.db
 export HYDRA_FULL_ERROR=1
 
 model=$1
+debug_quick=${7:-0}
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
 # Use timestamped log prefix; actual files will append _rank{rank}.txt
@@ -115,6 +116,10 @@ verifier_lora_dropout=0.05
 verifier_lr=1e-5
 verifier_loss_weight=1.0
 verifier_lora_path="/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit/xtuner_train/verifier-interns1-lora-cold-011316/checkpoint-486"  # Path to pretrained verifier LoRA, empty to train from scratch
+verifier_max_new_tokens=$((1024 * 2))
+verifier_temperature=1.0
+verifier_logprobs=1
+verifier_max_hint_tokens=128
 
 # verifier intervention mode: "by_response" or "by_step"
 verifier_intervention_mode=by_step
@@ -142,10 +147,11 @@ curriculum_end_weight=0.3    # Late: 30% control, 70% exp (rely on verifier)
 # data related (Mini version - smaller batch sizes)
 response_n=32  # keep 32k response to avoid truncation, use 8k to debug
 train_batch_size=8  # Must satisfy: (train_batch_size * n) % (n_gpus) == 0
-                      # With n=4 and 16 GPUs: 4*4=16, 16%16=0 ✓
+	                      # With n=4 and 16 GPUs: 4*4=16, 16%16=0 ✓
 max_prompt_length=$((1024 * 2))
 max_response_length=$((1024 * $response_n))
 max_model_len=$((max_prompt_length + max_response_length))
+verifier_max_prompt_length="${max_response_length}"
 # vLLM scheduler safety:
 # max_num_batched_tokens is the total token budget for one scheduling batch in vLLM.
 # Setting it too large (e.g. 2*(prompt+response) here) can cause vLLM to pack too much work and OOM.
@@ -154,6 +160,37 @@ rollout_max_num_batched_tokens="${max_model_len}"
 
 nnodes=$2
 n_gpus_per_node=$3
+
+# Quick debug mode: keep 32k response, reduce overall runtime.
+trainer_total_epochs=10
+trainer_total_training_steps=500
+trainer_rollout_dump_freq=10
+trainer_log_val_generations=100
+trainer_save_freq=20
+trainer_test_freq=20
+trainer_verifier_lora_sync_freq=10
+
+if [ "${debug_quick}" = "1" ]; then
+    echo "=== debug_quick=1: enable fast debug knobs (keep response_n=${response_n}k) ==="
+    train_batch_size=2
+    verifier_max_new_tokens=512
+    verifier_max_hint_tokens=128
+    max_interventions=1
+    # Keep prompts smaller for verifier and ensure by_step path is exercised early.
+    token_check_interval=1024
+    min_step_tokens=1024
+    confidence_threshold=0.0
+    use_entropy_filter=False
+    entropy_threshold=0.0
+
+    trainer_total_epochs=1
+    trainer_total_training_steps=2
+    trainer_rollout_dump_freq=1
+    trainer_log_val_generations=0
+    trainer_save_freq=0
+    trainer_test_freq=0
+    trainer_verifier_lora_sync_freq=1
+fi
 
 # Disable dynamic bsz and explicitly set micro batch size per GPU
 # Note: micro=2 was used before and caused OOM/NCCL timeout at ~150GB
@@ -308,23 +345,29 @@ python3 -m verl.trainer.main_ppo \
     verifier.optim.lr="${verifier_lr}" \
     verifier.loss_weight="${verifier_loss_weight}" \
     +verifier.lora_path="${verifier_lora_path}" \
+    +verifier.max_new_tokens="${verifier_max_new_tokens}" \
+    +verifier.max_prompt_length="${verifier_max_prompt_length}" \
+    +verifier.temperature="${verifier_temperature}" \
+    +verifier.logprobs="${verifier_logprobs}" \
+    +verifier.max_hint_tokens="${verifier_max_hint_tokens}" \
     trainer.val_before_train=False \
-    trainer.total_epochs=10 \
-    trainer.total_training_steps=500 \
+    trainer.total_epochs="${trainer_total_epochs}" \
+    trainer.total_training_steps="${trainer_total_training_steps}" \
     trainer.resume_mode="${resume_mode}" \
     trainer.resume_from_path="${resume_path}" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.default_local_dir="${save_dir}" \
     trainer.rollout_data_dir="${save_dir}/rollout_data" \
-    +trainer.rollout_dump_freq=10 \
+    +trainer.rollout_dump_freq="${trainer_rollout_dump_freq}" \
+    +trainer.verifier_lora_sync_freq="${trainer_verifier_lora_sync_freq}" \
     trainer.validation_data_dir="${save_dir}/validation_data" \
     trainer.logger=["console","tensorboard","swanlab"] \
     trainer.nnodes="${nnodes}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
-    trainer.log_val_generations=100 \
-    trainer.save_freq=20 \
-    trainer.test_freq=20 \
+    trainer.log_val_generations="${trainer_log_val_generations}" \
+    trainer.save_freq="${trainer_save_freq}" \
+    trainer.test_freq="${trainer_test_freq}" \
     2>&1 | tee "$LOG_FILE"
 
     # === Memory safety knobs === \

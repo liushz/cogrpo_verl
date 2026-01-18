@@ -1075,6 +1075,12 @@ class RayPPOTrainer:
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                # Create stable IDs early so rollout can report per-step verifier trajectories
+                # and trainer can map them back to per-sample rewards.
+                if "uid" not in batch.non_tensor_batch:
+                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
+                uids = batch.non_tensor_batch["uid"]
+
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -1088,6 +1094,8 @@ class RayPPOTrainer:
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                # Pass through uid so rollout can attach it to verifier trajectories.
+                gen_batch.non_tensor_batch["uid"] = uids
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1096,41 +1104,15 @@ class RayPPOTrainer:
                     with _timer("gen", timing_raw):
                         # Check if using Co-GRPO (dual-stream rollout)
                         use_co_grpo = self.config.algorithm.adv_estimator == AdvantageEstimator.CO_GRPO
+                        sample_uids = None
                         
                         if use_co_grpo:
                             # For Co-GRPO, repeat gen_batch first so each prompt generates multiple pairs
                             # e.g., rollout.n=8 → each prompt repeated 8 times → generates 8 pairs (16 samples)
-                            # #region agent log
-                            with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                                f.write(json.dumps({
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "A,B,C,D,E",
-                                    "location": "ray_trainer.py:1092",
-                                    "message": "Before gen_batch.repeat: original batch size",
-                                    "data": {
-                                        "gen_batch_batch_size": str(gen_batch.batch.batch_size),
-                                        "rollout_n": self.config.actor_rollout_ref.rollout.n
-                                    },
-                                    "timestamp": int(time.time() * 1000)
-                                }) + "\n")
-                            # #endregion
                             gen_batch_repeated = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                            # #region agent log
-                            with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                                f.write(json.dumps({
-                                    "sessionId": "debug-session",
-                                    "runId": "run1",
-                                    "hypothesisId": "A,B,C,D,E",
-                                    "location": "ray_trainer.py:1093",
-                                    "message": "After gen_batch.repeat: gen_batch_repeated size",
-                                    "data": {
-                                        "gen_batch_repeated_batch_size": str(gen_batch_repeated.batch.batch_size),
-                                        "rollout_n": self.config.actor_rollout_ref.rollout.n
-                                    },
-                                    "timestamp": int(time.time() * 1000)
-                                }) + "\n")
-                            # #endregion
+                            # Unique per-repeated-sample id (needed to map verifier steps back to per-sample rewards).
+                            sample_uids = np.array([str(uuid.uuid4()) for _ in range(len(gen_batch_repeated))], dtype=object)
+                            gen_batch_repeated.non_tensor_batch["sample_uid"] = sample_uids
                             # Use dual-stream rollout for Co-GRPO
                             if not self.async_rollout_mode:
                                 # Get intervention mode from config
@@ -1151,22 +1133,6 @@ class RayPPOTrainer:
                                     max_interventions=max_interventions,
                                     confidence_threshold=confidence_threshold,
                                 )
-                                # #region agent log
-                                with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                                    f.write(json.dumps({
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "A,B,C,D,E",
-                                        "location": "ray_trainer.py:1113",
-                                        "message": "After dual_stream_rollout: gen_batch_output size",
-                                        "data": {
-                                            "gen_batch_output_batch_size": str(gen_batch_output.batch.batch_size),
-                                            "gen_batch_repeated_batch_size": str(gen_batch_repeated.batch.batch_size),
-                                            "rollout_n": self.config.actor_rollout_ref.rollout.n
-                                        },
-                                        "timestamp": int(time.time() * 1000)
-                                    }) + "\n")
-                                # #endregion
                             else:
                                 # For async mode, we need to handle differently
                                 # For now, fall back to regular generation
@@ -1201,47 +1167,14 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                    # uid already exists; keep it stable for advantage grouping and for rollout mapping.
                     # repeat to align with repeated responses in rollout
                     # For both regular GRPO and Co-GRPO, we repeat the batch
                     # - Regular GRPO: repeat n times, each generates 1 response → n responses per prompt
                     # - Co-GRPO: repeat n times, each generates 1 pair (control+exp) → n pairs (2n samples) per prompt
-                    # #region agent log
-                    with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                        f.write(json.dumps({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A,B,C,D,E",
-                            "location": "ray_trainer.py:1153",
-                            "message": "Before batch.repeat: batch size and gen_batch_output size",
-                            "data": {
-                                "batch_batch_size": str(batch.batch.batch_size),
-                                "gen_batch_output_batch_size": str(gen_batch_output.batch.batch_size),
-                                "rollout_n": self.config.actor_rollout_ref.rollout.n,
-                                "use_co_grpo": use_co_grpo,
-                                "batch_keys": list(batch.batch.keys()),
-                                "gen_batch_output_keys": list(gen_batch_output.batch.keys())
-                            },
-                            "timestamp": int(time.time() * 1000)
-                        }) + "\n")
-                    # #endregion
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    # #region agent log
-                    with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-                        f.write(json.dumps({
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "A,B,C,D,E",
-                            "location": "ray_trainer.py:1154",
-                            "message": "After batch.repeat: batch size before union",
-                            "data": {
-                                "batch_batch_size": str(batch.batch.batch_size),
-                                "gen_batch_output_batch_size": str(gen_batch_output.batch.batch_size),
-                                "rollout_n": self.config.actor_rollout_ref.rollout.n
-                            },
-                            "timestamp": int(time.time() * 1000)
-                        }) + "\n")
-                    # #endregion
+                    if use_co_grpo and sample_uids is not None:
+                        batch.non_tensor_batch["sample_uid"] = sample_uids
                     batch = batch.union(gen_batch_output)
 
                     # For Co-GRPO, handle response masks for both streams
@@ -1273,6 +1206,28 @@ class RayPPOTrainer:
                             batch.batch["response_mask"] = batch.batch["exp_response_mask"][:, -exp_resp_len:]
                     else:
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    if use_co_grpo:
+                        try:
+                            control_resp_lens = batch.batch["control_response_mask"].to(torch.float32).sum(dim=1)
+                            if "exp_last_valid_pos" in batch.batch:
+                                exp_resp_lens = batch.batch["exp_last_valid_pos"].to(torch.float32)
+                            else:
+                                exp_resp_lens = batch.batch["exp_response_mask"].to(torch.float32).sum(dim=1)
+
+                            metrics["co_grpo/control_response_len_mean"] = control_resp_lens.mean().item()
+                            metrics["co_grpo/control_response_len_std"] = control_resp_lens.std(unbiased=False).item()
+                            metrics["co_grpo/exp_response_len_mean"] = exp_resp_lens.mean().item()
+                            metrics["co_grpo/exp_response_len_std"] = exp_resp_lens.std(unbiased=False).item()
+                            metrics["co_grpo/exp_control_response_len_ratio"] = (
+                                exp_resp_lens.mean() / (control_resp_lens.mean() + 1e-6)
+                            ).item()
+
+                            if "exp_loss_mask" in batch.batch:
+                                exp_policy_lens = batch.batch["exp_loss_mask"][:, -exp_resp_len:].to(torch.float32).sum(dim=1)
+                                metrics["co_grpo/exp_policy_len_mean"] = exp_policy_lens.mean().item()
+                                metrics["co_grpo/exp_hint_len_mean"] = (exp_resp_lens - exp_policy_lens).mean().item()
+                        except Exception as e:
+                            logger.warning(f"Failed to log Co-GRPO response length metrics: {e}")
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1450,6 +1405,26 @@ class RayPPOTrainer:
                                 control_rewards=control_outcome,
                                 exp_rewards=exp_outcome
                             )
+
+                            # Optional: intervention penalty + reward shaping need intervention stats.
+                            num_interventions = batch.non_tensor_batch.get('num_interventions', None)
+                            hint_token_counts = batch.non_tensor_batch.get('hint_token_counts', None)
+                            # Defensive cast: some loaders may wrap arrays as object dtype.
+                            def _safe_int_array(values, name):
+                                if values is None:
+                                    return None
+                                try:
+                                    return np.asarray(values, dtype=np.int32)
+                                except Exception:
+                                    try:
+                                        return np.array([int(v) if v is not None else 0 for v in values], dtype=np.int32)
+                                    except Exception as e:
+                                        logger.warning(f"Failed to cast {name} to int array: {e}")
+                                        return None
+
+                            num_interventions = _safe_int_array(num_interventions, "num_interventions")
+                            hint_token_counts = _safe_int_array(hint_token_counts, "hint_token_counts")
+                            intervention_costs = torch.zeros_like(verifier_outcome_rewards)
                             
                             # Apply intervention penalty to prevent over-intervention
                             if hasattr(self.config.algorithm, 'intervention_penalty'):
@@ -1458,13 +1433,8 @@ class RayPPOTrainer:
                                 lambda_len = penalty_config.get('len_coef', 0.0)
                                 
                                 if lambda_freq > 0 or lambda_len > 0:
-                                    # Get intervention statistics from non_tensor_batch
-                                    num_interventions = batch.non_tensor_batch.get('num_interventions', None)
-                                    hint_token_counts = batch.non_tensor_batch.get('hint_token_counts', None)
-                                    
                                     if num_interventions is not None and hint_token_counts is not None:
                                         # Compute intervention cost
-                                        intervention_costs = torch.zeros_like(verifier_outcome_rewards)
                                         for i in range(len(verifier_outcome_rewards)):
                                             cost = lambda_freq * num_interventions[i] + lambda_len * hint_token_counts[i] / 100.0  # Normalize token count
                                             intervention_costs[i] = cost
@@ -1478,6 +1448,49 @@ class RayPPOTrainer:
                                         metrics['co_grpo/avg_intervention_cost'] = intervention_costs.mean().item()
                                         metrics['co_grpo/max_interventions'] = np.max(num_interventions)
                                         metrics['co_grpo/min_interventions'] = np.min(num_interventions)
+
+                            # Soft weighting for verifier rewards to focus learning signal on "true improvements".
+                            # This affects verifier updates only (verifier_train_batch), not actor rewards.
+                            if hasattr(self.config.algorithm, "verifier_reward_weighting"):
+                                weight_config = self.config.algorithm.verifier_reward_weighting
+                                improve_coef = float(weight_config.get("improve_coef", 0.0))
+                                tie_no_intervention_weight = float(weight_config.get("tie_no_intervention_weight", 1.0))
+
+                                if improve_coef != 0.0 or tie_no_intervention_weight != 1.0:
+                                    gap = exp_outcome - control_outcome  # outcome-level improvement
+                                    device = verifier_outcome_rewards.device
+                                    if num_interventions is not None:
+                                        num_interventions_tensor = torch.as_tensor(num_interventions, device=device)
+                                        did_intervene = num_interventions_tensor > 0
+                                    else:
+                                        did_intervene = torch.zeros_like(gap, dtype=torch.bool, device=device)
+
+                                    is_tie = torch.isclose(gap, torch.zeros_like(gap), atol=1e-6)
+                                    is_improve = gap > 0
+
+                                    sample_weight = torch.ones_like(verifier_outcome_rewards)
+                                    if improve_coef != 0.0:
+                                        sample_weight = sample_weight + improve_coef * torch.clamp(gap, min=0.0)
+
+                                    if tie_no_intervention_weight != 1.0:
+                                        tie_no_intervene = is_tie & (~did_intervene)
+                                        if tie_no_intervention_weight < 0:
+                                            logger.warning(
+                                                "verifier_reward_weighting.tie_no_intervention_weight < 0 is invalid; ignoring."
+                                            )
+                                        else:
+                                            sample_weight = torch.where(
+                                                tie_no_intervene,
+                                                torch.full_like(sample_weight, tie_no_intervention_weight),
+                                                sample_weight,
+                                            )
+
+                                    verifier_outcome_rewards = verifier_outcome_rewards * sample_weight
+                                    metrics["co_grpo/verifier_reward_weight_mean"] = float(sample_weight.mean().item())
+                                    metrics["co_grpo/verifier_reward_weight_improve_ratio"] = float(is_improve.float().mean().item())
+                                    metrics["co_grpo/verifier_reward_weight_tie_no_intervene_ratio"] = float(
+                                        (is_tie & (~did_intervene)).float().mean().item()
+                                    )
                             
                             # Log reward comparison statistics
                             metrics['co_grpo/control_reward_mean'] = control_outcome.mean().item()
@@ -1516,6 +1529,80 @@ class RayPPOTrainer:
                             # Expand to token level for verifier
                             batch.batch["verifier_token_level_rewards"] = verifier_outcome_rewards.unsqueeze(-1).expand(-1, exp_resp_len)
                             batch.batch["verifier_response_mask"] = batch.batch["exp_response_mask"]
+
+                            # Prepare verifier training batch (by_step intervention trajectories).
+                            verifier_batch = batch.meta_info.get("verifier_batch", None)
+                            if verifier_batch is not None and len(verifier_batch) > 0:
+                                try:
+                                    from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+
+                                    debug_asserts = os.getenv("VERL_DEBUG_ASSERTS", "0") == "1" or os.getenv("VERL_LOGGING_LEVEL", "").upper() == "DEBUG"
+                                    if debug_asserts and int(os.environ.get("RANK", "0")) == 0 and verifier_batch.batch is not None:
+                                        for key, tensor in verifier_batch.batch.items():
+                                            if isinstance(tensor, torch.Tensor):
+                                                assert tensor.device.type == "cpu", f"verifier_batch.{key} must be on CPU, got {tensor.device}"
+
+                                    verifier_batch = verifier_batch.to("cpu")
+                                    parent_sample_uids = verifier_batch.non_tensor_batch.get("parent_sample_uid", None)
+                                    parent_group_uids = verifier_batch.non_tensor_batch.get("parent_uid", None)
+                                    step_indices = verifier_batch.non_tensor_batch.get("step_idx", None)
+
+                                    if parent_sample_uids is None or parent_group_uids is None or step_indices is None:
+                                        raise ValueError("verifier_batch missing required non_tensor fields: parent_uid/parent_sample_uid/step_idx")
+
+                                    # Map sample_uid -> verifier_outcome_reward (per repeated sample).
+                                    batch_sample_uids = batch.non_tensor_batch.get("sample_uid", None)
+                                    if batch_sample_uids is None:
+                                        raise ValueError("batch missing non_tensor_batch['sample_uid'] for mapping verifier rewards")
+
+                                    verifier_outcome_cpu = verifier_outcome_rewards.detach().to("cpu")
+                                    reward_by_sample_uid = {}
+                                    for i in range(len(batch_sample_uids)):
+                                        reward_by_sample_uid[str(batch_sample_uids[i])] = verifier_outcome_cpu[i]
+
+                                    # Count interventions per sample_uid for credit assignment.
+                                    count_by_sample_uid = {}
+                                    for su in parent_sample_uids:
+                                        su = str(su)
+                                        count_by_sample_uid[su] = count_by_sample_uid.get(su, 0) + 1
+
+                                    step_rewards = []
+                                    group_index = []
+                                    for j in range(len(verifier_batch)):
+                                        su = str(parent_sample_uids[j])
+                                        gu = str(parent_group_uids[j])
+                                        step_idx = int(step_indices[j])
+                                        r_total = reward_by_sample_uid.get(su, torch.tensor(0.0))
+                                        denom = max(1, int(count_by_sample_uid.get(su, 0)))
+                                        step_rewards.append(r_total / denom)
+                                        group_index.append(f"{gu}:{step_idx}")
+
+                                    step_rewards = torch.stack(step_rewards, dim=0).to(torch.float32)  # (m,)
+                                    response_len = int(verifier_batch.batch["responses"].size(1))
+                                    verifier_response_mask = verifier_batch.batch["attention_mask"][:, -response_len:].to(torch.float32)
+                                    token_counts = verifier_response_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                                    token_level_rewards = (step_rewards.unsqueeze(-1) / token_counts) * verifier_response_mask
+
+                                    advantages, _ = compute_grpo_outcome_advantage(
+                                        token_level_rewards=token_level_rewards,
+                                        response_mask=verifier_response_mask,
+                                        index=np.array(group_index, dtype=object),
+                                        norm_adv_by_std_in_grpo=True,
+                                    )
+
+                                    # Loss weight for verifier updates.
+                                    verifier_loss_weight = float(getattr(self.config, "verifier", {}).get("loss_weight", 1.0))
+                                    advantages = advantages * verifier_loss_weight
+
+                                    verifier_batch.batch["advantages"] = advantages
+
+                                    # Keep some debug scalars for logging/dump if needed.
+                                    verifier_batch.non_tensor_batch["step_reward"] = np.array(
+                                        [float(r.item()) for r in step_rewards], dtype=np.float32
+                                    )
+                                    batch.meta_info["verifier_train_batch"] = verifier_batch
+                                except Exception as e:
+                                    logger.warning(f"Failed to build verifier_train_batch: {e}")
                             
                             # Use experimental rewards as main rewards for policy training
                             batch.batch["token_level_rewards"] = exp_token_rewards
@@ -1905,6 +1992,30 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # Update Verifier (LoRA) BEFORE Actor (Base) to reduce base drift breaking PPO stability.
+                        if use_co_grpo and "verifier_train_batch" in batch.meta_info:
+                            verifier_train_batch = batch.meta_info.pop("verifier_train_batch", None)
+                            if verifier_train_batch is not None and len(verifier_train_batch) > 0:
+                                metrics["verifier/train_batch_size"] = float(len(verifier_train_batch))
+                                with _timer("update_verifier", timing_raw):
+                                    verifier_output = self.actor_rollout_wg.update_verifier(verifier_train_batch)
+                                verifier_output_metrics = reduce_metrics(verifier_output.meta_info["metrics"])
+                                metrics.update(verifier_output_metrics)
+
+                                # Periodically sync verifier LoRA weights to rollout (vLLM) workers.
+                                sync_freq = int(self.config.trainer.get("verifier_lora_sync_freq", 10))
+                                if sync_freq > 0 and (is_last_step or self.global_steps % sync_freq == 0):
+                                    verifier_lora_dir = os.path.join(self.config.trainer.default_local_dir, "verifier_lora_latest")
+                                    t0 = time.time()
+                                    self.actor_rollout_wg.save_verifier_lora(verifier_lora_dir)
+                                    t1 = time.time()
+                                    self.actor_rollout_wg.reload_verifier_lora(verifier_lora_dir)
+                                    t2 = time.time()
+                                    metrics["verifier/lora_sync_freq"] = float(sync_freq)
+                                    metrics["verifier/lora_save_s"] = float(t1 - t0)
+                                    metrics["verifier/lora_reload_s"] = float(t2 - t1)
+                                    metrics["verifier/lora_sync_s"] = float(t2 - t0)
+
                         # update actor
                         with _timer("update_actor", timing_raw):
                             if use_co_grpo:
@@ -1932,8 +2043,6 @@ class RayPPOTrainer:
                     should_dump_rollout = rollout_data_dir and (rollout_dump_freq == 0 or self.global_steps % rollout_dump_freq == 0 or is_last_step)
                     if should_dump_rollout:
                         with _timer("dump_rollout_generations", timing_raw):
-                            print(batch.batch.keys())
-                            print("non_tensor_batch keys:", list(batch.non_tensor_batch.keys()) if hasattr(batch, 'non_tensor_batch') else "N/A")
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()

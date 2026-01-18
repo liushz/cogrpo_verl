@@ -49,9 +49,10 @@ class NaiveRewardManager:
 
         import sys
         import os
-        # Debug verbosity (opt-in via env). Separate from VERL_DEBUG which may be used elsewhere.
-        debug_enabled = os.environ.get("VERL_RM_DEBUG", "").lower() in ("1", "true", "yes")
-        debug_limit = int(os.environ.get("VERL_RM_DEBUG_LIMIT", 0))
+        # NOTE: Disabled ad-hoc debug printing for stability/clean logs.
+        # If needed again, re-enable by restoring the env-driven flags.
+        debug_enabled = False
+        debug_limit = 0
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
@@ -303,14 +304,6 @@ class NaiveRewardManager:
 
                 if already_print_data_sources[data_source] < self.num_examine:
                     already_print_data_sources[data_source] += 1
-                    print("[prompt]", prompt_str)
-                    print("[response]", response_str)
-                    print("[ground_truth]", ground_truth)
-                    if isinstance(score, dict):
-                        for key, value in score.items():
-                            print(f"[{key}]", value)
-                    else:
-                        print(f"[score]", score)  
             return i, reward, valid_response_length, reward_extra_info, dump_record
 
         # Process items in parallel using ThreadPoolExecutor
@@ -372,7 +365,7 @@ class NaiveRewardManager:
 
             with open(control_file, 'w', encoding='utf-8') as f:
                 json.dump(control_batch_metadata, f, ensure_ascii=False, indent=2)
-            print(f"[DUMP] Saved CONTROL batch ({len(control_dump_records)} samples) to: {control_file}", file=sys.stderr)
+            # NOTE: Disabled per-batch dump logging (the files are still written).
 
         # Write exp stream batch
         if exp_dump_records:
@@ -392,7 +385,7 @@ class NaiveRewardManager:
 
             with open(exp_file, 'w', encoding='utf-8') as f:
                 json.dump(exp_batch_metadata, f, ensure_ascii=False, indent=2)
-            print(f"[DUMP] Saved EXP batch ({len(exp_dump_records)} samples) to: {exp_file}", file=sys.stderr)
+            # NOTE: Disabled per-batch dump logging (the files are still written).
 
         if return_dict:
             return {

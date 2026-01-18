@@ -5,18 +5,20 @@ cd /mnt/shared-storage-user/liuhongwei/main_works/repos/repro
 # ========== 基础参数设置 ==========
 model_name="/mnt/shared-storage-user/opencompass-shared/liuhongwei/interns1/repro_exp/s1_model/interns1-8b-hf-1951"
 dataset_name="passrate_math_merged"
-exp_name="cgrpo-verifier-8b-mini"
+exp_name="cgrpo-verifier-8b-mini-debug16"
 verl_debug=1
+debug_quick=1
+
 
 # ========== 集群配置（Mini版本 - 较小资源） ==========
-# cluster="llmit_gpu"
-cluster="opencompass_gpu"
+cluster="llmit_gpu"
+# cluster="opencompass_gpu"
 
 
 nnodes=2
 n_gpus_per_node=8
 gen_tp=2
-gpu_memory_utilization=0.7
+gpu_memory_utilization=0.6
 # cpu 为 16x总卡数 内存按比例计算（参考 run_co_grpo.sh: 1200000 MB for 64 GPUs）
 
 # cpu=$((16 * nnodes * n_gpus_per_node))
@@ -52,7 +54,7 @@ echo "rjob-$exp_name-$datetime"
 rjob delete "rjob-$exp_name-$datetime"
 rjob submit \
     --name="rjob-$exp_name-$datetime" \
-    --gpu=8 \
+    --gpu=$n_gpus_per_node \
     --memory=1200000 \
     --cpu=128 \
     --charged-group=$cluster \
@@ -72,11 +74,13 @@ rjob submit \
         export HF_DATASETS_CACHE=/mnt/shared-storage-user/liuhongwei/main_works/temp_debug/hf_datasets_cache &&
         export HF_DATASETS_OFFLINE=1 &&
         export TRANSFORMERS_OFFLINE=1 &&
-        export HF_EVALUATE_OFFLINE=1 &&
-        export HF_HUB_OFFLINE=1 &&
-        export VERL_DEBUG=$verl_debug &&
-        echo 'HuggingFace offline mode configured' &&
-        echo 'VERL_DEBUG set to $verl_debug - full responses will be logged' &&
-        chmod +x /mnt/shared-storage-user/liuhongwei/main_works/repos/repro/scripts/run_multinodes_cgrpo_mini.sh &&
-        /mnt/shared-storage-user/liuhongwei/main_works/repos/repro/scripts/run_multinodes_cgrpo_mini.sh '$model_name' $nnodes $n_gpus_per_node $gen_tp $gpu_memory_utilization '$dataset_name' '$verl_debug'
-    "
+	        export HF_EVALUATE_OFFLINE=1 &&
+	        export HF_HUB_OFFLINE=1 &&
+	        export VERL_DEBUG=$verl_debug &&
+	        export VERL_DEBUG_ASSERTS=1 &&
+	        export VERL_LOGGING_LEVEL=INFO &&
+	        echo 'HuggingFace offline mode configured' &&
+	        echo 'VERL_DEBUG set to $verl_debug - full responses will be logged' &&
+	        chmod +x /mnt/shared-storage-user/liuhongwei/main_works/repos/repro/scripts/run_multinodes_cgrpo_mini.sh &&
+	        /mnt/shared-storage-user/liuhongwei/main_works/repos/repro/scripts/run_multinodes_cgrpo_mini.sh '$model_name' $nnodes $n_gpus_per_node $gen_tp $gpu_memory_utilization '$dataset_name' '$debug_quick'
+	    "

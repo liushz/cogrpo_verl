@@ -106,25 +106,6 @@ def unpad_dataproto(data: "DataProto", pad_size):
 
 def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
     """Union two tensordicts."""
-    # #region agent log
-    import json
-    import time
-    with open("/mnt/shared-storage-user/liuhongwei/main_works/.cursor/debug.log", "a") as f:
-        f.write(json.dumps({
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "A,B,C,D,E",
-            "location": "protocol.py:107",
-            "message": "union_tensor_dict: batch sizes comparison",
-            "data": {
-                "tensor_dict1_batch_size": str(tensor_dict1.batch_size),
-                "tensor_dict2_batch_size": str(tensor_dict2.batch_size),
-                "tensor_dict1_keys": list(tensor_dict1.keys()),
-                "tensor_dict2_keys": list(tensor_dict2.keys())
-            },
-            "timestamp": int(time.time() * 1000)
-        }) + "\n")
-    # #endregion
     assert tensor_dict1.batch_size == tensor_dict2.batch_size, f"Two tensor dict must have identical batch size. Got {tensor_dict1.batch_size} and {tensor_dict2.batch_size}"
     for key in tensor_dict2.keys():
         if key not in tensor_dict1.keys():
