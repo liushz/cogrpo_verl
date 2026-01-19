@@ -178,8 +178,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes="${nnodes}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
     trainer.log_val_generations=100 \
-    trainer.save_freq=100 \
-    trainer.test_freq=100
+    trainer.save_freq=20 \
+    trainer.test_freq=20
 
 else
 # init worker

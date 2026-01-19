@@ -567,13 +567,16 @@ class vLLMRollout(BaseRollout):
             # input_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=idx.size(1), left=True).to(idx.device).to(torch.float32)
 
             if self.sampling_params.n > 1 and do_sample:
-                idx = _repeat_interleave(idx, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-                batch_size = batch_size * self.sampling_params.n
-                # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
-                if "tools_kwargs" in non_tensor_batch.keys():
-                    non_tensor_batch["tools_kwargs"] = _repeat_interleave(non_tensor_batch["tools_kwargs"], self.sampling_params.n)
+                repeat_n = int(self.sampling_params.n)
+                orig_batch_size = batch_size
+                idx = _repeat_interleave(idx, repeat_n)
+                attention_mask = _repeat_interleave(attention_mask, repeat_n)
+                position_ids = _repeat_interleave(position_ids, repeat_n)
+                batch_size = batch_size * repeat_n
+                # Repeat per-sample metadata in non_tensor_batch to match expanded batch size.
+                for key, val in list(non_tensor_batch.items()):
+                    if isinstance(val, np.ndarray) and val.shape[0] == orig_batch_size:
+                        non_tensor_batch[key] = _repeat_interleave(val, repeat_n)
 
             seq = torch.cat([idx, response], dim=-1)
 

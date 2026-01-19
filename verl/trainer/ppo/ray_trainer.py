@@ -1077,8 +1077,14 @@ class RayPPOTrainer:
 
                 # Create stable IDs early so rollout can report per-step verifier trajectories
                 # and trainer can map them back to per-sample rewards.
-                if "uid" not in batch.non_tensor_batch:
-                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
+                if (
+                    "uid" not in batch.non_tensor_batch
+                    or not isinstance(batch.non_tensor_batch["uid"], np.ndarray)
+                    or batch.non_tensor_batch["uid"].shape[0] != len(batch)
+                ):
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch))], dtype=object
+                    )
                 uids = batch.non_tensor_batch["uid"]
 
                 # pop those keys for generation
