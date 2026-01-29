@@ -37,12 +37,13 @@ reward_model_key = os.environ.get("REWARD_MODEL_KEY", "NONE")
 class NaiveRewardManager:
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
+    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", config=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key
         self.reward_model_clients = [OpenAI(base_url=url, api_key=reward_model_key) for url in reward_model_urls] if reward_model_urls else None
+        self.config = config  # Store config for accessing trainer settings
 
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
@@ -53,6 +54,24 @@ class NaiveRewardManager:
         # If needed again, re-enable by restoring the env-driven flags.
         debug_enabled = False
         debug_limit = 0
+
+        # Normalize non_tensor_batch to per-sample arrays to avoid scalar indexing errors.
+        if data.non_tensor_batch:
+            batch_size = len(data)
+            for key, val in list(data.non_tensor_batch.items()):
+                if isinstance(val, np.ndarray):
+                    if val.shape == ():
+                        data.non_tensor_batch[key] = np.full((batch_size,), val.item(), dtype=object)
+                    elif val.shape[0] != batch_size:
+                        if val.size == 1:
+                            data.non_tensor_batch[key] = np.full((batch_size,), val.reshape(-1)[0], dtype=object)
+                elif isinstance(val, (list, tuple)):
+                    if len(val) == batch_size:
+                        data.non_tensor_batch[key] = np.array(val, dtype=object)
+                    elif len(val) == 1:
+                        data.non_tensor_batch[key] = np.full((batch_size,), val[0], dtype=object)
+                else:
+                    data.non_tensor_batch[key] = np.full((batch_size,), val, dtype=object)
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
@@ -75,10 +94,49 @@ class NaiveRewardManager:
         from datetime import datetime
 
         batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        def _first_scalar(value):
+            if value is None:
+                return None
+            if isinstance(value, np.ndarray):
+                if value.size == 0:
+                    return None
+                value = value.reshape(-1)[0]
+            elif isinstance(value, list):
+                if len(value) == 0:
+                    return None
+                value = value[0]
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    return None
+                value = value.reshape(-1)[0].item()
+            if isinstance(value, np.generic):
+                return value.item()
+            return value
+
         # Prefer upstream-provided experiment id, then env override, else timestamp-based.
-        experiment_id = data.non_tensor_batch.get("experiment_id") or os.environ.get("VERL_EXPERIMENT_ID") or f"exp_{batch_timestamp}"
+        experiment_id = _first_scalar(data.non_tensor_batch.get("experiment_id"))
+        if not experiment_id:
+            experiment_id = os.environ.get("VERL_EXPERIMENT_ID")
+        if not experiment_id:
+            experiment_id = f"exp_{batch_timestamp}"
         # Batch tag to avoid filename collisions; prefer upstream batch ids/steps.
-        batch_tag = data.non_tensor_batch.get("batch_id") or data.non_tensor_batch.get("step") or data.non_tensor_batch.get("global_step") or batch_timestamp
+        batch_tag = _first_scalar(data.non_tensor_batch.get("batch_id"))
+        if batch_tag is None or batch_tag == "":
+            batch_tag = _first_scalar(data.non_tensor_batch.get("step"))
+        if batch_tag is None or batch_tag == "":
+            batch_tag = _first_scalar(data.non_tensor_batch.get("global_step"))
+        if batch_tag is None or batch_tag == "":
+            batch_tag = batch_timestamp
+
+        # Get experiment_name from config for unified experiment_id
+        if self.config is not None and hasattr(self.config, 'trainer'):
+            experiment_name = self.config.trainer.get('experiment_name', None)
+        else:
+            experiment_name = None
+
+        # Use experiment_name from config if available, otherwise fallback to experiment_id from data/env
+        final_experiment_id = experiment_name or experiment_id
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
@@ -228,7 +286,7 @@ class NaiveRewardManager:
                 'full_response': full_response_with_hints if is_exp_stream else response_str,  # Use full response with hints for exp stream
                 'ground_truth': ground_truth,
                 'data_source': data_source,
-                'experiment_id': experiment_id,
+                'experiment_id': final_experiment_id,  # Use final_experiment_id from config
                 'timestamp': batch_timestamp,
                 # Basic token-length diagnostics (works even if rollout diagnostics missing)
                 'valid_prompt_length': int(valid_prompt_length),
@@ -335,17 +393,68 @@ class NaiveRewardManager:
             elif dump_record.get('stream_type') == 'control':
                 control_dump_records.append(dump_record)
 
+        # Check if we should dump based on dual_rollout_dump_freq
+        # Get dual_rollout_dump_freq from config (default to rollout_dump_freq for backward compatibility)
+        dual_rollout_dump_freq = 0
+        if self.config is not None and hasattr(self.config, 'trainer'):
+            dual_rollout_dump_freq_config = self.config.trainer.get('dual_rollout_dump_freq', None)
+            if dual_rollout_dump_freq_config is not None:
+                dual_rollout_dump_freq = dual_rollout_dump_freq_config
+            else:
+                # Fallback to rollout_dump_freq
+                rollout_dump_freq_config = self.config.trainer.get('rollout_dump_freq', 0)
+                if rollout_dump_freq_config is not None:
+                    dual_rollout_dump_freq = rollout_dump_freq_config
+
+        # Get global_step from data to decide if we should dump
+        should_dump = True  # Default to dump
+        if dual_rollout_dump_freq > 0:
+            # Try to get global_step from non_tensor_batch
+            global_step = _first_scalar(data.non_tensor_batch.get('global_step', None))
+            if global_step is not None:
+                try:
+                    global_step = int(global_step)
+                    should_dump = (global_step % dual_rollout_dump_freq == 0)
+                except (ValueError, TypeError):
+                    should_dump = True
+            else:
+                # Fallback: try to get from batch_tag (step)
+                try:
+                    batch_tag_int = int(batch_tag)
+                    should_dump = (batch_tag_int % dual_rollout_dump_freq == 0)
+                except (ValueError, TypeError):
+                    # If batch_tag is not an integer, dump anyway
+                    should_dump = True
+
+        # Skip dump if frequency check fails
+        if not should_dump:
+            if return_dict:
+                return {
+                    "reward_tensor": reward_tensor,
+                    "reward_extra_info": reward_extra_info,
+                }
+            return reward_tensor
+
         # Write dump files with organized directory structure:
-        # experiment_id/
+        # work_dir/dual_rollout_data/
         #   ├── control/
         #   │   └── batch_YYYYMMDD_HHMMSS.json (filename now uses batch_tag)
         #   └── exp/
         #       └── batch_YYYYMMDD_HHMMSS.json
         import json, os
-        dump_base_dir = os.environ.get("VERL_DUMP_DIR", '/mnt/shared-storage-user/liuhongwei/main_works/temp_debug')
 
-        # Create experiment directory structure
-        experiment_dir = os.path.join(dump_base_dir, 'outputs', experiment_id)
+        # Get dump directory from config or environment
+        if self.config is not None and hasattr(self.config, 'trainer'):
+            work_dir = self.config.trainer.get('default_local_dir', None)
+        else:
+            work_dir = None
+
+        # Fallback to environment variable or default path
+        dump_base_dir = work_dir or os.environ.get("VERL_DUMP_DIR", '/mnt/shared-storage-user/liuhongwei/main_works/temp_debug')
+
+        # Create dual_rollout_data directory structure
+        # final_experiment_id is already computed above (line 91)
+        experiment_dir = os.path.join(dump_base_dir, 'dual_rollout_data', final_experiment_id)
 
         # Write control stream batch
         if control_dump_records:
@@ -355,7 +464,7 @@ class NaiveRewardManager:
 
             # Add batch metadata
             control_batch_metadata = {
-                'experiment_id': experiment_id,
+                'experiment_id': final_experiment_id,  # ✅ 使用 final_experiment_id
                 'stream_type': 'control',
                 'batch_timestamp': batch_timestamp,
                 'batch_tag': batch_tag,
@@ -375,7 +484,7 @@ class NaiveRewardManager:
 
             # Add batch metadata
             exp_batch_metadata = {
-                'experiment_id': experiment_id,
+                'experiment_id': final_experiment_id,  # ✅ 使用 final_experiment_id
                 'stream_type': 'exp',
                 'batch_timestamp': batch_timestamp,
                 'batch_tag': batch_tag,

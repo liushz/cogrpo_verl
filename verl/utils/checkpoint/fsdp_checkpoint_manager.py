@@ -272,6 +272,69 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     else:
                         print(f"Warning: {self.__class__.__name__}.save_checkpoint: Generation config file not found in, using a generation config created from the model config when saving hf_model.")
 
+                expected_keys = set(save_model.state_dict().keys())
+                # If training uses PEFT/LoRA wrappers (e.g., verifier LoRA on the same base model),
+                # FSDP full_state_dict will contain PEFT-prefixed keys (base_model.*) and LoRA weights.
+                # Convert to a plain HF-compatible state_dict for downstream inference engines (lmdeploy/vllm/etc.).
+                if expected_keys and state_dict and not expected_keys.issuperset(state_dict.keys()):
+                    rewritten = {}
+                    dropped_lora = 0
+                    dropped_unmatched = 0
+                    remapped = 0
+
+                    def _candidates(name: str):
+                        out = [name]
+                        if name.startswith("base_model.model."):
+                            out.append(name[len("base_model.model.") :])
+                        if name.startswith("base_model."):
+                            out.append(name[len("base_model.") :])
+                        expanded = []
+                        for n in out:
+                            expanded.append(n)
+                            expanded.append(n.replace(".base_layer.", "."))
+                            expanded.append(n.replace(".base_layer.weight", ".weight"))
+                            expanded.append(n.replace(".base_layer.bias", ".bias"))
+                            expanded.append(n.replace("model.model.", "model."))
+                        # de-dup preserve order
+                        seen = set()
+                        dedup = []
+                        for n in expanded:
+                            if n not in seen:
+                                seen.add(n)
+                                dedup.append(n)
+                        return dedup
+
+                    for k, v in state_dict.items():
+                        if ".lora_" in k or ".lora_A." in k or ".lora_B." in k:
+                            dropped_lora += 1
+                            continue
+                        target = None
+                        for cand in _candidates(k):
+                            if cand in expected_keys:
+                                target = cand
+                                break
+                        if target is None:
+                            dropped_unmatched += 1
+                            continue
+                        rewritten[target] = v
+                        remapped += 1
+
+                    missing = expected_keys.difference(rewritten.keys())
+                    if missing:
+                        logger.warning(
+                            f"{self.__class__.__name__}.save_checkpoint: PEFT->HF rewrite missing {len(missing)} keys; "
+                            f"dropped_lora={dropped_lora}, dropped_unmatched={dropped_unmatched}, remapped={remapped}"
+                        )
+                    else:
+                        log_with_rank(
+                            f"Rewrote PEFT-wrapped state_dict to plain HF keys: "
+                            f"dropped_lora={dropped_lora}, dropped_unmatched={dropped_unmatched}, remapped={remapped}",
+                            rank=self.rank,
+                            logger=logger,
+                            log_only_rank_0=True,
+                        )
+                    state_dict = rewritten
+
                 save_model.save_pretrained(hf_local_path, state_dict=state_dict)
                 self.processing_class.save_pretrained(hf_local_path)
                 log_with_rank(f"Saved hf_model to {os.path.abspath(hf_local_path)}", rank=self.rank, logger=logger, log_only_rank_0=True)

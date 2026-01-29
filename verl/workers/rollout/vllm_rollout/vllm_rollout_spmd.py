@@ -57,32 +57,66 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # Verifier prompts (matching format_training_data.py)
 VERIFIER_SYSTEM_PROMPT = "You are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags."
 
-VERIFIER_INTERVENE_PROMPT = """You are a **Socratic Reasoning Supervisor** and **Logic Auditor** for a large language model.
-Your goal is to monitor the student's (model's) reasoning process step-by-step.
+VERIFIER_INTERVENE_PROMPT = """You are monitoring a student's reasoning trace.
+Based on the `Question` and the `Student Response` so far, perform the following workflow:
 
-**Your Workflow:**
-1.  **Analyze**: Read the provided `Question` and the student's `Current Reasoning Trace`.
-2.  **Diagnose (System 2 Thought)**:
-    - Generate a ```<think> ... </think>``` block.
-    - Inside, perform a **Shadow Verification**:
-        - If the step involves calculation, re-calculate it independently.
-        - If the step involves logic, verify the rule application.
-        - If you detect a pattern of error (e.g., hallucination, logic gap), diagnose it.
-3.  **Act**:
-    - If the reasoning is sound: Output `<GO>`.
-    - If there is a critical error or high-risk pattern: Output `<WAIT>` followed by a brief, fuzzy guidance (imperative mood, do not leak answer).
+**Phase 1: Shadow Verification (Inside <think>)**
+Write a stream-of-consciousness verification paragraph. You MUST:
+1.  **Re-calculate**: Explicitly perform the math step yourself to check for errors.
+2.  **Check Logic**: Verify if the theorem or rule used is applicable (check conditions/edge cases).
+3.  **Check Efficiency (Crucial)**: Ask *"Did this step add new information or eliminate a possibility?"*
+    - If the student just repeats a known fact (e.g., "a=3" -> "3 is prime") -> Mark as **Stagnation**.
+    - If the answer is boxed but the student keeps writing -> Mark as **Late-stage Verbosity**.
 
-**Output Format:**
-```
+**Phase 2: Decision (Output)**
+- If the step is correct and makes progress: Output `<GO>`.
+- If there is an error or stagnation: Output `<WAIT>` followed by a specific **Guidance Hint**.
+
+**Guidance Hint Guidelines:**
+- **For Logic Errors**: Use a **Checklist**. (e.g., "Verify: 1. Is it continuous? 2. Is it bounded?")
+- **For Calc Errors**: Point to the **Attribute**. (e.g., "Check the sign of the constant term.")
+- **For Stagnation**: Use a **Redirect**. (e.g., "You established X. Stop repeating. Solve for Y now.")
+- **For Late-stage**: Force a stop. (e.g., "Solution is boxed. Stop writing.")
+
+**Output Format (Strict):**
+- Start directly with `<think>`.
+- Do NOT use Markdown code blocks (like ```).
+- Format:
 <think>
-(Your shadow verification and diagnosis)
+[Your detailed shadow verification...]
 </think>
+<GO>
+OR
+<think>
+...
+</think>
+<WAIT> [Your specific hint]
 
-<GO> or <WAIT> [Guidance]
-```
+**Question:**
+{question}
 
-**Question & Student Response:**
+**Student Response (So Far):**
+{student_response}
 """
+
+def build_verifier_user_prompt(question: str, student_response: str) -> str:
+    template = VERIFIER_INTERVENE_PROMPT.replace(
+        "{question}", "__VERIFIER_QUESTION__"
+    ).replace(
+        "{student_response}", "__VERIFIER_RESPONSE__"
+    )
+    return template.replace("__VERIFIER_QUESTION__", question).replace(
+        "__VERIFIER_RESPONSE__", student_response
+    )
+
+# Hard filters to prevent verifier "spam hints" / mode collapse.
+BANNED_PHRASES = [
+    "provide the final numeric answer",
+    "finish the solution",
+    "answer the question",
+    "provide the final answer",
+    "final numeric answer",
+]
 
 # TODO
 # 1. support pp in vllm
@@ -109,6 +143,15 @@ class InterventionPolicy:
         Returns:
             bool: 是否应该干预
         """
+        import difflib
+
+        def _normalize_hint(text: str) -> str:
+            if not text:
+                return ""
+            s = text.strip().lower()
+            s = re.sub(r"\s+", " ", s)
+            return s
+
         # 1. 达到最大干预次数
         if len(state['hints']) >= self.max_interventions:
             return False
@@ -120,8 +163,26 @@ class InterventionPolicy:
         # 3. 没有 hint
         if not decision.get("hint"):
             return False
-        
-        # 简单阈值判断，可根据实际 verifier 输出调整
+
+        # === Hard filters: blacklist + deduplication ===
+        hint_norm = _normalize_hint(str(decision.get("hint", "")))
+        if not hint_norm:
+            return False
+
+        for phrase in BANNED_PHRASES:
+            if phrase in hint_norm:
+                return False
+
+        prev_hints = state.get("hints", []) or []
+        for prev in prev_hints:
+            prev_norm = _normalize_hint(str(prev))
+            if not prev_norm:
+                continue
+            if hint_norm in prev_norm or prev_norm in hint_norm:
+                return False
+            if difflib.SequenceMatcher(a=hint_norm, b=prev_norm).ratio() >= 0.9:
+                return False
+
         return True
 
 
@@ -140,6 +201,22 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return value.repeat_interleave(repeats, dim=0)
     else:
         return np.repeat(value, repeats, axis=0)
+
+
+def _as_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    if isinstance(val, (int, np.integer)):
+        return bool(val)
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off", ""):
+            return False
+    return bool(val)
 
 
 def _extract_vllm_outputs(outputs, pad_token_id: int, max_length: int, device):
@@ -247,9 +324,14 @@ class vLLMRollout(BaseRollout):
         # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
         # #endregion
         
-        # KV Cache optimization: enable prefix caching for by_step mode
-        # This allows vLLM to reuse attention cache across steps, reducing compute
-        self.enable_kv_cache_optimization = kwargs.pop("enable_kv_cache_optimization", True)
+        # KV Cache optimization: whether to enable vLLM prefix caching.
+        # NOTE: In by_step mode we call vLLM generate() repeatedly. Prefix caching can
+        # improve throughput but may also cause prefix-cache reset failures / block leaks
+        # in some vLLM versions. Make it configurable via config (preferred) or kwargs.
+        config_enable_kv_cache_optimization = config.get("enable_kv_cache_optimization", None)
+        if config_enable_kv_cache_optimization is None:
+            config_enable_kv_cache_optimization = kwargs.pop("enable_kv_cache_optimization", True)
+        self.enable_kv_cache_optimization = _as_bool(config_enable_kv_cache_optimization)
         # copy it to avoid secretly modifying the engine config
         engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
         # For each vLLM engine parameter,
@@ -310,7 +392,7 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            enable_prefix_caching=self.enable_kv_cache_optimization,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
             **lora_kwargs,
@@ -797,6 +879,7 @@ class vLLMRollout(BaseRollout):
         self, 
         prompts: DataProto, 
         intervention_mode: str = "by_response",
+        stream_mode: str = "both",
         token_check_interval: int = 1024,
         entropy_threshold: float = 0.5,
         use_entropy_filter: bool = True,
@@ -874,6 +957,7 @@ class vLLMRollout(BaseRollout):
             kwargs.setdefault('min_step_tokens', token_check_interval)
             kwargs['entropy_threshold'] = entropy_threshold
             kwargs['use_entropy_filter'] = use_entropy_filter
+            kwargs['stream_mode'] = stream_mode
             return self._dual_stream_rollout_by_step(
                 prompts, timing_info, start_time, tokenizer, idx, attention_mask,
                 position_ids, eos_token_id, batch_size, **kwargs
@@ -884,6 +968,7 @@ class vLLMRollout(BaseRollout):
             kwargs['token_check_interval'] = token_check_interval
             kwargs['entropy_threshold'] = entropy_threshold
             kwargs['use_entropy_filter'] = use_entropy_filter
+            kwargs['stream_mode'] = stream_mode
             return self._dual_stream_rollout_by_step(
                 prompts, timing_info, start_time, tokenizer, idx, attention_mask,
                 position_ids, eos_token_id, batch_size, **kwargs
@@ -1016,7 +1101,7 @@ class vLLMRollout(BaseRollout):
         verifier_chat_inputs = []
         for prompt, draft in zip(prompt_texts, draft_texts):
             # Construct user content: intervene_prompt + question + student response
-            user_content = f"{VERIFIER_INTERVENE_PROMPT} Question: {prompt}\n\nStudent Response: {draft}"
+            user_content = build_verifier_user_prompt(prompt, draft)
 
             # Format as separate system and user messages (matches training data)
             messages = [
@@ -1387,9 +1472,9 @@ class vLLMRollout(BaseRollout):
             verifier_prompt_token_ids = []
             for verifier_prompt in verifier_inputs:
                 # Heuristic structured truncation: keep the latest part of "Student Response".
-                prefix_text, sep, student_resp = verifier_prompt.partition("Student Response:")
+                prefix_text, sep, student_resp = verifier_prompt.partition("**Student Response (So Far):**")
                 if sep:
-                    user_prefix = f"{prefix_text}Student Response:\n"
+                    user_prefix = f"{prefix_text}**Student Response (So Far):**\n"
                 else:
                     user_prefix = verifier_prompt
                     student_resp = ""
@@ -1530,7 +1615,8 @@ class vLLMRollout(BaseRollout):
         # Step 2: Extract <GO> or <WAIT> followed content
         # Pattern: <GO> or <WAIT> followed by optional whitespace and content
         go_match = re.search(r'<GO>\s*(.*?)(?:\n|$)', text_without_think, re.IGNORECASE | re.DOTALL)
-        wait_match = re.search(r'<WAIT>\s*(.*?)(?:\n|$)', text_without_think, re.IGNORECASE | re.DOTALL)
+        # IMPORTANT: <WAIT> hints are often multi-line checklists. Do not truncate at first newline.
+        wait_match = re.search(r'<WAIT>\s*(.*)$', text_without_think, re.IGNORECASE | re.DOTALL)
         
         if wait_match:
             hint = f"<WAIT> {wait_match.group(1).strip()}"
@@ -1750,85 +1836,94 @@ class vLLMRollout(BaseRollout):
         3. Token ID + String Suffix 双重停止检测
         4. 完整的 DataProto 构建
         """
-        # ========== Control Stream: Policy generates without guidance ==========
-        idx_list = []
-        for i in range(batch_size):
-            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+        stream_mode = kwargs.pop("stream_mode", "both")
+        if stream_mode not in ("both", "control", "exp"):
+            logger.warning(f"Unknown stream_mode={stream_mode}, falling back to 'both'")
+            stream_mode = "both"
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        control_responses = None
+        control_log_probs = None
+        control_n = 1
 
-        # =================================================================
-        # FIX START: Robust Batch Size Check for Co-GRPO
-        # =================================================================
+        # ========== Control Stream: Policy generates without guidance ==========
+        if stream_mode in ("both", "control"):
+            idx_list = []
+            for i in range(batch_size):
+                idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
-        # 1. Basic configuration
-        if not do_sample:
-            control_kwargs = {
-                "best_of": 1, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
-                "temperature": 0, "n": 1,
-            }
-        elif is_validate:
-            control_kwargs = {
-                "top_k": self.config.val_kwargs.top_k,
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
-                "n": 1,
-            }
-        else:
-            control_kwargs = {}
+            # =================================================================
+            # FIX START: Robust Batch Size Check for Co-GRPO
+            # =================================================================
 
-        # 2. Co-GRPO: Force n=1 to avoid double repetition
-        # In Co-GRPO, trainer already repeats gen_batch BEFORE calling dual_stream_rollout
-        # So we MUST use n=1 here, otherwise vLLM will repeat again causing batch_size mismatch
-        if do_sample and not is_validate and self.sampling_params.n > 1:
-            target_n = self.sampling_params.n
-            logger.info(f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})")
-            control_kwargs["n"] = 1
-
-        # =================================================================
-        # FIX END
-        # =================================================================
-
-        # Store the actual n used for control generation (for batch expansion)
-        control_n = control_kwargs.get("n", self.sampling_params.n if do_sample and not is_validate else 1)
-
-        # Generate control responses (no LoRA)
-        control_start = time.time()
-        with self.update_sampling_params(**control_kwargs):
-            control_output = self.inference_engine.generate(
-                prompts=None,
-                sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
-                lora_request=None,
-                use_tqdm=False,
-            )
-
-        control_responses, control_log_probs = _extract_vllm_outputs(
-            control_output, self.pad_token_id, self.config.response_length, idx.device
-        )
-        timing_info["control_gen"] = time.time() - control_start
-
-        # Handle num_generation_per_prompt > 1 case
-        # IMPORTANT: Check if batch was already repeated by trainer (for Co-GRPO)
-        # In Co-GRPO, trainer repeats gen_batch before calling dual_stream_rollout
-        # So we should NOT repeat again here to avoid double repetition
-        # IMPORTANT: Use control_n (the actual n used) not self.sampling_params.n
-        if control_n > 1 and do_sample:
-            n = control_n
-            # Check if batch was already repeated by checking if batch_size is a multiple of n
-            # If batch_size >= n and is divisible by n, it was likely pre-repeated by trainer
-            if batch_size % n == 0 and batch_size >= n:
-                # Batch was already repeated by trainer, don't repeat again
-                pass
+            # 1. Basic configuration
+            if not do_sample:
+                control_kwargs = {
+                    "best_of": 1, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
+                    "temperature": 0, "n": 1,
+                }
+            elif is_validate:
+                control_kwargs = {
+                    "top_k": self.config.val_kwargs.top_k,
+                    "top_p": self.config.val_kwargs.top_p,
+                    "temperature": self.config.val_kwargs.temperature,
+                    "n": 1,
+                }
             else:
-                # Normal case: repeat batch in rollout
-                idx = _repeat_interleave(idx, n)
-                attention_mask = _repeat_interleave(attention_mask, n)
-                position_ids = _repeat_interleave(position_ids, n)
-                # Repeat idx_list to match the expanded batch size
-                idx_list = idx_list * n
-                batch_size = batch_size * n
+                control_kwargs = {}
+
+            # 2. Co-GRPO: Force n=1 to avoid double repetition
+            # In Co-GRPO, trainer already repeats gen_batch BEFORE calling dual_stream_rollout
+            # So we MUST use n=1 here, otherwise vLLM will repeat again causing batch_size mismatch
+            if do_sample and not is_validate and self.sampling_params.n > 1:
+                target_n = self.sampling_params.n
+                logger.info(f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})")
+                control_kwargs["n"] = 1
+
+            # =================================================================
+            # FIX END
+            # =================================================================
+
+            # Store the actual n used for control generation (for batch expansion)
+            control_n = control_kwargs.get("n", self.sampling_params.n if do_sample and not is_validate else 1)
+
+            # Generate control responses (no LoRA)
+            control_start = time.time()
+            with self.update_sampling_params(**control_kwargs):
+                control_output = self.inference_engine.generate(
+                    prompts=None,
+                    sampling_params=self.sampling_params,
+                    prompt_token_ids=idx_list,
+                    lora_request=None,
+                    use_tqdm=False,
+                )
+
+            control_responses, control_log_probs = _extract_vllm_outputs(
+                control_output, self.pad_token_id, self.config.response_length, idx.device
+            )
+            timing_info["control_gen"] = time.time() - control_start
+
+            # Handle num_generation_per_prompt > 1 case
+            # IMPORTANT: Check if batch was already repeated by trainer (for Co-GRPO)
+            # In Co-GRPO, trainer repeats gen_batch before calling dual_stream_rollout
+            # So we should NOT repeat again here to avoid double repetition
+            # IMPORTANT: Use control_n (the actual n used) not self.sampling_params.n
+            if control_n > 1 and do_sample:
+                n = control_n
+                # Check if batch was already repeated by checking if batch_size is a multiple of n
+                # If batch_size >= n and is divisible by n, it was likely pre-repeated by trainer
+                if batch_size % n == 0 and batch_size >= n:
+                    # Batch was already repeated by trainer, don't repeat again
+                    pass
+                else:
+                    # Normal case: repeat batch in rollout
+                    idx = _repeat_interleave(idx, n)
+                    attention_mask = _repeat_interleave(attention_mask, n)
+                    position_ids = _repeat_interleave(position_ids, n)
+                    # Repeat idx_list to match the expanded batch size
+                    idx_list = idx_list * n
+                    batch_size = batch_size * n
 
         # ========== Experimental Stream: 批量并行增量打断生成 ==========
         # 1. 获取停止配置
@@ -2279,7 +2374,7 @@ class vLLMRollout(BaseRollout):
                     # CRITICAL FIX: Use training data format for Verifier input
                     # Format matches format_training_data.py: system -> user (intervene_prompt + question + student response)
                     # by_step mode: current_reasoning is the partial response so far
-                    user_content = f"{VERIFIER_INTERVENE_PROMPT} Question: {state['prompt_text']}\n\nStudent Response: {current_reasoning}"
+                    user_content = build_verifier_user_prompt(state['prompt_text'], current_reasoning)
                     verifier_input = user_content  # Will be formatted with system message in _run_verifier_inference
                     verifier_inputs.append(verifier_input)
                     verifier_input_map.append((b, state['step_count']))
@@ -2478,32 +2573,35 @@ class vLLMRollout(BaseRollout):
         exp_responses = torch.stack(exp_responses_list)  # [batch_size, response_length]
         
         # 10. 构建完整的 DataProto（参考现有实现）
-        # Control stream data
-        control_seq = torch.cat([idx, control_responses], dim=-1)
-        control_response_length = control_responses.size(1)
-        control_delta_position_id = torch.arange(1, control_response_length + 1, device=position_ids.device)
-        control_delta_position_id = control_delta_position_id.unsqueeze(0).repeat(batch_size, 1)
-
-        # 计算 last_valid_pos
-        control_last_valid_pos = torch.full((batch_size,), control_response_length, dtype=torch.long, device=idx.device)
         exp_last_valid_pos = torch.tensor(exp_last_valid_pos_list, dtype=torch.long, device=idx.device)
-
-        # 11. 构建 TensorDict batch
         from tensordict import TensorDict
-        batch = TensorDict({
-            'control_input_ids': control_seq,
-            'control_attention_mask': torch.cat([attention_mask, torch.ones_like(control_responses)], dim=-1),
-            'control_position_ids': torch.cat([position_ids, control_delta_position_id], dim=-1),
-            'control_log_probs': control_log_probs,
-            'control_last_valid_pos': control_last_valid_pos,
-            'control_responses': control_responses,  # Add responses separately for trainer
+        batch_dict = {
             'exp_input_ids': exp_input_ids,
             'exp_attention_mask': exp_attention_mask,
             'exp_position_ids': exp_position_ids,
             'exp_loss_mask': exp_loss_mask,  # 关键新增
             'exp_responses': exp_responses,
             'exp_last_valid_pos': exp_last_valid_pos,
-        }, batch_size=batch_size)
+        }
+
+        if stream_mode in ("both", "control"):
+            # Control stream data
+            control_seq = torch.cat([idx, control_responses], dim=-1)
+            control_response_length = control_responses.size(1)
+            control_delta_position_id = torch.arange(1, control_response_length + 1, device=position_ids.device)
+            control_delta_position_id = control_delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+            control_last_valid_pos = torch.full((batch_size,), control_response_length, dtype=torch.long, device=idx.device)
+            batch_dict.update({
+                'control_input_ids': control_seq,
+                'control_attention_mask': torch.cat([attention_mask, torch.ones_like(control_responses)], dim=-1),
+                'control_position_ids': torch.cat([position_ids, control_delta_position_id], dim=-1),
+                'control_log_probs': control_log_probs,
+                'control_last_valid_pos': control_last_valid_pos,
+                'control_responses': control_responses,  # Add responses separately for trainer
+            })
+
+        # 11. 构建 TensorDict batch
+        batch = TensorDict(batch_dict, batch_size=batch_size)
 
         # 12. 构建 non_tensor_batch
         # IMPORTANT: Preserve the original non_tensor_batch fields (reward_model, data_source, etc.)
@@ -2521,8 +2619,6 @@ class vLLMRollout(BaseRollout):
                     non_tensor_batch[key] = _repeat_interleave(val, repeat_factor)
 
         non_tensor_batch.update({
-            'control_prompts': np.array([tokenizer.decode(idx[i].tolist(), skip_special_tokens=False) for i in range(batch_size)], dtype=object),
-            'control_responses': np.array([tokenizer.decode(control_responses[i].tolist(), skip_special_tokens=False) for i in range(batch_size)], dtype=object),
             'exp_prompts': np.array([state['prompt_text'] for state in sample_states], dtype=object),
             'exp_responses': np.array([tokenizer.decode(exp_responses[i].tolist(), skip_special_tokens=False) for i in range(batch_size)], dtype=object),
             'hints': np.array(all_hints, dtype=object),
@@ -2542,6 +2638,11 @@ class vLLMRollout(BaseRollout):
             'context_exhausted': np.array([state.get('context_exhausted', False) for state in sample_states], dtype=np.bool_),
             'first_step_tokens_len': np.array([state.get('first_step_tokens_len') for state in sample_states], dtype=object),
         })
+        if stream_mode in ("both", "control"):
+            non_tensor_batch.update({
+                'control_prompts': np.array([tokenizer.decode(idx[i].tolist(), skip_special_tokens=False) for i in range(batch_size)], dtype=object),
+                'control_responses': np.array([tokenizer.decode(control_responses[i].tolist(), skip_special_tokens=False) for i in range(batch_size)], dtype=object),
+            })
 
         # Ensure all vector-like fields in non_tensor_batch align with batch_size
         for key, val in list(non_tensor_batch.items()):
@@ -2678,7 +2779,7 @@ class vLLMAsyncRollout(vLLMRollout):
         self.lora_kwargs = kwargs.pop("lora_kwargs", {})
         verifier_lora_name = kwargs.pop("verifier_lora_name", None)
         verifier_lora_path = kwargs.pop("verifier_lora_path", None)
-        self.enable_kv_cache_optimization = kwargs.pop("enable_kv_cache_optimization", True)
+        self.enable_kv_cache_optimization = _as_bool(kwargs.pop("enable_kv_cache_optimization", True))
 
         sampling_kwargs = dict(
             n=1,
@@ -2869,6 +2970,7 @@ class vLLMAsyncRollout(vLLMRollout):
         self, 
         prompts: DataProto, 
         intervention_mode: str = "by_response",
+        stream_mode: str = "both",
         token_check_interval: int = 2048,
         entropy_threshold: float = 0.5,
         use_entropy_filter: bool = True,
@@ -2943,6 +3045,7 @@ class vLLMAsyncRollout(vLLMRollout):
             kwargs['token_check_interval'] = token_check_interval
             kwargs['entropy_threshold'] = entropy_threshold
             kwargs['use_entropy_filter'] = use_entropy_filter
+            kwargs['stream_mode'] = stream_mode
             return self._dual_stream_rollout_by_step(
                 prompts, timing_info, start_time, tokenizer, idx, attention_mask,
                 position_ids, eos_token_id, batch_size, **kwargs
@@ -2953,6 +3056,7 @@ class vLLMAsyncRollout(vLLMRollout):
             kwargs['token_check_interval'] = token_check_interval
             kwargs['entropy_threshold'] = entropy_threshold
             kwargs['use_entropy_filter'] = use_entropy_filter
+            kwargs['stream_mode'] = stream_mode
             return self._dual_stream_rollout_by_step(
                 prompts, timing_info, start_time, tokenizer, idx, attention_mask,
                 position_ids, eos_token_id, batch_size, **kwargs

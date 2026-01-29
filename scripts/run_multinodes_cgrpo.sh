@@ -153,10 +153,10 @@ if [ "${co_grpo_mode}" = "verifier_lora_only" ]; then
 fi
 
 
-verifier_max_new_tokens=$((1024 * 2 ))
+verifier_max_new_tokens=$((1024 * 2))
 verifier_temperature=1.0
 verifier_logprobs=1
-verifier_max_hint_tokens=256
+verifier_max_hint_tokens=512
 
 # verifier intervention mode: "by_response" or "by_step"
 verifier_intervention_mode=by_step
@@ -185,13 +185,9 @@ confidence_threshold=0.7
 # Minimum tokens before honoring stop boundaries (defaults to token_check_interval if not set)
  
 # intervention penalty (weak; applied only on non-improving samples in trainer)
-intervention_penalty_freq_coef=0.01
+intervention_penalty_freq_coef=0.005
 intervention_penalty_len_coef=0.0
 
-# Approximate hint headroom for max_model_len budgeting.
-# Override if your verifier hints are much longer/shorter.
-estimated_hint_tokens=${estimated_hint_tokens:-256}
-hint_headroom=$((max_interventions * estimated_hint_tokens))
 
 # curriculum learning (dynamic control/exp weight)
 use_curriculum_weighting=True
@@ -210,8 +206,11 @@ train_batch_size=64  # Must satisfy: (train_batch_size * n) % (n_gpus) == 0
 	                      # With n=4 and 16 GPUs: 4*4=16, 16%16=0 ✓
 max_prompt_length=$((1024))
 max_response_length=$((1024 * $response_n))
-# Cap max_model_len to model context length (e.g., 40k) while reserving headroom for hints.
+max_model_len=$((max_prompt_length + max_response_length))
+
 model_max_len=${MODEL_MAX_LEN:-40960}
+estimated_hint_tokens=${estimated_hint_tokens:-256}
+hint_headroom=$((max_interventions * estimated_hint_tokens))
 max_model_len=$((max_prompt_length + max_response_length + hint_headroom))
 if [ "${max_model_len}" -gt "${model_max_len}" ]; then
     max_model_len=${model_max_len}
@@ -257,8 +256,8 @@ trainer_control_rollout_sync_freq=${trainer_control_rollout_sync_freq:-5}
 reward_async=${reward_async:-true}
 
 # Validation control:
-# - DO_VAL=true (default): keep periodic validation by `trainer_test_freq`
-# - DO_VAL=false: disable validation runs (still requires a valid `data.val_files` for dataset init)
+# - DO_VAL=false (default): disable validation runs (still requires a valid `data.val_files` for dataset init)
+# - DO_VAL=true: enable periodic validation by `trainer_test_freq`
 do_val=${DO_VAL:-false}
 do_val_norm=$(echo "${do_val}" | tr '[:upper:]' '[:lower:]')
 if [ "${do_val_norm}" != "true" ]; then
@@ -314,7 +313,7 @@ temperature=1.0
 top_p=1.0
 top_k=-1
 
-project_name=co_grpo_freeze_actor_mini
+project_name=co_grpo_mini
 # Build experiment name with key configs
 intervention_mode_short=${verifier_intervention_mode//by_/}  # by_step -> step, by_response -> response
 curriculum_short="cur${curriculum_start_weight//./_}to${curriculum_end_weight//./_}"

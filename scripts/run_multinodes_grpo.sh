@@ -174,7 +174,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.rollout_data_dir="${save_dir}/rollout_data" \
     +trainer.rollout_dump_freq=20 \
     trainer.validation_data_dir="${save_dir}/validation_data" \
-    trainer.logger=["console","tensorboard","swanlab"] \
+    trainer.logger=["console","swanlab"] \
     trainer.nnodes="${nnodes}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
     trainer.log_val_generations=100 \

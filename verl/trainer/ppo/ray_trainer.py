@@ -81,6 +81,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
+    ActorRolloutControl = 7
 
 
 @dataclass
@@ -440,6 +441,7 @@ class RayPPOTrainer:
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
+        self.parallel_control_exp = bool(self.config.trainer.get("parallel_control_exp", False))
 
         if self.hybrid_engine:
             assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
@@ -487,8 +489,16 @@ class RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
+        if self.parallel_control_exp and config.actor_rollout_ref.actor.strategy not in ["fsdp", "fsdp2"]:
+            raise NotImplementedError("parallel_control_exp only supports fsdp/fsdp2 strategies")
         # number of GPUs total
-        n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+        if self.parallel_control_exp:
+            exp_gpus = config.trainer.exp_rollout_gpus_per_node
+            if exp_gpus is None:
+                exp_gpus = max(1, config.trainer.n_gpus_per_node // 2)
+            n_gpus = exp_gpus * config.trainer.nnodes
+        else:
+            n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
         if config.actor_rollout_ref.actor.strategy == "megatron":
             model_parallel_size = config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size * config.actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
             assert n_gpus % (model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size) == 0, f"n_gpus ({n_gpus}) must be divisible by model_parallel_size ({model_parallel_size}) times context_parallel_size ({config.actor_rollout_ref.actor.megatron.context_parallel_size})"
@@ -847,6 +857,8 @@ class RayPPOTrainer:
 
         # create actor and rollout
         if self.hybrid_engine:
+            if self.parallel_control_exp and self.config.actor_rollout_ref.rollout.mode != "sync":
+                raise NotImplementedError("parallel_control_exp only supports sync rollout mode")
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
             # For Co-GRPO, pass verifier config to actor_rollout_ref worker
             # The worker needs to know about verifier LoRA configuration
@@ -863,6 +875,24 @@ class RayPPOTrainer:
                 role="actor_rollout",
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+
+            if self.parallel_control_exp:
+                control_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRolloutControl)
+                control_config = OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True)
+                control_config = DictConfig(control_config)
+                OmegaConf.set_struct(control_config, False)
+                with open_dict(control_config):
+                    # Keep verifier config aligned with exp so FSDP full state dict keys match.
+                    if hasattr(self.config, "verifier"):
+                        control_config.verifier = deepcopy(self.config.verifier)
+                    # Ensure vLLM does not internally repeat when trainer already repeats prompts.
+                    control_config.rollout.n = 1
+                control_rollout_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.ActorRolloutControl],
+                    config=control_config,
+                    role="rollout",
+                )
+                self.resource_pool_to_cls[control_pool]["actor_rollout_control"] = control_rollout_cls
         else:
             raise NotImplementedError
 
@@ -916,6 +946,11 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
+        if self.parallel_control_exp:
+            self.actor_rollout_control_wg = all_wg["actor_rollout_control"]
+            self.actor_rollout_control_wg.init_model()
+        else:
+            self.actor_rollout_control_wg = None
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -927,6 +962,27 @@ class RayPPOTrainer:
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+
+    def _co_grpo_convert_control_output(self, output: DataProto) -> DataProto:
+        """Convert a standard rollout output to Co-GRPO control_* fields."""
+        from tensordict import TensorDict
+
+        batch = output.batch
+        batch_size = len(output)
+        control_batch = TensorDict(
+            {
+                "control_input_ids": batch["input_ids"],
+                "control_attention_mask": batch["attention_mask"],
+                "control_position_ids": batch["position_ids"],
+                "control_responses": batch["responses"],
+            },
+            batch_size=batch_size,
+        )
+        if "rollout_log_probs" in batch:
+            control_batch["control_rollout_log_probs"] = batch["rollout_log_probs"]
+        if "prompts" in batch:
+            control_batch["prompts"] = batch["prompts"]
+        return DataProto(batch=control_batch, non_tensor_batch=output.non_tensor_batch, meta_info=output.meta_info)
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -1110,6 +1166,7 @@ class RayPPOTrainer:
                     with _timer("gen", timing_raw):
                         # Check if using Co-GRPO (dual-stream rollout)
                         use_co_grpo = self.config.algorithm.adv_estimator == AdvantageEstimator.CO_GRPO
+                        use_parallel = use_co_grpo and self.parallel_control_exp
                         sample_uids = None
                         
                         if use_co_grpo:
@@ -1120,7 +1177,82 @@ class RayPPOTrainer:
                             sample_uids = np.array([str(uuid.uuid4()) for _ in range(len(gen_batch_repeated))], dtype=object)
                             gen_batch_repeated.non_tensor_batch["sample_uid"] = sample_uids
                             # Use dual-stream rollout for Co-GRPO
-                            if not self.async_rollout_mode:
+                            if use_parallel:
+                                if self.actor_rollout_control_wg is None:
+                                    raise RuntimeError("parallel_control_exp enabled but control rollout worker group is missing")
+
+                                # Sync control weights from the training (exp) group.
+                                # NOTE: This exports a FULL FSDP state_dict (large, e.g. ~16GB for 8B bf16) and
+                                # transfers it via Ray object store to the control rollout group, which can cause
+                                # severe object spilling if done every step. Allow controlling sync frequency.
+                                # Skip sync when actor is frozen (verifier_lora_only mode) since base model weights don't change.
+                                # Verifier LoRA is synced separately via reload_verifier_lora().
+                                freeze_actor = bool(self.config.get("verifier", {}).get("freeze_actor", False))
+                                control_sync_freq = int(self.config.trainer.get("control_rollout_sync_freq", 1))
+                                should_sync_control = (
+                                    not freeze_actor  # Skip sync if actor is frozen (verifier_lora_only mode)
+                                    and control_sync_freq > 0
+                                    and (self.global_steps == 0 or is_last_step or self.global_steps % control_sync_freq == 0)
+                                )
+                                if should_sync_control:
+                                    t0 = time.time()
+                                    control_state = self.actor_rollout_wg.export_actor_state_dict()
+                                    if isinstance(control_state, list):
+                                        control_state = next((state for state in control_state if state), None)
+                                    if control_state is None:
+                                        raise RuntimeError("Failed to export actor state dict for control rollout sync")
+                                    # IMPORTANT: avoid duplicating a huge state_dict per worker.
+                                    # Passing a Python dict directly into a ONE_TO_ALL call can cause Ray to
+                                    # serialize/put it multiple times (one per worker), quickly filling the object store.
+                                    # Put once and broadcast the ObjectRef (Ray will zero-copy/share it across workers).
+                                    try:
+                                        control_state_ref = ray.put(control_state)
+                                        self.actor_rollout_control_wg.load_actor_state_dict(control_state_ref)
+                                    except Exception:
+                                        # Fallback: still try direct passing (may spill on large clusters).
+                                        self.actor_rollout_control_wg.load_actor_state_dict(control_state)
+                                    del control_state
+                                    t1 = time.time()
+                                    metrics["control_rollout/sync_freq"] = float(control_sync_freq)
+                                    metrics["control_rollout/sync_s"] = float(t1 - t0)
+
+                                # Get intervention mode from config
+                                intervention_mode = self.config.algorithm.get("verifier_intervention_mode", "by_response")
+                                token_check_interval = self.config.algorithm.get("token_check_interval", 5)
+                                entropy_threshold = self.config.algorithm.get("entropy_threshold", 0.5)
+                                use_entropy_filter = self.config.algorithm.get("use_entropy_filter", True)
+                                max_interventions = self.config.algorithm.get("max_interventions", 3)
+                                confidence_threshold = self.config.algorithm.get("confidence_threshold", 0.7)
+
+                                control_future = self.actor_rollout_control_wg.generate_sequences_async(gen_batch_repeated)
+                                exp_future = self.actor_rollout_wg.dual_stream_rollout_async(
+                                    gen_batch_repeated,
+                                    intervention_mode=intervention_mode,
+                                    token_check_interval=token_check_interval,
+                                    entropy_threshold=entropy_threshold,
+                                    use_entropy_filter=use_entropy_filter,
+                                    max_interventions=max_interventions,
+                                    confidence_threshold=confidence_threshold,
+                                    stream_mode="exp",
+                                )
+                                control_output = control_future.get()
+                                exp_output = exp_future.get()
+
+                                control_timing = control_output.meta_info.get("timing", {})
+                                exp_meta = exp_output.meta_info.copy()
+                                exp_timing = exp_meta.pop("timing", {})
+                                verifier_batch = exp_meta.pop("verifier_batch", None)
+
+                                control_output.meta_info = {}
+                                exp_output.meta_info = exp_meta
+                                control_output = self._co_grpo_convert_control_output(control_output)
+                                gen_batch_output = control_output.union(exp_output)
+                                if verifier_batch is not None:
+                                    gen_batch_output.meta_info["verifier_batch"] = verifier_batch
+
+                                timing_raw.update({f"control_{k}": v for k, v in control_timing.items()})
+                                timing_raw.update({f"exp_{k}": v for k, v in exp_timing.items()})
+                            elif not self.async_rollout_mode:
                                 # Get intervention mode from config
                                 intervention_mode = self.config.algorithm.get("verifier_intervention_mode", "by_response")
                                 token_check_interval = self.config.algorithm.get("token_check_interval", 5)
@@ -1154,8 +1286,9 @@ class RayPPOTrainer:
                                 self.async_rollout_manager.wake_up()
                                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                                 self.async_rollout_manager.sleep()
-                        timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
-                        gen_batch_output.meta_info.pop("timing", None)
+                        if not use_parallel:
+                            timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
+                            gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
@@ -1298,6 +1431,10 @@ class RayPPOTrainer:
                             # Mark stream type for reward manager dump
                             # CRITICAL FIX: Must be a list, not a scalar, to avoid IndexError in protocol.py:275
                             control_batch.non_tensor_batch["stream_type"] = ["control"] * control_batch.batch.size(0)
+                            # Add global_step for NaiveRewardManager dump frequency control
+                            control_batch.non_tensor_batch["global_step"] = np.full(
+                                (len(control_batch),), self.global_steps, dtype=np.int64
+                            )
 
                             # Compute rewards for experimental stream
                             exp_batch = batch.select(
@@ -1318,7 +1455,11 @@ class RayPPOTrainer:
                             # Mark stream type for reward manager dump
                             # CRITICAL FIX: Must be a list, not a scalar, to avoid IndexError in protocol.py:275
                             exp_batch.non_tensor_batch["stream_type"] = ["exp"] * exp_batch.batch.size(0)
-                            
+                            # Add global_step for NaiveRewardManager dump frequency control
+                            exp_batch.non_tensor_batch["global_step"] = np.full(
+                                (len(exp_batch),), self.global_steps, dtype=np.int64
+                            )
+
                             if self.config.reward_model.launch_reward_fn_async:
                                 tokenizer_name_or_path = self.tokenizer.name_or_path
                                 future_control_reward = compute_reward_async.remote(control_batch, self.config, tokenizer_name_or_path)
@@ -1407,7 +1548,7 @@ class RayPPOTrainer:
                             
                             control_outcome = get_outcome_reward(control_token_rewards)
                             exp_outcome = get_outcome_reward(exp_token_rewards)
-                            verifier_outcome_rewards = compute_relative_advantage_reward(
+                            raw_relative_rewards = compute_relative_advantage_reward(
                                 control_rewards=control_outcome,
                                 exp_rewards=exp_outcome
                             )
@@ -1430,73 +1571,73 @@ class RayPPOTrainer:
 
                             num_interventions = _safe_int_array(num_interventions, "num_interventions")
                             hint_token_counts = _safe_int_array(hint_token_counts, "hint_token_counts")
-                            intervention_costs = torch.zeros_like(verifier_outcome_rewards)
-                            
-                            # Apply intervention penalty to prevent over-intervention
-                            if hasattr(self.config.algorithm, 'intervention_penalty'):
-                                penalty_config = self.config.algorithm.intervention_penalty
-                                lambda_freq = penalty_config.get('freq_coef', 0.0)
-                                lambda_len = penalty_config.get('len_coef', 0.0)
-                                
-                                if lambda_freq > 0 or lambda_len > 0:
-                                    if num_interventions is not None and hint_token_counts is not None:
-                                        # Compute intervention cost
-                                        for i in range(len(verifier_outcome_rewards)):
-                                            cost = lambda_freq * num_interventions[i] + lambda_len * hint_token_counts[i] / 100.0  # Normalize token count
-                                            intervention_costs[i] = cost
-                                        
-                                        # Subtract cost from verifier rewards
-                                        verifier_outcome_rewards = verifier_outcome_rewards - intervention_costs
-                                        
-                                        # Log intervention statistics
-                                        metrics['co_grpo/avg_interventions'] = np.mean(num_interventions)
-                                        metrics['co_grpo/avg_hint_tokens'] = np.mean(hint_token_counts)
-                                        metrics['co_grpo/avg_intervention_cost'] = intervention_costs.mean().item()
-                                        metrics['co_grpo/max_interventions'] = np.max(num_interventions)
-                                        metrics['co_grpo/min_interventions'] = np.min(num_interventions)
 
-                            # Soft weighting for verifier rewards to focus learning signal on "true improvements".
-                            # This affects verifier updates only (verifier_train_batch), not actor rewards.
+                            # Robust verifier reward: support multiple modes via config.
+                            reward_mode = "gap"
+                            headroom_min = 0.05
+                            try:
+                                reward_mode = str(self.config.algorithm.get("verifier_reward_mode", "gap"))
+                                headroom_min = float(self.config.algorithm.get("verifier_reward_headroom_min", 0.05))
+                            except Exception:
+                                reward_mode = "gap"
+                                headroom_min = 0.05
+
+                            if reward_mode == "headroom":
+                                # Normalize by remaining headroom to emphasize small gains at high baseline.
+                                control_clamped = torch.clamp(control_outcome, min=0.0, max=1.0)
+                                headroom = torch.clamp(1.0 - control_clamped, min=headroom_min)
+                                clamped_gap = torch.clamp(raw_relative_rewards / headroom, min=-1.0, max=1.0)
+                                metrics["co_grpo/verifier_reward_headroom_mean"] = float(headroom.mean().item())
+                            else:
+                                if reward_mode != "gap":
+                                    logger.warning(f"Unknown verifier_reward_mode={reward_mode}, fallback to 'gap'")
+                                clamped_gap = torch.clamp(raw_relative_rewards, min=-1.0, max=1.0)
+
+                            # Add linear boost for positive gap.
+                            positive_gap = torch.clamp(clamped_gap, min=0.0, max=0.5)
+                            improve_coef = 1.0
                             if hasattr(self.config.algorithm, "verifier_reward_weighting"):
                                 weight_config = self.config.algorithm.verifier_reward_weighting
-                                improve_coef = float(weight_config.get("improve_coef", 0.0))
-                                tie_no_intervention_weight = float(weight_config.get("tie_no_intervention_weight", 1.0))
+                                improve_coef = float(weight_config.get("improve_coef", 1.0))
 
-                                if improve_coef != 0.0 or tie_no_intervention_weight != 1.0:
-                                    gap = exp_outcome - control_outcome  # outcome-level improvement
+                            verifier_outcome_rewards = clamped_gap + improve_coef * positive_gap
+
+                            # Log boost factor (even though reward uses additive boost).
+                            reward_weight = 1.0 + improve_coef * positive_gap
+                            metrics["co_grpo/verifier_reward_weight_mean"] = float(reward_weight.mean().item())
+                            metrics["co_grpo/verifier_reward_weight_improve_ratio"] = float(
+                                (raw_relative_rewards > 0).float().mean().item()
+                            )
+
+                            # Apply a weak penalty only when there is no improvement.
+                            intervention_costs = torch.zeros_like(verifier_outcome_rewards)
+                            if hasattr(self.config.algorithm, 'intervention_penalty'):
+                                penalty_config = self.config.algorithm.intervention_penalty
+                                lambda_freq = float(penalty_config.get('freq_coef', 0.0))
+                                lambda_len = float(penalty_config.get('len_coef', 0.0))
+
+                                if (lambda_freq > 0 or lambda_len > 0) and num_interventions is not None:
                                     device = verifier_outcome_rewards.device
-                                    if num_interventions is not None:
-                                        num_interventions_tensor = torch.as_tensor(num_interventions, device=device)
-                                        did_intervene = num_interventions_tensor > 0
-                                    else:
-                                        did_intervene = torch.zeros_like(gap, dtype=torch.bool, device=device)
+                                    cost = torch.zeros_like(verifier_outcome_rewards)
+                                    num_interventions_tensor = torch.as_tensor(num_interventions, device=device, dtype=verifier_outcome_rewards.dtype)
+                                    cost = cost + lambda_freq * num_interventions_tensor
+                                    if lambda_len > 0 and hint_token_counts is not None:
+                                        hint_token_counts_tensor = torch.as_tensor(
+                                            hint_token_counts, device=device, dtype=verifier_outcome_rewards.dtype
+                                        )
+                                        cost = cost + lambda_len * hint_token_counts_tensor / 100.0
 
-                                    is_tie = torch.isclose(gap, torch.zeros_like(gap), atol=1e-6)
-                                    is_improve = gap > 0
-
-                                    sample_weight = torch.ones_like(verifier_outcome_rewards)
-                                    if improve_coef != 0.0:
-                                        sample_weight = sample_weight + improve_coef * torch.clamp(gap, min=0.0)
-
-                                    if tie_no_intervention_weight != 1.0:
-                                        tie_no_intervene = is_tie & (~did_intervene)
-                                        if tie_no_intervention_weight < 0:
-                                            logger.warning(
-                                                "verifier_reward_weighting.tie_no_intervention_weight < 0 is invalid; ignoring."
-                                            )
-                                        else:
-                                            sample_weight = torch.where(
-                                                tie_no_intervene,
-                                                torch.full_like(sample_weight, tie_no_intervention_weight),
-                                                sample_weight,
-                                            )
-
-                                    verifier_outcome_rewards = verifier_outcome_rewards * sample_weight
-                                    metrics["co_grpo/verifier_reward_weight_mean"] = float(sample_weight.mean().item())
-                                    metrics["co_grpo/verifier_reward_weight_improve_ratio"] = float(is_improve.float().mean().item())
-                                    metrics["co_grpo/verifier_reward_weight_tie_no_intervene_ratio"] = float(
-                                        (is_tie & (~did_intervene)).float().mean().item()
+                                    intervention_costs = cost
+                                    verifier_outcome_rewards = torch.where(
+                                        clamped_gap > 0, verifier_outcome_rewards, verifier_outcome_rewards - cost
                                     )
+
+                                    # Log intervention statistics
+                                    metrics['co_grpo/avg_interventions'] = np.mean(num_interventions)
+                                    metrics['co_grpo/avg_hint_tokens'] = np.mean(hint_token_counts) if hint_token_counts is not None else 0.0
+                                    metrics['co_grpo/avg_intervention_cost'] = intervention_costs.mean().item()
+                                    metrics['co_grpo/max_interventions'] = np.max(num_interventions)
+                                    metrics['co_grpo/min_interventions'] = np.min(num_interventions)
                             
                             # Log reward comparison statistics
                             metrics['co_grpo/control_reward_mean'] = control_outcome.mean().item()
@@ -1505,7 +1646,6 @@ class RayPPOTrainer:
                             metrics['co_grpo/exp_reward_std'] = exp_outcome.std().item()
                             
                             # Log relative reward statistics (before penalty)
-                            raw_relative_rewards = exp_outcome - control_outcome
                             metrics['co_grpo/relative_reward_mean'] = raw_relative_rewards.mean().item()
                             metrics['co_grpo/relative_reward_std'] = raw_relative_rewards.std().item()
                             metrics['co_grpo/relative_reward_positive_ratio'] = (raw_relative_rewards > 0).float().mean().item()
@@ -1616,6 +1756,11 @@ class RayPPOTrainer:
                             reward_extra_infos_dict = {}
                         else:
                             # Regular reward computation
+                            # Add global_step for NaiveRewardManager dump frequency control
+                            batch.non_tensor_batch["global_step"] = np.full(
+                                (len(batch),), self.global_steps, dtype=np.int64
+                            )
+
                             if self.use_rm:
                                 reward_tensor = self.rm_wg.compute_rm_score(batch)
                                 batch = batch.union(reward_tensor)
@@ -2096,6 +2241,34 @@ class RayPPOTrainer:
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()
+                            # Save verifier LoRA alongside base checkpoints so we can pick the best step later.
+                            # By default, follow trainer.save_freq unless explicitly overridden.
+                            try:
+                                verifier_cfg = getattr(self.config, "verifier", {}) or {}
+                                verifier_lora_enabled = int(verifier_cfg.get("lora_rank", 0)) > 0
+                            except Exception:
+                                verifier_lora_enabled = False
+
+                            verifier_lora_save_freq = int(
+                                self.config.trainer.get("verifier_lora_save_freq", self.config.trainer.save_freq)
+                            )
+                            if (
+                                verifier_lora_enabled
+                                and verifier_lora_save_freq > 0
+                                and (is_last_step or self.global_steps % verifier_lora_save_freq == 0)
+                                and getattr(self, "actor_rollout_wg", None) is not None
+                                and hasattr(self.actor_rollout_wg, "save_verifier_lora")
+                            ):
+                                verifier_ckpt_dir = os.path.join(
+                                    self.config.trainer.default_local_dir, "verifier_lora", f"global_step_{self.global_steps}"
+                                )
+                                os.makedirs(os.path.dirname(verifier_ckpt_dir), exist_ok=True)
+                                t0 = time.time()
+                                self.actor_rollout_wg.save_verifier_lora(verifier_ckpt_dir)
+                                t1 = time.time()
+                                metrics["verifier/lora_ckpt_save_freq"] = float(verifier_lora_save_freq)
+                                metrics["verifier/lora_ckpt_save_s"] = float(t1 - t0)
+                                metrics["verifier/lora_ckpt_dir"] = verifier_ckpt_dir
 
                 # training metrics
                 metrics.update(

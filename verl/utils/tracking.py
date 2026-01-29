@@ -203,8 +203,47 @@ class _TensorboardAdapter:
         self.writer = SummaryWriter(tensorboard_dir)
 
     def log(self, data, step):
-        for key in data:
-            self.writer.add_scalar(key, data[key], step)
+        import numpy as np
+
+        def _as_scalar_float(value):
+            # torch scalar
+            try:
+                import torch
+
+                if isinstance(value, torch.Tensor):
+                    if value.numel() != 1:
+                        return None
+                    return float(value.detach().cpu().item())
+            except Exception:
+                pass
+
+            # python / numpy scalar
+            if isinstance(value, (int, float, np.floating, np.integer, bool)):
+                return float(value)
+            return None
+
+        def _as_text(value, max_len: int = 2048):
+            if value is None:
+                return "None"
+            if isinstance(value, str):
+                text = value
+            else:
+                try:
+                    text = repr(value)
+                except Exception:
+                    text = f"<unrepr-able {type(value)}>"
+            if len(text) > max_len:
+                text = text[: max_len - 3] + "..."
+            return text
+
+        for key, value in data.items():
+            scalar = _as_scalar_float(value)
+            if scalar is not None:
+                self.writer.add_scalar(key, scalar, step)
+            else:
+                # TensorBoard scalar summaries only accept numeric types.
+                # Some training code logs strings (e.g. checkpoint paths); record them as text instead.
+                self.writer.add_text(key, _as_text(value), step)
 
     def finish(self):
         self.writer.close()

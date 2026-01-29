@@ -15,6 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
+import datetime
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, register
+from verl.single_controller.base.decorator import Dispatch, Execute, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -54,6 +55,8 @@ from verl.utils.fsdp_utils import (
     apply_fsdp2,
     fsdp2_load_full_state_dict,
     fsdp_version,
+    get_fsdp_full_state_dict,
+    get_fsdp_state_ctx,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -72,6 +75,36 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _get_dist_timeout(config: Union[DictConfig, dict, None]) -> datetime.timedelta:
+    """
+    Timeout for torch.distributed collectives.
+
+    Defaults to PyTorch's historical default (30 minutes) unless overridden.
+    Override priority:
+      1) config.nccl_timeout (seconds)
+      2) env VERL_NCCL_TIMEOUT_SEC (seconds)
+    """
+    timeout_s = None
+    if config is not None and hasattr(config, "get"):
+        timeout_s = config.get("nccl_timeout", None)
+    if timeout_s is None:
+        env = os.environ.get("VERL_NCCL_TIMEOUT_SEC")
+        timeout_s = int(env) if env else 1800
+    return datetime.timedelta(seconds=int(timeout_s))
+
+
+def _safe_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "t", "yes", "y", "on")
+    return bool(v)
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -108,7 +141,12 @@ class ActorRolloutRefWorker(Worker):
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
-            torch.distributed.init_process_group(backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}", rank=rank, world_size=world_size)
+            torch.distributed.init_process_group(
+                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                rank=rank,
+                world_size=world_size,
+                timeout=_get_dist_timeout(config),
+            )
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -284,6 +322,7 @@ class ActorRolloutRefWorker(Worker):
                 verifier_cfg = self.config.get("verifier", None)
                 verifier_lora_rank = int(verifier_cfg.get("lora_rank", 0)) if verifier_cfg is not None else 0
                 verifier_lora_path = verifier_cfg.get("lora_path", None) if verifier_cfg is not None else None
+                freeze_actor = _safe_bool(verifier_cfg.get("freeze_actor", False)) if verifier_cfg is not None else False
                 if verifier_lora_rank > 0:
                     if hasattr(actor_module, "peft_config") and self._is_lora:
                         logger.warning("Actor is already a PEFT LoRA model; verifier LoRA multi-adapter is not enabled in this build.")
@@ -305,10 +344,12 @@ class ActorRolloutRefWorker(Worker):
                             }
                             actor_module = get_peft_model(actor_module, LoraConfig(**verifier_lora_config))
 
-                        # Ensure base model params remain trainable for actor full-parameter updates.
+                        # Control trainability:
+                        # - default: base + verifier LoRA trainable (actor update disables adapter at runtime)
+                        # - verifier.freeze_actor=True: freeze base; only verifier LoRA trainable
                         for name, param in actor_module.named_parameters():
                             if "lora_" not in name:
-                                param.requires_grad = True
+                                param.requires_grad = not freeze_actor
                             else:
                                 param.requires_grad = True
                         # PEFT may create verifier adapter params in fp32; FSDP2 requires uniform original dtypes.
@@ -393,7 +434,8 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
 
         # TODO: add more optimizer args into config
-        if role == "actor" and optim_config is not None:
+        freeze_actor = _safe_bool(self.config.get("verifier", {}).get("freeze_actor", False)) if role == "actor" else False
+        if role == "actor" and optim_config is not None and not freeze_actor:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
             # If verifier LoRA is attached, exclude LoRA params from the actor optimizer (base-only update).
@@ -586,8 +628,9 @@ class ActorRolloutRefWorker(Worker):
                 optim_config = self.config.actor.optim
                 fsdp_config = self.config.actor.fsdp_config
             else:
+                # Rollout-only workers still need FSDP2 defaults (e.g., offload_policy/reshard_after_forward).
                 optim_config = None
-                fsdp_config = OmegaConf.create()
+                fsdp_config = self.config.actor.fsdp_config
 
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
             (
@@ -618,8 +661,9 @@ class ActorRolloutRefWorker(Worker):
                 log_gpu_memory_usage("After offload actor model during init", logger=logger)
 
             if self._is_offload_optimizer:
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-                log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+                if self.actor_optimizer is not None:
+                    offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                    log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
                 if getattr(self, "verifier_optimizer", None) is not None:
                     offload_fsdp_optimizer(optimizer=self.verifier_optimizer)
                     log_gpu_memory_usage("After offload verifier optimizer during init", logger=logger)
@@ -637,6 +681,8 @@ class ActorRolloutRefWorker(Worker):
             self.verifier_actor = None
             verifier_cfg = self.config.get("verifier", {})
             verifier_lora_enabled = bool(verifier_cfg.get("lora_rank", 0) > 0)
+            if _safe_bool(verifier_cfg.get("freeze_actor", False)) and not verifier_lora_enabled:
+                logger.warning("verifier.freeze_actor=True but verifier.lora_rank<=0; no parameters will be updated.")
             if verifier_lora_enabled:
                 from torch import optim
                 from verl.utils.torch_functional import get_constant_schedule_with_warmup
@@ -670,17 +716,37 @@ class ActorRolloutRefWorker(Worker):
                     with open_dict(verifier_actor_cfg):
                         verifier_actor_cfg.use_kl_loss = False
                         verifier_actor_cfg.kl_loss_coef = 0.0
+                        # Allow verifier-specific PPO/microbatch overrides.
+                        # Motivation: verifier trajectories can have much longer prompts than actor updates,
+                        # and reusing actor's dynamic micro-batching settings can OOM during verifier backward.
+                        # These keys are optional; if absent, we fall back to actor settings.
+                        if isinstance(verifier_cfg, (dict, DictConfig)):
+                            if "use_dynamic_bsz" in verifier_cfg:
+                                verifier_actor_cfg.use_dynamic_bsz = _safe_bool(verifier_cfg.get("use_dynamic_bsz"))
+                            if "ppo_micro_batch_size_per_gpu" in verifier_cfg:
+                                verifier_actor_cfg.ppo_micro_batch_size_per_gpu = int(
+                                    verifier_cfg.get("ppo_micro_batch_size_per_gpu")
+                                )
+                            if "ppo_mini_batch_size" in verifier_cfg:
+                                verifier_actor_cfg.ppo_mini_batch_size = int(verifier_cfg.get("ppo_mini_batch_size"))
+                            if "ppo_max_token_len_per_gpu" in verifier_cfg:
+                                verifier_actor_cfg.ppo_max_token_len_per_gpu = int(
+                                    verifier_cfg.get("ppo_max_token_len_per_gpu")
+                                )
                     self.verifier_actor = DataParallelPPOActor(
                         config=verifier_actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.verifier_optimizer
                     )
 
                     # FSDP safety: verifier optimizer must not include base params, and actor optimizer must not include LoRA params.
                     lora_param_ids = {id(p) for p in lora_params}
-                    actor_opt_param_ids = {id(p) for g in self.actor_optimizer.param_groups for p in g["params"]}
+                    actor_opt_param_ids = set()
+                    if self.actor_optimizer is not None:
+                        actor_opt_param_ids = {id(p) for g in self.actor_optimizer.param_groups for p in g["params"]}
                     verifier_opt_param_ids = {id(p) for g in self.verifier_optimizer.param_groups for p in g["params"]}
 
                     assert verifier_opt_param_ids.issubset(lora_param_ids), "verifier_optimizer contains non-LoRA parameters"
-                    assert actor_opt_param_ids.isdisjoint(lora_param_ids), "actor_optimizer must exclude verifier LoRA parameters"
+                    if actor_opt_param_ids:
+                        assert actor_opt_param_ids.isdisjoint(lora_param_ids), "actor_optimizer must exclude verifier LoRA parameters"
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
@@ -706,12 +772,23 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
+            checkpoint_contents = self.config.actor.checkpoint
+            if _safe_bool(self.config.get("verifier", {}).get("freeze_actor", False)):
+                from omegaconf import OmegaConf
+
+                checkpoint_contents = OmegaConf.create(OmegaConf.to_container(checkpoint_contents, resolve=True)) if checkpoint_contents is not None else OmegaConf.create({})
+                OmegaConf.set_struct(checkpoint_contents, False)
+                with open_dict(checkpoint_contents):
+                    save_contents = list(checkpoint_contents.get("save_contents", []))
+                    load_contents = list(checkpoint_contents.get("load_contents", save_contents))
+                    checkpoint_contents.save_contents = [c for c in save_contents if c != "optimizer"]
+                    checkpoint_contents.load_contents = [c for c in load_contents if c != "optimizer"]
             self.checkpoint_manager = FSDPCheckpointManager(
                 model=self.actor_module_fsdp,
                 optimizer=self.actor.actor_optimizer,
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
-                checkpoint_contents=self.config.actor.checkpoint,
+                checkpoint_contents=checkpoint_contents,
             )
 
         if not self._is_actor and self._is_rollout:
@@ -733,10 +810,13 @@ class ActorRolloutRefWorker(Worker):
         data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
         assert self._is_actor
+        if _safe_bool(self.config.get("verifier", {}).get("freeze_actor", False)):
+            return DataProto(meta_info={"metrics": {"actor/frozen": 1.0, "actor/lr": 0.0}})
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            if self.actor_optimizer is not None:
+                load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
@@ -758,11 +838,20 @@ class ActorRolloutRefWorker(Worker):
             metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            # NOTE: `virtual_memory().used` is node-level memory usage, not this process' RSS.
+            # Log both so we can distinguish Python/worker memory leaks from Ray object store / page cache growth.
+            vm = psutil.virtual_memory()
+            metrics["perf/cpu_memory_used_gb"] = vm.used / (1024**3)
+            metrics["perf/cpu_memory_available_gb"] = vm.available / (1024**3)
+            proc = psutil.Process(os.getpid())
+            mem_info = proc.memory_info()
+            metrics["perf/process_rss_gb"] = mem_info.rss / (1024**3)
+            metrics["perf/process_vms_gb"] = mem_info.vms / (1024**3)
 
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr
-            self.actor_lr_scheduler.step()
+            if self.actor_lr_scheduler is not None:
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr
+                self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
@@ -774,8 +863,9 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            if self.actor_optimizer is not None:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         return output
 
@@ -910,6 +1000,10 @@ class ActorRolloutRefWorker(Worker):
         get_torch_device().empty_cache()
         return output
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def generate_sequences_async(self, prompts: DataProto):
+        return self.generate_sequences(prompts)
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def dual_stream_rollout(self, prompts: DataProto, **kwargs):
         """Dual-stream rollout for Co-GRPO with Verifier intervention.
@@ -972,6 +1066,42 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         get_torch_device().empty_cache()
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def dual_stream_rollout_async(self, prompts: DataProto, **kwargs):
+        return self.dual_stream_rollout(prompts, **kwargs)
+
+    @register(dispatch_mode=Dispatch.ALL_TO_ALL)
+    def export_actor_state_dict(self):
+        """Export full actor state dict on rank0 (CPU)."""
+        assert self._is_actor, "export_actor_state_dict is only supported for actor workers"
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        state_dict = get_fsdp_full_state_dict(self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return state_dict
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_actor_state_dict(self, full_state: dict):
+        """Load full actor state dict on all ranks."""
+        assert self._is_rollout or self._is_actor, "load_actor_state_dict requires actor or rollout worker"
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        if fsdp_version(self.actor_module_fsdp) == 1:
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+            state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            with get_fsdp_state_ctx(self.actor_module_fsdp, state_type=StateDictType.FULL_STATE_DICT, state_cfg=state_dict_config, optim_cfg=None):
+                self.actor_module_fsdp.load_state_dict(full_state, strict=False)
+        elif fsdp_version(self.actor_module_fsdp) == 2:
+            fsdp2_load_full_state_dict(self.actor_module_fsdp, full_state, device_mesh=self.device_mesh, cpu_offload=self._is_offload_param)
+        else:
+            raise NotImplementedError(f"Unknown FSDP version {fsdp_version(self.actor_module_fsdp)}")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
@@ -1179,7 +1309,8 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
         if self._is_offload_optimizer:
-            offload_fsdp_optimizer(self.actor_optimizer)
+            if self.actor_optimizer is not None:
+                offload_fsdp_optimizer(self.actor_optimizer)
 
 
 class CriticWorker(Worker):
@@ -1188,7 +1319,7 @@ class CriticWorker(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend=get_nccl_backend())
+            torch.distributed.init_process_group(backend=get_nccl_backend(), timeout=_get_dist_timeout(config))
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel
@@ -1535,7 +1666,7 @@ class RewardModelWorker(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend=get_nccl_backend())
+            torch.distributed.init_process_group(backend=get_nccl_backend(), timeout=_get_dist_timeout(config))
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel

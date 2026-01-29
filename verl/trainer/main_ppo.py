@@ -129,17 +129,43 @@ class TaskRunner:
             Role.ActorRollout: ray.remote(actor_rollout_cls),
             Role.Critic: ray.remote(CriticWorker),
         }
+        if config.trainer.get("parallel_control_exp", False):
+            role_worker_mapping[Role.ActorRolloutControl] = ray.remote(actor_rollout_cls)
 
         # Define the resource pool specification.
         # Map roles to the resource pool.
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        mapping = {
-            Role.ActorRollout: global_pool_id,
-            Role.Critic: global_pool_id,
-        }
+        if config.trainer.get("parallel_control_exp", False):
+            control_gpus = config.trainer.control_rollout_gpus_per_node
+            exp_gpus = config.trainer.exp_rollout_gpus_per_node
+            if control_gpus is None:
+                control_gpus = max(1, config.trainer.n_gpus_per_node // 2)
+            if exp_gpus is None:
+                exp_gpus = max(1, config.trainer.n_gpus_per_node - control_gpus)
+            if control_gpus + exp_gpus > config.trainer.n_gpus_per_node:
+                raise ValueError(
+                    f"control_rollout_gpus_per_node({control_gpus}) + "
+                    f"exp_rollout_gpus_per_node({exp_gpus}) exceeds n_gpus_per_node({config.trainer.n_gpus_per_node})"
+                )
+            control_pool_id = "control_pool"
+            exp_pool_id = "exp_pool"
+            resource_pool_spec = {
+                exp_pool_id: [exp_gpus] * config.trainer.nnodes,
+                control_pool_id: [control_gpus] * config.trainer.nnodes,
+            }
+            mapping = {
+                Role.ActorRollout: exp_pool_id,
+                Role.ActorRolloutControl: control_pool_id,
+                Role.Critic: exp_pool_id,
+            }
+        else:
+            global_pool_id = "global_pool"
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
+            mapping = {
+                Role.ActorRollout: global_pool_id,
+                Role.Critic: global_pool_id,
+            }
 
         # We should adopt a multi-source reward function here:
         # - for rule-based rm, we directly call a reward score
@@ -155,12 +181,12 @@ class TaskRunner:
             else:
                 raise NotImplementedError
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            mapping[Role.RewardModel] = global_pool_id
+            mapping[Role.RewardModel] = exp_pool_id if config.trainer.get("parallel_control_exp", False) else global_pool_id
 
         # Add a reference policy worker if KL loss or KL reward is used.
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
-            mapping[Role.RefPolicy] = global_pool_id
+            mapping[Role.RefPolicy] = exp_pool_id if config.trainer.get("parallel_control_exp", False) else global_pool_id
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))

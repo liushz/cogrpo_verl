@@ -836,6 +836,11 @@ trainer:
   # Number of GPUs per node
   n_gpus_per_node: 8
 
+  # Co-GRPO parallel control/exp rollout (two vLLM engine groups)
+  parallel_control_exp: False
+  control_rollout_gpus_per_node: null
+  exp_rollout_gpus_per_node: null
+
   # Save frequency (by iteration) for model checkpoints
   save_freq: -1
 
@@ -895,6 +900,9 @@ verifier:
   lora_dropout: 0.1
   lora_name: "verifier_lora"
   target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+  # If True, freeze actor (policy) updates; only train verifier LoRA.
+  freeze_actor: False
 
   # Verifier optimizer configuration
   optim:

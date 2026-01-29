@@ -5,13 +5,13 @@ cd /mnt/shared-storage-user/liuhongwei/main_works/repos/repro
 # ========== 基础参数设置 ==========
 model_name="/mnt/shared-storage-user/opencompass-shared/liuhongwei/interns1/repro_exp/s1_model/interns1-8b-hf-1951"
 dataset_name="passrate_math_merged"
-exp_name="grpo-verifier-8b-mini"
+exp_name="grpo-verifier-8b-headroom"
 verl_debug=1
 
 # ========== 训练模式 ==========
 # full: 正常训练 actor + verifier
 # verifier_lora_only: freeze actor（不更新），只更新 verifier LoRA
-co_grpo_mode=${CO_GRPO_MODE:-"verifier_lora_only"}
+co_grpo_mode=${CO_GRPO_MODE:-"full"}
 
 # ========== Resume 配置 ==========
 # 原地续跑（推荐）：填已有实验的 default_local_dir（包含 global_step_* 与 latest_checkpointed_iteration.txt）
@@ -34,25 +34,6 @@ gpu_memory_utilization=0.8
 
 # cpu=$((16 * nnodes * n_gpus_per_node))
 # memory=$((120000 * nnodes * n_gpus_per_node))  # 按比例计算，约 128 GB per GPU
-
-
-# ========== Co-GRPO Mini特有参数 ==========
-# Verifier干预模式：
-#   verifier_intervention_mode=by_step    # 或 by_response
-#
-# 干预正则化（防止过度干预）：
-#   intervention_penalty_freq_coef=0.1   # 频率惩罚系数
-#   intervention_penalty_len_coef=0.01   # 长度惩罚系数
-#
-# Curriculum Learning（动态权重）：
-#   use_curriculum_weighting=True
-#   curriculum_start_weight=0.3          # 早期30% control, 70% exp
-#   curriculum_end_weight=0.7            # 后期70% control, 30% exp
-#
-# by_step模式参数：
-#   max_interventions=5                  # 最多干预次数（mini版本）
-#   token_check_interval=5               # token检查间隔
-#   entropy_threshold=0.5                # 熵阈值
 
 
 # 获取日期作为 rjob 名称
@@ -94,6 +75,6 @@ rjob submit \
         export RESUME_PATH='${resume_path}' &&
         echo 'HuggingFace offline mode configured' &&
         echo 'VERL_DEBUG set to $verl_debug - full responses will be logged' &&
-        chmod +x /mnt/shared-storage-user/liuhongwei/main_works/repos/repro/scripts/run_multinodes_cgrpo_mini.sh &&
-        /mnt/shared-storage-user/liuhongwei/main_works/repos/repro/scripts/run_multinodes_cgrpo_mini.sh '$model_name' $nnodes $n_gpus_per_node $gen_tp $gpu_memory_utilization '$dataset_name' '$verl_debug'
+        chmod +x /mnt/shared-storage-user/liuhongwei/main_works/repos/repro/scripts/run_multinodes_cgrpo.sh &&
+        /mnt/shared-storage-user/liuhongwei/main_works/repos/repro/scripts/run_multinodes_cgrpo.sh '$model_name' $nnodes $n_gpus_per_node $gen_tp $gpu_memory_utilization '$dataset_name' '$verl_debug'
     "

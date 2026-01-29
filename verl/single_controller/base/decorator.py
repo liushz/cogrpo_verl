@@ -133,8 +133,17 @@ def _split_args_kwargs_data_proto_with_auto_padding(chunks, *args, **kwargs):
 
 
 def dispatch_one_to_all(worker_group, *args, **kwargs):
-    args = tuple([arg] * worker_group.world_size for arg in args)
-    kwargs = {k: [v] * worker_group.world_size for k, v in kwargs.items()}
+    # NOTE: ONE_TO_ALL often carries large Python objects (e.g., full state_dict for weight sync).
+    # If we replicate a raw Python object across all workers, Ray may end up serializing/putting
+    # the payload multiple times (one per worker), quickly filling the object store and spilling.
+    # Put once and broadcast the same ObjectRef to all workers.
+    import ray
+
+    def _to_ref(x):
+        return x if isinstance(x, ray.ObjectRef) else ray.put(x)
+
+    args = tuple([_to_ref(arg)] * worker_group.world_size for arg in args)
+    kwargs = {k: [_to_ref(v)] * worker_group.world_size for k, v in kwargs.items()}
     return args, kwargs
 
 

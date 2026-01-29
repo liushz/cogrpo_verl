@@ -299,7 +299,14 @@ Your goal is to monitor student's (model's) reasoning process step-by-step.
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
             if len(lora_int_ids) > 0:
                 lora_int_id = lora_int_ids[0]
-                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path=getattr(self, "verifier_lora_path", None)  # Use actual Verifier LoRA path)] * batch_size
+                # Use actual verifier LoRA path if present.
+                lora_requests = [
+                    LoRARequest(
+                        lora_name=f"{lora_int_id}",
+                        lora_int_id=lora_int_id,
+                        lora_path=getattr(self, "verifier_lora_path", None),
+                    )
+                ] * batch_size
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             output = self.inference_engine.generate(
@@ -935,37 +942,33 @@ Your goal is to monitor student's (model's) reasoning process step-by-step.
         Returns:
             dict with keys: "action" (str), "hint" (str, extracted <GO>/<WAIT> content)
         """
-        verifier_text = verifier_text.strip()
-        
-        # Step 1: Remove think blocks (```\n...\n```)
-        text_without_think = re.sub(
-            r'```\n(.*?)\n```',
-            '',
-            verifier_text,
-            flags=re.DOTALL
-        )
-        
-        # Step 2: Extract <GO> or <WAIT> content from the remaining text
-        go_match = re.search(r'<GO>\s*(.*)', text_without_think, re.IGNORECASE)
-        wait_match = re.search(r'<WAIT>\s*(.*)', text_without_think, re.IGNORECASE)
-        
-        if go_match:
-            action = "Intervene"
-            hint = go_match.group(1).strip()  # Extract and strip the content
-        elif wait_match:
-            action = "Intervene"
-            hint = wait_match.group(1).strip()  # Extract and strip the content
+        verifier_text = (verifier_text or "").strip()
+
+        # Step 1: Remove think blocks (```...```), and also <think>...</think> if present.
+        text_without_think = re.sub(r"```\s*\n?.*?\n?\s*```", "", verifier_text, flags=re.DOTALL)
+        text_without_think = re.sub(r"<think>.*?</think>", "", text_without_think, flags=re.DOTALL)
+
+        # Step 2: Extract <GO> / <WAIT> payload.
+        # IMPORTANT: <WAIT> hints are often multi-line checklists; do not truncate at first newline.
+        if "<WAIT>" in text_without_think.upper():
+            m = re.search(r"<WAIT>\s*(.*)$", text_without_think, flags=re.IGNORECASE | re.DOTALL)
+            hint = (m.group(1) if m else "").strip()
+            action = "Intervene" if hint else "Pass"
+        elif "<GO>" in text_without_think.upper():
+            action = "Pass"
+            hint = ""
         else:
-            # Fallback: try old format
-            if verifier_text.lower().startswith("intervene"):
+            # Fallback: try old format.
+            lower = verifier_text.lower()
+            if lower.startswith("intervene"):
                 action = "Intervene"
-                hint_match = re.search(r'intervene[:\s]+(.+)', verifier_text, re.IGNORECASE | re.DOTALL)
+                hint_match = re.search(r"intervene[:\s]+(.+)", verifier_text, re.IGNORECASE | re.DOTALL)
                 hint = hint_match.group(1).strip() if hint_match else ""
-            elif verifier_text.lower().startswith("pass"):
+            elif lower.startswith("pass"):
                 action = "Pass"
                 hint = ""
             else:
-                action = "Pass"  # Default: treat as Pass
+                action = "Pass"
                 hint = ""
         
         return {
