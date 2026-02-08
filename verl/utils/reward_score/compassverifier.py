@@ -86,10 +86,6 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
 
     Returns:
         int: 1 if correct (A), 0 otherwise (B or C)
-
-    Raises:
-        ValueError: If reward_model_clients is None or empty
-        RuntimeError: If API call fails
     """
     global _debug_call_count
     _debug_call_count += 1
@@ -128,61 +124,60 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
     if debug_enabled:
         print(f"[CompassVerifier #{call_id}] Using API endpoint: {api_base_url}", file=sys.stderr)
     
-    # 构建 prompt
+    # 构建 prompt（任何异常都降级为 0，避免训练中断）
     try:
         llm_response = _postprocess_llm_response(llm_response)
-        prompt_content = verify_prompt.replace("{question}", str(question)).replace("{gold_answer}", str(gold_answer)).replace("{llm_response}", str(llm_response))
-    except Exception as e:
-        raise ValueError(f"Failed to format prompt: {e}")
-    
-    # API 调用，添加错误处理
-    try:
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] Calling API...", file=sys.stderr)
-        response = api_client.chat.completions.create(
-            model="cv-32b",
-            messages=[
-                {"role": "user", "content": prompt_content},
-            ],
-            temperature=0.0,
+        prompt_content = (
+            verify_prompt.replace("{question}", str(question))
+            .replace("{gold_answer}", str(gold_answer))
+            .replace("{llm_response}", str(llm_response))
         )
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] API response received", file=sys.stderr)
-    except Exception as e:
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] API call FAILED: {e}", file=sys.stderr)
-        raise RuntimeError(f"API call failed: {e}")
-
-    # 检查响应有效性
-    if not response or not hasattr(response, 'choices') or not response.choices:
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] Invalid API response: no choices", file=sys.stderr)
-        raise RuntimeError("Invalid API response: no choices")
-
-    if not response.choices[0] or not hasattr(response.choices[0], 'message'):
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] Invalid API response: no message", file=sys.stderr)
-        raise RuntimeError("Invalid API response: no message")
-
-    content = response.choices[0].message.content
-    if not content:
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] Invalid API response: empty content", file=sys.stderr)
-        raise RuntimeError("Invalid API response: empty content")
-
-    if debug_enabled:
-        print(f"[CompassVerifier #{call_id}] API returned: '{content.strip()}'", file=sys.stderr)
-
-    # 判断结果：A (CORRECT) 返回 1，其他返回 0
-    content_upper = content.strip().upper()
-    if content_upper == "A" or "CORRECT" in content_upper:
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] RETURNING 1 (CORRECT)", file=sys.stderr)
-        return 1
-    else:
-        if debug_enabled:
-            print(f"[CompassVerifier #{call_id}] RETURNING 0 (INCORRECT)", file=sys.stderr)
+    except Exception:
         return 0
+
+    # API 调用：默认 fail-fast（和历史行为一致）；多 endpoint 轮询重试。
+    # 如果你希望“网络/服务抖动时不要打挂训练（失败降级为 0 分）”，设置环境变量：
+    #   REWARD_STRICT=0
+    clients = list(valid_clients)
+    random.shuffle(clients)
+    retries_per_client = 2
+    last_error: Exception | None = None
+
+    for candidate_client in clients:
+        for _ in range(retries_per_client):
+            try:
+                if debug_enabled:
+                    api_base_url = getattr(getattr(candidate_client, "_client", None), "base_url", None)
+                    print(f"[CompassVerifier #{call_id}] Calling API via: {api_base_url}", file=sys.stderr)
+                response = candidate_client.chat.completions.create(
+                    model="cv-32b",
+                    messages=[{"role": "user", "content": prompt_content}],
+                    temperature=0.0,
+                )
+
+                content = None
+                if response and getattr(response, "choices", None):
+                    choice0 = response.choices[0]
+                    if choice0 and getattr(choice0, "message", None):
+                        content = getattr(choice0.message, "content", None)
+
+                if not content:
+                    continue
+
+                content_upper = content.strip().upper()
+                if content_upper == "A" or "CORRECT" in content_upper:
+                    return 1
+                return 0
+            except Exception as exc:
+                last_error = exc
+                continue
+
+    if last_error is not None and os.environ.get("REWARD_STRICT", "1") == "1":
+        raise RuntimeError(f"API call failed (all endpoints): {last_error}")
+
+    if debug_enabled and last_error is not None:
+        print(f"[CompassVerifier #{call_id}] All endpoints failed: {last_error}", file=sys.stderr)
+    return 0
 
 
 

@@ -6,7 +6,7 @@ source /mnt/shared-storage-user/liuhongwei/miniconda3/etc/profile.d/conda.sh
 conda activate /mnt/shared-storage-user/liuhongwei/miniconda3/envs/repro
 
 
-export PYTHONPATH=$PYTHONPATH:$(pwd)
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 export SWANLAB_MODE="local"
 export SWANLAB_LOG_DIR=/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit/verl_train/swanlab
 export VERL_AUTO_PADDING=1
@@ -80,14 +80,20 @@ fi
 
 if [ "${NODE_RANK:-0}" == "0" ]
 then
-ray start --head --port=8266 &
+ray stop --force >/dev/null 2>&1 || true
+ray start --head --port=8266 --num-gpus="${n_gpus_per_node}" &
 # 等待 Ray 启动
 sleep 3
 
 TARGET_GPU=$((nnodes * n_gpus_per_node))
 CHECK_INTERVAL=10
 get_ray_gpu() {
-    ray status 2>/dev/null | grep -oP '/\K[\d.]+(?=\s+GPU)' | awk '{print int($1)}' || echo 0
+    # Ray CLI output format varies across versions; use Ray API for robustness.
+    python3 - <<'PY' 2>/dev/null || echo 0
+import ray
+ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False)
+print(int(ray.cluster_resources().get("GPU", 0)))
+PY
 }
 while true; do
     GPU_COUNT=$(get_ray_gpu)
@@ -141,7 +147,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr_warmup_steps=30 \
     actor_rollout_ref.actor.fsdp_config.param_offload="${offload}" \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload="${offload}" \
+    +actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    +actor_rollout_ref.ref.fsdp_config.model_dtype=bf16 \
+    +critic.model.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.rollout.disable_log_stats=True \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.temperature=$temperature \
@@ -161,6 +170,8 @@ python3 -m verl.trainer.main_ppo \
     reward_model.enable=False \
     reward_model.reward_manager=naive \
     reward_model.launch_reward_fn_async=True \
+    "+reward_model.reward_model_urls='${REWARD_MODEL_URLS}'" \
+    "+reward_model.reward_model_key='${REWARD_MODEL_KEY}'" \
     algorithm.adv_estimator="${adv_estimator}" \
     algorithm.kl_ctrl.kl_coef="${kl_coef}" \
     algorithm.norm_adv_by_std_in_grpo="${norm_adv_by_std_in_grpo}" \
@@ -184,7 +195,8 @@ python3 -m verl.trainer.main_ppo \
 else
 # init worker
 sleep 10
-ray start --address=$MASTER_ADDR:8266 &
+ray stop --force >/dev/null 2>&1 || true
+ray start --address=$MASTER_ADDR:8266 --num-gpus="${n_gpus_per_node}" &
 # 等待 Ray 启动
 sleep 3
 # 保持 worker 节点运行

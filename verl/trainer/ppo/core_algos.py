@@ -426,6 +426,18 @@ def compute_co_grpo_advantage(
             return getattr(config, key, default)
         else:
             return default
+
+    # Always define for logging/metadata, even when control stream is absent.
+    effective_control_weight = control_group_weight
+
+    def _pad_or_truncate_to(x: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Pad/truncate on seq dim=1 with zeros to match exp stream length."""
+        if x.shape[1] == target_len:
+            return x
+        if x.shape[1] > target_len:
+            return x[:, :target_len]
+        pad = torch.zeros((x.shape[0], target_len - x.shape[1]), device=x.device, dtype=x.dtype)
+        return torch.cat([x, pad], dim=1)
     
     # Compute Policy advantages from both Control and Experimental streams
     # Experimental stream GRPO
@@ -449,7 +461,6 @@ def compute_co_grpo_advantage(
         
         # Dynamic weighting: adjust control_group_weight based on training progress
         # This implements curriculum learning to reduce Policy's dependence on Verifier over time
-        effective_control_weight = control_group_weight
         if get_config_value('use_curriculum_weighting', False):
             # Curriculum schedule: control weight increases over training
             # Early training: low control weight (high reliance on Verifier guidance)
@@ -462,17 +473,18 @@ def compute_co_grpo_advantage(
             
             logger.info(f"Co-GRPO curriculum weighting: progress={training_progress:.3f}, control_weight={effective_control_weight:.3f}")
         
-        # Mix advantages: weighted combination
-        # Note: We need to ensure both have the same shape
-        # If batch sizes differ, we need to handle that
-        if exp_advantages.shape == control_advantages.shape:
-            policy_advantages = (1 - effective_control_weight) * exp_advantages + effective_control_weight * control_advantages
-            policy_returns = (1 - effective_control_weight) * exp_returns + effective_control_weight * control_returns
-        else:
-            # If shapes differ, use experimental stream shape and pad/truncate control
-            logger.warning(f"Shape mismatch: exp {exp_advantages.shape} vs control {control_advantages.shape}, using experimental only")
-            policy_advantages = exp_advantages
-            policy_returns = exp_returns
+        # Mix advantages: weighted combination.
+        # Keep experimental stream length as the canonical shape (trainer typically uses exp response_mask).
+        if exp_advantages.shape != control_advantages.shape:
+            logger.warning(
+                f"Shape mismatch: exp {exp_advantages.shape} vs control {control_advantages.shape}; "
+                f"pad/truncate control to exp length={exp_advantages.shape[1]}"
+            )
+            control_advantages = _pad_or_truncate_to(control_advantages, exp_advantages.shape[1])
+            control_returns = _pad_or_truncate_to(control_returns, exp_returns.shape[1])
+
+        policy_advantages = (1 - effective_control_weight) * exp_advantages + effective_control_weight * control_advantages
+        policy_returns = (1 - effective_control_weight) * exp_returns + effective_control_weight * control_returns
     else:
         # Only experimental stream available
         policy_advantages = exp_advantages

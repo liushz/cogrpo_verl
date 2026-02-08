@@ -1497,9 +1497,16 @@ class RayPPOTrainer:
                                 print(f"  Max: {int(np.max(interventions))}", file=sys.stderr)
                                 print(f"  Min: {int(np.min(interventions))}", file=sys.stderr)
 
-                            # Reward comparison
-                            control_outcome_early = control_reward_tensor.squeeze() if control_reward_tensor.dim() > 1 else control_reward_tensor
-                            exp_outcome_early = exp_reward_tensor.squeeze() if exp_reward_tensor.dim() > 1 else exp_reward_tensor
+                            # Reward comparison (outcome-level)
+                            def _to_outcome_reward(reward_tensor):
+                                if reward_tensor.dim() == 1:
+                                    return reward_tensor
+                                if reward_tensor.size(-1) == 1:
+                                    return reward_tensor.squeeze(-1)
+                                return reward_tensor.sum(dim=-1)
+
+                            control_outcome_early = _to_outcome_reward(control_reward_tensor)
+                            exp_outcome_early = _to_outcome_reward(exp_reward_tensor)
 
                             print(f"[Reward Comparison]:", file=sys.stderr)
                             print(f"  Control reward: {float(control_outcome_early.mean()):.4f} ± {float(control_outcome_early.std()):.4f}", file=sys.stderr)
@@ -1534,20 +1541,8 @@ class RayPPOTrainer:
                             # Compute verifier relative rewards: r_B - r_A (outcome level)
                             from verl.trainer.ppo.reward import compute_relative_advantage_reward
                             
-                            def get_outcome_reward(token_rewards):
-                                """Convert token-level rewards to outcome rewards if needed."""
-                                if token_rewards.dim() == 1:
-                                    # Already outcome-level
-                                    return token_rewards
-                                elif token_rewards.size(-1) == 1:
-                                    # Shape [batch, 1], squeeze it
-                                    return token_rewards.squeeze(-1)
-                                else:
-                                    # Shape [batch, seq_len], sum it
-                                    return token_rewards.sum(dim=-1)
-                            
-                            control_outcome = get_outcome_reward(control_token_rewards)
-                            exp_outcome = get_outcome_reward(exp_token_rewards)
+                            control_outcome = _to_outcome_reward(control_token_rewards)
+                            exp_outcome = _to_outcome_reward(exp_token_rewards)
                             raw_relative_rewards = compute_relative_advantage_reward(
                                 control_rewards=control_outcome,
                                 exp_rewards=exp_outcome
@@ -2188,10 +2183,14 @@ class RayPPOTrainer:
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    rollout_dump_freq = self.config.trainer.get("rollout_dump_freq", 0)  # 0 means every step (backward compatible)
-                    # rollout_dump_answer = self.config.trainer.get("rollout_dump_answer", None)  # 0 means every step (backward compatible)
-                    # Only dump if: 1) rollout_data_dir is set, AND 2) either freq is 0 or it's time to dump
-                    should_dump_rollout = rollout_data_dir and (rollout_dump_freq == 0 or self.global_steps % rollout_dump_freq == 0 or is_last_step)
+                    rollout_dump_freq = self.config.trainer.get("rollout_dump_freq", 0)
+                    # rollout_dump_answer = self.config.trainer.get("rollout_dump_answer", None)
+                    # Dump semantics (aligned with dual_rollout_dump_freq):
+                    #   rollout_dump_freq <= 0: disable
+                    #   rollout_dump_freq > 0 : periodic dump + last step
+                    should_dump_rollout = False
+                    if rollout_data_dir and rollout_dump_freq and rollout_dump_freq > 0:
+                        should_dump_rollout = (self.global_steps % rollout_dump_freq == 0 or is_last_step)
                     if should_dump_rollout:
                         with _timer("dump_rollout_generations", timing_raw):
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)

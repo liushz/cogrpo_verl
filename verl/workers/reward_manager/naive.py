@@ -27,10 +27,14 @@ from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 
-# Filter reward model URLs to valid http(s) endpoints; ignore blanks
-_raw_reward_urls = os.environ.get("REWARD_MODEL_URLS", "")
-reward_model_urls = [u.strip() for u in _raw_reward_urls.split(",") if u.strip().startswith(("http://", "https://"))]
-reward_model_key = os.environ.get("REWARD_MODEL_KEY", "NONE")
+def _parse_reward_urls(urls_val) -> list[str]:
+    if urls_val is None:
+        return []
+    if isinstance(urls_val, (list, tuple)):
+        urls = [str(u).strip() for u in urls_val]
+    else:
+        urls = [u.strip() for u in str(urls_val).split(",")]
+    return [u for u in urls if u and u.startswith(("http://", "https://"))]
 
 
 @register("naive")
@@ -42,8 +46,37 @@ class NaiveRewardManager:
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key
-        self.reward_model_clients = [OpenAI(base_url=url, api_key=reward_model_key) for url in reward_model_urls] if reward_model_urls else None
         self.config = config  # Store config for accessing trainer settings
+        # Reward model endpoints are primarily configured via env vars. However, in Ray clusters
+        # it's easy to end up with env vars missing in worker processes. To make this robust,
+        # we also allow pulling endpoints/keys from `config.reward_model` when present.
+        urls = _parse_reward_urls(os.environ.get("REWARD_MODEL_URLS", ""))
+        key = os.environ.get("REWARD_MODEL_KEY", "NONE")
+        try:
+            reward_cfg = getattr(config, "reward_model", None) if config is not None else None
+            if reward_cfg is not None:
+                # Accept a few common field names.
+                cfg_urls = None
+                if hasattr(reward_cfg, "get"):
+                    cfg_urls = (
+                        reward_cfg.get("reward_model_urls")
+                        or reward_cfg.get("urls")
+                        or reward_cfg.get("openai_api_base")
+                    )
+                    key = reward_cfg.get("reward_model_key") or reward_cfg.get("key") or key
+                else:
+                    cfg_urls = (
+                        getattr(reward_cfg, "reward_model_urls", None)
+                        or getattr(reward_cfg, "urls", None)
+                        or getattr(reward_cfg, "openai_api_base", None)
+                    )
+                    key = getattr(reward_cfg, "reward_model_key", None) or getattr(reward_cfg, "key", None) or key
+                if cfg_urls:
+                    urls = _parse_reward_urls(cfg_urls) or urls
+        except Exception:
+            pass
+
+        self.reward_model_clients = [OpenAI(base_url=url, api_key=key) for url in urls] if urls else None
 
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
@@ -335,13 +368,23 @@ class NaiveRewardManager:
                 print(f"[DEBUG Row {i}] ground_truth: {ground_truth}", file=sys.stderr)
                 print(f"[DEBUG Row {i}] reward_model_clients: {self.reward_model_clients}", file=sys.stderr)
 
-            score = self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-                reward_model_clients=self.reward_model_clients
-            )
+            try:
+                score = self.compute_score(
+                    data_source=data_source,
+                    solution_str=response_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                    reward_model_clients=self.reward_model_clients,
+                )
+            except Exception as exc:
+                if os.environ.get("REWARD_STRICT", "1") == "1":
+                    raise
+                # Do not let transient API/network issues kill the entire training job.
+                # Degrade to 0 reward and attach minimal error info for debugging.
+                score = 0.0
+                err = f"{type(exc).__name__}: {exc}"
+                reward_extra_info["reward_error"] = err[:200]
+                dump_record["reward_error"] = err[:200]
 
             # ========== DEBUG: Print compute_score output ==========
             if debug_enabled and (debug_limit <= 0 or i < debug_limit):
@@ -407,7 +450,10 @@ class NaiveRewardManager:
                     dual_rollout_dump_freq = rollout_dump_freq_config
 
         # Get global_step from data to decide if we should dump
-        should_dump = True  # Default to dump
+        # Dump semantics:
+        #   dual_rollout_dump_freq <= 0: disable
+        #   dual_rollout_dump_freq > 0 : periodic dump
+        should_dump = False
         if dual_rollout_dump_freq > 0:
             # Try to get global_step from non_tensor_batch
             global_step = _first_scalar(data.non_tensor_batch.get('global_step', None))

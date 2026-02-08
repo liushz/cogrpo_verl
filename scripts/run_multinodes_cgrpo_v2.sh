@@ -9,14 +9,65 @@ n_gpus_per_node="$3"
 gen_tp="$4"
 gpu_memory_utilization="$5"
 train_file_name="$6"
+verl_debug="${7:-0}"
 
-if [ "$#" -ge 7 ]; then
-  verl_debug="$7"
-  shift 7
-else
-  verl_debug="0"
-  shift 6
-fi
+# Positional args from run_co_grpo.sh (single entry ownership)
+exp_name="${8:-}"
+work_dir="${9:-/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit/verl_train}"
+preset="${10:-full}"
+co_grpo_mode="${11:-}"
+resume_dir="${12:-}"
+resume_path="${13:-}"
+verifier_lora_path="${14:-}"
+
+response_n="${15:-16}"
+train_batch_size="${16:-32}"
+token_check_interval="${17:-2048}"
+min_step_tokens="${18:-2048}"
+max_interventions="${19:-5}"
+verifier_max_hint_tokens="${20:-512}"
+estimated_hint_tokens="${21:-512}"
+
+control_group_weight="${22:-0.5}"
+use_curriculum_weighting="${23:-True}"
+curriculum_start_weight="${24:-0.3}"
+curriculum_end_weight="${25:-0.5}"
+intervention_penalty_freq_coef="${26:-0.01}"
+intervention_penalty_len_coef="${27:-0.0}"
+verifier_reward_mode="${28:-headroom}"
+verifier_reward_improve_coef="${29:-1.0}"
+verifier_reward_headroom_min="${30:-0.05}"
+
+trainer_rollout_dump_freq="${31:-5}"
+trainer_dual_rollout_dump_freq="${32:-5}"
+use_dynamic_bsz="${33:-False}"
+micro_bsz_per_gpu="${34:-2}"
+verifier_reward_tie_no_intervention_weight="${35:-1.0}"
+
+verifier_intervention_mode="${36:-by_step}"
+confidence_threshold="${37:-0.7}"
+entropy_threshold="${38:-0.5}"
+use_entropy_filter="${39:-True}"
+
+verifier_lora_rank="${40:-64}"
+verifier_lora_alpha="${41:-128}"
+verifier_lora_dropout="${42:-0.05}"
+verifier_lr="${43:-1e-5}"
+verifier_loss_weight="${44:-1.0}"
+verifier_max_new_tokens="${45:-4096}"
+verifier_logprobs="${46:-1}"
+verifier_temperature="${47:-1.0}"
+
+trainer_total_epochs="${48:-10}"
+trainer_total_training_steps="${49:-1000}"
+trainer_save_freq="${50:-20}"
+trainer_test_freq="${51:--1}"
+trainer_log_val_generations="${52:-False}"
+trainer_control_rollout_sync_freq="${53:-5}"
+trainer_verifier_lora_sync_freq="${54:-1}"
+trainer_verifier_lora_save_freq="${55:-20}"
+
+max_prompt_length="${56:-1024}"
 
 cd /mnt/shared-storage-user/liuhongwei/main_works/repos/repro
 
@@ -37,112 +88,21 @@ export REWARD_MODEL_KEY="${REWARD_MODEL_KEY:-EMPTY}"
 ray_port="${RAY_PORT:-8266}"
 
 # -------------------------
-# Defaults (edit here, or override via flags)
+# Fixed defaults in this launcher
 # -------------------------
-preset="full" # full | mini
-work_dir="/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit/verl_train"
-co_grpo_mode="" # full | verifier_lora_only (empty => derived from preset)
-exp_name=""
-resume_dir=""
-resume_path=""
-
-# Data + lengths
-response_n=16
-train_batch_size=32
-max_prompt_length=1024
 max_response_length=0 # computed below
-
-# by_step knobs
-verifier_intervention_mode="by_step"
-token_check_interval=2048
-min_step_tokens=2048
-max_interventions=5
-confidence_threshold=0.7
-entropy_threshold=0.5
-use_entropy_filter=True
 
 # Max model length (cap to model context length)
 model_max_len_cap=40960
-verifier_max_hint_tokens=512
-estimated_hint_tokens=512
 
 # Algorithm knobs
 adv_estimator="co_grpo"
 kl_coef=0.001
 norm_adv_by_std_in_grpo=True
-control_group_weight=0.5
-use_curriculum_weighting=True
-curriculum_start_weight=0.3
-curriculum_end_weight=0.5
-
-# Intervention penalty (trainer applies only when gap<=0)
-intervention_penalty_freq_coef=0.01
-intervention_penalty_len_coef=0.0
-
-# Verifier reward shaping
-verifier_reward_mode="headroom" # gap | headroom
-verifier_reward_improve_coef=1.0
-verifier_reward_tie_no_intervention_weight=1.0
-verifier_reward_headroom_min=0.05
-
-# Verifier config
-verifier_lora_rank=64
-verifier_lora_alpha=128
-verifier_lora_dropout=0.05
-verifier_lr=1e-5
-verifier_loss_weight=1.0
-verifier_lora_path=""
-verifier_max_new_tokens=4096
-verifier_logprobs=1
-verifier_temperature=1.0
 verifier_max_prompt_length="$((1024 * 16))"
 
 # Trainer
 parallel_control_exp=True
-trainer_total_epochs=10
-trainer_total_training_steps=1000
-trainer_save_freq=20
-trainer_test_freq=-1
-trainer_log_val_generations=False
-trainer_rollout_dump_freq=5
-trainer_dual_rollout_dump_freq=5
-trainer_control_rollout_sync_freq=5
-trainer_verifier_lora_sync_freq=1
-trainer_verifier_lora_save_freq="${trainer_save_freq}"
-use_dynamic_bsz=False
-
-# -------------------------
-# Flags
-# -------------------------
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --preset) preset="$2"; shift 2 ;;
-    --co-grpo-mode) co_grpo_mode="$2"; shift 2 ;;
-    --exp-name) exp_name="$2"; shift 2 ;;
-    --work-dir) work_dir="$2"; shift 2 ;;
-    --resume-dir) resume_dir="$2"; shift 2 ;;
-    --resume-path) resume_path="$2"; shift 2 ;;
-    --control-group-weight) control_group_weight="$2"; shift 2 ;;
-    --curriculum-start-weight) curriculum_start_weight="$2"; shift 2 ;;
-    --curriculum-end-weight) curriculum_end_weight="$2"; shift 2 ;;
-    --no-curriculum-weighting) use_curriculum_weighting=False; shift ;;
-    --micro-bsz-per-gpu) micro_bsz_per_gpu="$2"; shift 2 ;;
-    --use-dynamic-bsz) use_dynamic_bsz=True; shift ;;
-    --no-dynamic-bsz) use_dynamic_bsz=False; shift ;;
-    --verifier-reward-mode) verifier_reward_mode="$2"; shift 2 ;;
-    --verifier-improve-coef) verifier_reward_improve_coef="$2"; shift 2 ;;
-    --verifier-headroom-min) verifier_reward_headroom_min="$2"; shift 2 ;;
-    --intervention-penalty-freq-coef) intervention_penalty_freq_coef="$2"; shift 2 ;;
-    --intervention-penalty-len-coef) intervention_penalty_len_coef="$2"; shift 2 ;;
-    --verifier-lora-rank) verifier_lora_rank="$2"; shift 2 ;;
-    --verifier-lora-path) verifier_lora_path="$2"; shift 2 ;;
-    --verifier-max-hint-tokens) verifier_max_hint_tokens="$2"; shift 2 ;;
-    --estimated-hint-tokens) estimated_hint_tokens="$2"; shift 2 ;;
-    --max-interventions) max_interventions="$2"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
-  esac
-done
 
 if [ "${preset}" = "mini" ]; then
   if [ -z "${co_grpo_mode}" ]; then

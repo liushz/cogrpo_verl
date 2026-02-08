@@ -157,7 +157,12 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
-        lora_kwargs = kwargs.pop("lora_kwargs", {})
+        lora_kwargs = kwargs.pop("lora_kwargs", {}) or {}
+        # Sanitize LoRA kwargs: vLLM expects ints for limits like max_loras, and `None`
+        # can crash inside LoRA manager with TypeErrors (e.g., None > int).
+        lora_kwargs = {k: v for k, v in dict(lora_kwargs).items() if v is not None}
+        if lora_kwargs.get("enable_lora", False) and "max_loras" not in lora_kwargs:
+            lora_kwargs["max_loras"] = 1
         self.lora_kwargs = lora_kwargs
         self.inference_engine = LLM(
             actor_module,
@@ -1373,7 +1378,17 @@ Your goal is to monitor student's (model's) reasoning process step-by-step.
                         metrics['total_interventions'] += 1
                         
                         # 关键：将 hint 追加到 response_tokens，并设置 loss_mask 为 0
-                        hint_text = f"\n\n[Guide]: {hint}\n\n"
+                        hint = (hint or "").strip()
+                        try:
+                            tail = tokenizer.decode(state["response_tokens"][-32:], skip_special_tokens=True)
+                        except Exception:
+                            tail = ""
+                        if tail.endswith("\n\n"):
+                            hint_text = f"{hint}\n\n"
+                        elif tail.endswith("\n"):
+                            hint_text = f"\n{hint}\n\n"
+                        else:
+                            hint_text = f"\n\n{hint}\n\n"
                         hint_tokens = tokenizer.encode(hint_text, add_special_tokens=False)
                         
                         # 验证编码正确性
