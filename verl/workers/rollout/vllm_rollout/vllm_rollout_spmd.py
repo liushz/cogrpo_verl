@@ -34,7 +34,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -49,7 +49,11 @@ from vllm.worker.worker_base import WorkerWrapperBase
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
-from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length, pad_sequence_to_length
+from verl.utils.torch_functional import (
+    get_response_mask,
+    pad_2d_list_to_length,
+    pad_sequence_to_length,
+)
 from verl.workers.rollout.base import BaseRollout
 
 logger = logging.getLogger(__file__)
@@ -110,9 +114,19 @@ OR
 
 
 _NATURAL_INSERT_PUNCT = (
-    "。", ".", "!", "?", "！", "？",
-    "，", ",", "、",
-    "；", ";", "：", ":",
+    "。",
+    ".",
+    "!",
+    "?",
+    "！",
+    "？",
+    "，",
+    ",",
+    "、",
+    "；",
+    ";",
+    "：",
+    ":",
 )
 
 
@@ -131,6 +145,319 @@ def _is_natural_insert_boundary(tail_text: str) -> bool:
     return False
 
 
+def _normalize_eos_token_ids(eos_token_id):
+    """Return a set[int] of eos token ids (handles int/list/tuple)."""
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, (list, tuple, set)):
+        out = set()
+        for t in eos_token_id:
+            try:
+                out.add(int(t))
+            except Exception:
+                continue
+        return out
+    try:
+        return {int(eos_token_id)}
+    except Exception:
+        return set()
+
+
+def _find_first_eos_index(tokens, eos_token_ids: set) -> Optional[int]:
+    if not tokens or not eos_token_ids:
+        return None
+    for i, t in enumerate(tokens):
+        if t in eos_token_ids:
+            return i
+    return None
+
+
+def _find_last_eos_index(tokens, eos_token_ids: set) -> Optional[int]:
+    if not tokens or not eos_token_ids:
+        return None
+    for i in range(len(tokens) - 1, -1, -1):
+        if tokens[i] in eos_token_ids:
+            return i
+    return None
+
+
+def _find_last_subsequence_index(tokens: List[int], subseq: List[int]) -> Optional[int]:
+    """Return the start index of the last occurrence of subseq in tokens."""
+    if not tokens or not subseq or len(subseq) > len(tokens):
+        return None
+    for start in range(len(tokens) - len(subseq), -1, -1):
+        if tokens[start : start + len(subseq)] == subseq:
+            return start
+    return None
+
+
+def _find_last_marker_span(
+    tokens: List[int], tokenizer, markers: Tuple[str, ...]
+) -> Optional[Tuple[int, int]]:
+    """Return (start, end) of the last marker occurrence."""
+    if not tokens:
+        return None
+
+    best_span: Optional[Tuple[int, int]] = None
+    for marker in markers:
+        try:
+            marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+        except Exception:
+            marker_ids = []
+        if not marker_ids:
+            continue
+        pos = _find_last_subsequence_index(tokens, marker_ids)
+        if pos is None:
+            continue
+        span = (pos, pos + len(marker_ids))
+        if best_span is None or span[0] > best_span[0]:
+            best_span = span
+    return best_span
+
+
+def _find_last_think_close_span(tokens: List[int], tokenizer) -> Optional[Tuple[int, int]]:
+    return _find_last_marker_span(tokens, tokenizer, ("</think>", "<｜end of thought｜>"))
+
+
+def _find_prethink_rollback_keep_len(tokens: List[int], tokenizer) -> Optional[int]:
+    """Return keep_len to roll back before last </think> when suffix is substantive."""
+    think_span = _find_last_think_close_span(tokens, tokenizer)
+    if think_span is None:
+        return None
+    start, end = think_span
+    if start <= 0:
+        return None
+
+    try:
+        suffix_text = tokenizer.decode(tokens[end : end + 256], skip_special_tokens=True)
+    except Exception:
+        suffix_text = ""
+    if not suffix_text.strip():
+        return None
+    return start
+
+
+def _has_final_answer_marker(
+    tokens: List[int], tokenizer, decode_tail_tokens: int = 512
+) -> bool:
+    if not tokens:
+        return False
+    try:
+        tail_len = max(64, int(decode_tail_tokens))
+    except Exception:
+        tail_len = 512
+
+    try:
+        tail_text = tokenizer.decode(tokens[-tail_len:], skip_special_tokens=True)
+    except Exception:
+        tail_text = ""
+    if not tail_text:
+        return False
+
+    low_tail = tail_text.lower()
+    if "\\boxed" in tail_text:
+        return True
+    if "final answer" in low_tail:
+        return True
+    if ("最终答案" in tail_text) or ("答案：" in tail_text) or ("答案:" in tail_text):
+        return True
+    return False
+
+
+def _is_post_think_finalized(
+    tokens: List[int], tokenizer, decode_tail_tokens: int = 512
+) -> bool:
+    """True iff final-answer markers appear after a think-closure marker.
+
+    For reasoning models that may keep writing inside <think> without closing,
+    we should NOT treat boxed/final-answer text alone as a hard late-stage signal.
+    """
+    think_span = _find_last_think_close_span(tokens, tokenizer)
+    if think_span is None:
+        return False
+    _, end = think_span
+    suffix_tokens = tokens[end:]
+    if not suffix_tokens:
+        return False
+    return _has_final_answer_marker(
+        suffix_tokens, tokenizer, decode_tail_tokens=decode_tail_tokens
+    )
+
+
+def _rollback_state_to_keep_len(state: dict, keep_len: int) -> bool:
+    response_tokens = list(state.get("response_tokens") or [])
+    loss_masks = list(state.get("loss_masks") or [])
+    if len(response_tokens) != len(loss_masks):
+        return False
+    try:
+        keep = int(keep_len)
+    except Exception:
+        return False
+    if keep < 0 or keep > len(response_tokens):
+        return False
+    if keep == len(response_tokens):
+        return False
+
+    state["response_tokens"] = response_tokens[:keep]
+    state["loss_masks"] = loss_masks[:keep]
+    return True
+
+
+def _compute_tail_rollback_keep_len(
+    response_tokens: List[int], tokenizer, window_tokens: int
+) -> Optional[int]:
+    try:
+        window_tokens = int(window_tokens)
+    except Exception:
+        return None
+    if window_tokens <= 0 or len(response_tokens) < window_tokens + 1:
+        return None
+
+    tail = response_tokens[-window_tokens:]
+    keep_in_tail = _find_last_trim_boundary(tail, tokenizer)
+    if keep_in_tail is None:
+        return None
+
+    keep = len(response_tokens) - window_tokens + int(keep_in_tail)
+    if keep <= 0 or keep >= len(response_tokens):
+        return None
+    return keep
+
+
+def _rollback_prethink_once(state: dict, tokenizer) -> bool:
+    """Rollback before </think> once per sample."""
+    if state.get("_prethink_rollback_used", False):
+        return False
+    keep = _find_prethink_rollback_keep_len(state.get("response_tokens") or [], tokenizer)
+    if keep is None:
+        return False
+    if not _rollback_state_to_keep_len(state, keep):
+        return False
+    state["_prethink_rollback_used"] = True
+    return True
+
+
+def _find_think_close_pos(tokens: List[int], tokenizer) -> Optional[int]:
+    """Find a safe insertion position before the last think-closure marker.
+
+    To avoid breaking causal consistency, only return a position when the decoded
+    suffix after the marker is whitespace (i.e., marker is effectively at end).
+    """
+    think_span = _find_last_think_close_span(tokens, tokenizer)
+    if think_span is None:
+        return None
+    start, end = think_span
+
+    # Only safe if there's no substantive content after the marker.
+    suffix_ids = tokens[end : end + 128]
+    try:
+        suffix_text = tokenizer.decode(suffix_ids, skip_special_tokens=True)
+    except Exception:
+        suffix_text = ""
+    if suffix_text.strip():
+        return None
+
+    return start
+
+
+def _insert_hint_tokens(
+    state: dict,
+    hint_tokens: List[int],
+    tokenizer,
+    eos_token_ids: set,
+) -> bool:
+    """Insert hint_tokens into response_tokens/loss_masks, preferring before </think>."""
+    if not hint_tokens:
+        return False
+
+    response_tokens = state.get("response_tokens") or []
+    loss_masks = state.get("loss_masks") or []
+    if len(response_tokens) != len(loss_masks):
+        return False
+
+    think_pos = _find_think_close_pos(response_tokens, tokenizer)
+    if think_pos is not None:
+        insert_pos = think_pos
+    else:
+        # Only skip as late-stage when final-answer markers appear *after* a closed </think>.
+        # If no </think> exists, keep treating content as inner-think and allow insertion.
+        # skip instead of appending a useless tail hint.
+        if _is_post_think_finalized(response_tokens, tokenizer):
+            state["_hint_skipped_late_stage"] = True
+            return False
+        insert_pos = _find_last_eos_index(response_tokens, eos_token_ids)
+
+    if insert_pos is None:
+        response_tokens.extend(hint_tokens)
+        loss_masks.extend([0] * len(hint_tokens))
+    else:
+        response_tokens[insert_pos:insert_pos] = hint_tokens
+        loss_masks[insert_pos:insert_pos] = [0] * len(hint_tokens)
+
+    state["response_tokens"] = response_tokens
+    state["loss_masks"] = loss_masks
+    state["_hint_inserted_this_step"] = True
+    return True
+
+
+def _rollback_tail_for_hint(
+    state: dict,
+    tokenizer,
+    window_tokens: int,
+) -> bool:
+    """Trim a trailing fragment so hint can affect regenerated content."""
+    response_tokens = list(state.get("response_tokens") or [])
+    keep = _compute_tail_rollback_keep_len(response_tokens, tokenizer, window_tokens)
+    if keep is None:
+        return False
+    return _rollback_state_to_keep_len(state, keep)
+
+
+def _find_last_trim_boundary(tokens: List[int], tokenizer) -> Optional[int]:
+    """Find a natural boundary inside `tokens` to trim to (return keep_len).
+
+    This is used when we hit the fixed per-step max_tokens (e.g., 2k) and
+    want to discard an unfinished trailing fragment.
+    """
+    if not tokens:
+        return None
+
+    # Prefer coarser boundaries first.
+    boundary_strs = [
+        "\n\n",
+        "。",
+        ".",
+        "！",
+        "!",
+        "？",
+        "?",
+        "；",
+        ";",
+        "：",
+        ":",
+        "，",
+        ",",
+    ]
+
+    best = None
+    for s in boundary_strs:
+        try:
+            ids = tokenizer.encode(s, add_special_tokens=False)
+        except Exception:
+            ids = []
+        if not ids:
+            continue
+        pos = _find_last_subsequence_index(tokens, ids)
+        if pos is None:
+            continue
+        keep = pos + len(ids)
+        if keep <= 0 or keep >= len(tokens):
+            continue
+        if best is None or keep > best:
+            best = keep
+    return best
+
+
 def _hint_prefix_for_tail(tail_text: str) -> str:
     if tail_text.endswith("\n\n"):
         return ""
@@ -138,12 +465,11 @@ def _hint_prefix_for_tail(tail_text: str) -> str:
         return "\n"
     return "\n\n"
 
+
 def build_verifier_user_prompt(question: str, student_response: str) -> str:
     template = VERIFIER_INTERVENE_PROMPT.replace(
         "{question}", "__VERIFIER_QUESTION__"
-    ).replace(
-        "{student_response}", "__VERIFIER_RESPONSE__"
-    )
+    ).replace("{student_response}", "__VERIFIER_RESPONSE__")
     return template.replace("__VERIFIER_QUESTION__", question).replace(
         "__VERIFIER_RESPONSE__", student_response
     )
@@ -183,7 +509,7 @@ def _extract_verifier_question_from_prompt(prompt_text: str) -> str:
         tail = text[start:]
         end_match = re.search(r"\n\s*assistant\s*(?:\n|$)", tail, flags=re.IGNORECASE)
         if end_match:
-            tail = tail[:end_match.start()]
+            tail = tail[: end_match.start()]
         candidate = tail.strip()
 
     # Drop obvious answer-format directives from the question body to reduce mode confusion.
@@ -232,6 +558,7 @@ def _extract_verifier_question_from_prompt(prompt_text: str) -> str:
         return candidate
     return text.strip()
 
+
 # Hard filters to prevent verifier "spam hints" / mode collapse.
 BANNED_PHRASES = [
     "provide the final numeric answer",
@@ -256,18 +583,19 @@ class InterventionPolicy:
     """
     控制 Verifier 干预策略，避免过度干预或资源浪费。
     """
+
     def __init__(self, max_interventions: int = 3, confidence_threshold: float = 0.7):
         self.max_interventions = max_interventions
         self.confidence_threshold = confidence_threshold
-    
+
     def should_intervene(self, state: Dict[str, Any], decision: Dict[str, Any]) -> bool:
         """
         判断是否应该进行干预。
-        
+
         Args:
             state: 样本状态字典
             decision: Verifier 决策字典
-        
+
         Returns:
             bool: 是否应该干预
         """
@@ -290,13 +618,13 @@ class InterventionPolicy:
             return cleaned
 
         # 1. 达到最大干预次数
-        if len(state['hints']) >= self.max_interventions:
+        if len(state["hints"]) >= self.max_interventions:
             return False
-        
+
         # 2. 决策不是 Intervene
         if decision.get("action") != "Intervene":
             return False
-        
+
         # 3. 没有 hint
         if not decision.get("hint"):
             return False
@@ -335,12 +663,16 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     # remove the left padding in the prompt token_id
     # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id
     # is not None else self.llm_engine.tokenizer.eos_token_id
-    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
+    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][
+        0
+    ]
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
 
-def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
+def _repeat_interleave(
+    value: Union[torch.Tensor, np.ndarray], repeats: int
+) -> Union[torch.Tensor, List[Any]]:
     if isinstance(value, torch.Tensor):
         return value.repeat_interleave(repeats, dim=0)
     else:
@@ -366,21 +698,21 @@ def _as_bool(val: Any) -> bool:
 def _extract_vllm_outputs(outputs, pad_token_id: int, max_length: int, device):
     """
     从 vLLM RequestOutput 对象列表中提取 token_ids 和 logprobs
-    
+
     Args:
         outputs: List[RequestOutput] from vllm generate()
         pad_token_id: token id for padding
         max_length: maximum sequence length
         device: target device for tensors
-        
+
     Returns:
         tuple: (response_tensor, log_probs_tensor)
-            - response_tensor: (batch_size, max_length) 
+            - response_tensor: (batch_size, max_length)
             - log_probs_tensor: (batch_size, max_length)
     """
     response = []
     rollout_log_probs = []
-    
+
     for output in outputs:
         for sample_id in range(len(output.outputs)):
             response_ids = output.outputs[sample_id].token_ids
@@ -389,16 +721,22 @@ def _extract_vllm_outputs(outputs, pad_token_id: int, max_length: int, device):
             for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                 curr_log_prob.append(logprob[response_ids[i]].logprob)
             rollout_log_probs.append(curr_log_prob)
-    
-    response_tensor = pad_2d_list_to_length(response, pad_token_id, max_length=max_length).to(device)
-    log_probs_tensor = pad_2d_list_to_length(rollout_log_probs, -1, max_length=max_length).to(device)
+
+    response_tensor = pad_2d_list_to_length(
+        response, pad_token_id, max_length=max_length
+    ).to(device)
+    log_probs_tensor = pad_2d_list_to_length(
+        rollout_log_probs, -1, max_length=max_length
+    ).to(device)
     log_probs_tensor = log_probs_tensor.to(torch.float32)
-    
+
     return response_tensor, log_probs_tensor
 
 
 class vLLMRollout(BaseRollout):
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
+    def __init__(
+        self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs
+    ):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -411,10 +749,14 @@ class vLLMRollout(BaseRollout):
         super().__init__()
         self.config = config
         self.tokenizer = tokenizer  # Store tokenizer for dual_stream_rollout
-        assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
+        assert not (not config.enforce_eager and config.free_cache_engine), (
+            "disable CUDA graph (enforce_eager = False) if free cache engine"
+        )
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
+        assert tensor_parallel_size <= torch.distributed.get_world_size(), (
+            "tensor parallel size should be less than or equal to the world size"
+        )
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
         if kwargs.get("train_tp") is not None:
@@ -429,36 +771,59 @@ class vLLMRollout(BaseRollout):
             ):
                 train_tp = kwargs.get("train_tp")
                 num_tp_per_train_tp = train_tp // tensor_parallel_size
-                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
+                vllm_ps.initialize_parallel_state(
+                    tensor_model_parallel_size=tensor_parallel_size,
+                    num_tp_per_train_tp=num_tp_per_train_tp,
+                )
             else:
-                vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
+                vllm_ps.initialize_model_parallel(
+                    tensor_model_parallel_size=tensor_parallel_size
+                )
 
         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
         if not rope_scaling_config:
             max_position_embeddings = None
             if hasattr(model_hf_config, "max_position_embeddings"):
                 max_position_embeddings = model_hf_config.max_position_embeddings
-            elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
-            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
+            elif hasattr(model_hf_config, "llm_config") and hasattr(
+                model_hf_config.llm_config, "max_position_embeddings"
+            ):
+                max_position_embeddings = (
+                    model_hf_config.llm_config.max_position_embeddings
+                )
+            elif hasattr(model_hf_config, "text_config") and hasattr(
+                model_hf_config.text_config, "max_position_embeddings"
+            ):
+                max_position_embeddings = (
+                    model_hf_config.text_config.max_position_embeddings
+                )
             if max_position_embeddings is None:
                 raise ValueError("max_position_embeddings not found in model_hf_config")
 
-            assert max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
+            assert (
+                max_position_embeddings >= config.prompt_length + config.response_length
+            ), "model context length should be greater than total sequence length"
 
-        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
+        max_model_len = int(
+            config.max_model_len or config.prompt_length + config.response_length
+        )
 
-        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+        if (
+            max_num_batched_tokens < max_model_len
+            and self.config.enable_chunked_prefill
+        ):
             raise ValueError(
                 "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
                              please increase max_num_batched_tokens or disable chunked prefill"
             )
 
         trust_remote_code = kwargs.get("trust_remote_code", False)
-        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+        load_format = (
+            "dummy" if config.load_format.startswith("dummy") else config.load_format
+        )
 
         lora_kwargs = kwargs.pop("lora_kwargs", {}) or {}
+        verifier_config = kwargs.pop("verifier_config", None)
         # Sanitize LoRA kwargs: vLLM expects integer limits (e.g., max_loras). Some configs may
         # accidentally pass `None`, which can later crash inside add_lora/remove_lora with
         # TypeErrors like `'>' not supported between instances of 'NoneType' and 'int'`.
@@ -467,29 +832,52 @@ class vLLMRollout(BaseRollout):
             # Default to 1 so verifier LoRA hot-reload has a slot.
             lora_kwargs["max_loras"] = 1
         self.lora_kwargs = lora_kwargs
+
+        # Verifier config may live outside rollout sub-config (Hydra top-level `verifier.*`).
+        # Pass it explicitly from the trainer/worker so verifier inference uses the intended
+        # max_new_tokens / temperature / prompt budgets.
+        self.verifier_config = None
+        if verifier_config is not None:
+            try:
+                if isinstance(verifier_config, DictConfig):
+                    self.verifier_config = OmegaConf.to_container(
+                        verifier_config, resolve=True
+                    )
+                else:
+                    self.verifier_config = dict(verifier_config)
+            except Exception:
+                self.verifier_config = verifier_config
         # Extract verifier_lora_name and verifier_lora_path from kwargs if present
         verifier_lora_name = kwargs.pop("verifier_lora_name", None)
         verifier_lora_path = kwargs.pop("verifier_lora_path", None)
-        
-        # #region agent log
-        # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-        # #endregion
-        
+
         # KV Cache optimization: whether to enable vLLM prefix caching.
         # NOTE: In by_step mode we call vLLM generate() repeatedly. Prefix caching can
         # improve throughput but may also cause prefix-cache reset failures / block leaks
         # in some vLLM versions. Make it configurable via config (preferred) or kwargs.
-        config_enable_kv_cache_optimization = config.get("enable_kv_cache_optimization", None)
+        config_enable_kv_cache_optimization = config.get(
+            "enable_kv_cache_optimization", None
+        )
         if config_enable_kv_cache_optimization is None:
-            config_enable_kv_cache_optimization = kwargs.pop("enable_kv_cache_optimization", True)
-        self.enable_kv_cache_optimization = _as_bool(config_enable_kv_cache_optimization)
+            config_enable_kv_cache_optimization = kwargs.pop(
+                "enable_kv_cache_optimization", True
+            )
+        self.enable_kv_cache_optimization = _as_bool(
+            config_enable_kv_cache_optimization
+        )
         # copy it to avoid secretly modifying the engine config
-        engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        engine_kwargs = (
+            {}
+            if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs
+            else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        )
         # For each vLLM engine parameter,
         # - `None` means not setting it, so we pop it, and leave it to vLLM default value
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
-        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        engine_kwargs = {
+            key: val for key, val in engine_kwargs.items() if val is not None
+        }
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
@@ -503,7 +891,9 @@ class vLLMRollout(BaseRollout):
 
         # Optional verifier offload hint: map verifier.fsdp_config.* to safer vLLM settings.
         verifier_fsdp_config = config.get("verifier", {}).get("fsdp_config", {})
-        self.verifier_offload_enabled = bool(verifier_fsdp_config.get("param_offload")) or bool(verifier_fsdp_config.get("optimizer_offload"))
+        self.verifier_offload_enabled = bool(
+            verifier_fsdp_config.get("param_offload")
+        ) or bool(verifier_fsdp_config.get("optimizer_offload"))
         if self.verifier_offload_enabled:
             # If not provided, default to a conservative swap size (GB).
             swap_space_override = verifier_fsdp_config.get("swap_space", 64)
@@ -516,7 +906,9 @@ class vLLMRollout(BaseRollout):
             if gpu_mem_util is not None:
                 config.gpu_memory_utilization = gpu_mem_util
             else:
-                config.gpu_memory_utilization = min(getattr(config, "gpu_memory_utilization", 0.8), 0.7)
+                config.gpu_memory_utilization = min(
+                    getattr(config, "gpu_memory_utilization", 0.8), 0.7
+                )
 
             logger.info(
                 f"[VerifierOffload] Enabled verifier offload hints: swap_space={engine_kwargs.get('swap_space')}, "
@@ -524,7 +916,11 @@ class vLLMRollout(BaseRollout):
             )
 
         # Ensure stop_token_ids is a plain list to satisfy vLLM SamplingParams type checks
-        if "stop_token_ids" in kwargs and kwargs["stop_token_ids"] is not None and not isinstance(kwargs["stop_token_ids"], list):
+        if (
+            "stop_token_ids" in kwargs
+            and kwargs["stop_token_ids"] is not None
+            and not isinstance(kwargs["stop_token_ids"], list)
+        ):
             kwargs["stop_token_ids"] = list(kwargs["stop_token_ids"])
 
         self.inference_engine = LLM(
@@ -549,10 +945,6 @@ class vLLMRollout(BaseRollout):
             **lora_kwargs,
             **engine_kwargs,
         )
-        
-        # #region agent log
-        # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-        # #endregion
 
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
@@ -565,9 +957,14 @@ class vLLMRollout(BaseRollout):
 
         # # we may detokenize the result all together later
         # NOTE: detokenize must be True when using stop strings
-        has_stop_params = config.get("stop", None) is not None or config.get("stop_token_ids", None) is not None
+        has_stop_params = (
+            config.get("stop", None) is not None
+            or config.get("stop_token_ids", None) is not None
+        )
         if vllm_version != "0.3.1":
-            kwargs["detokenize"] = has_stop_params  # True if stop strings used, False otherwise
+            kwargs["detokenize"] = (
+                has_stop_params  # True if stop strings used, False otherwise
+            )
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
@@ -575,7 +972,11 @@ class vLLMRollout(BaseRollout):
                 kwargs[k] = config.get(k)
 
         # Hydra may hand us an OmegaConf ListConfig; vLLM expects a native list
-        if "stop_token_ids" in kwargs and kwargs["stop_token_ids"] is not None and not isinstance(kwargs["stop_token_ids"], list):
+        if (
+            "stop_token_ids" in kwargs
+            and kwargs["stop_token_ids"] is not None
+            and not isinstance(kwargs["stop_token_ids"], list)
+        ):
             kwargs["stop_token_ids"] = list(kwargs["stop_token_ids"])
 
         # print(f"kwargs: {kwargs}")  # debug-only
@@ -587,10 +988,16 @@ class vLLMRollout(BaseRollout):
         if verifier_lora_name is not None:
             self.verifier_lora_name = verifier_lora_name
         else:
-            self.verifier_lora_name = self.config.get("verifier_lora_name", "verifier_lora")
-        self.verifier_lora_path = verifier_lora_path if verifier_lora_path else self.config.get("verifier", {}).get("lora_path", None)
+            self.verifier_lora_name = self.config.get(
+                "verifier_lora_name", "verifier_lora"
+            )
+        self.verifier_lora_path = (
+            verifier_lora_path
+            if verifier_lora_path
+            else self.config.get("verifier", {}).get("lora_path", None)
+        )
         self.verifier_lora_int_id = None
-        
+
         self._load_verifier_lora_if_needed()
 
     def _get_lora_engine(self):
@@ -605,7 +1012,9 @@ class vLLMRollout(BaseRollout):
     def _load_verifier_lora_if_needed(self):
         if not self.verifier_lora_path:
             return
-        if not hasattr(self, "lora_kwargs") or not self.lora_kwargs.get("enable_lora", False):
+        if not hasattr(self, "lora_kwargs") or not self.lora_kwargs.get(
+            "enable_lora", False
+        ):
             return
         if self.inference_engine is None:
             return
@@ -617,6 +1026,7 @@ class vLLMRollout(BaseRollout):
                 return
             try:
                 import inspect
+
                 sig = inspect.signature(lora_engine.add_lora)
                 if "lora_request" in sig.parameters:
                     if self.verifier_lora_int_id is None:
@@ -634,7 +1044,9 @@ class vLLMRollout(BaseRollout):
                     )
                     success = lora_engine.add_lora(lora_request=lora_req)
                     if success is False:
-                        logger.warning("Failed to load Verifier LoRA: add_lora returned False")
+                        logger.warning(
+                            "Failed to load Verifier LoRA: add_lora returned False"
+                        )
                     else:
                         logger.info(
                             f"Successfully loaded Verifier LoRA from {self.verifier_lora_path} with ID={self.verifier_lora_int_id}"
@@ -648,16 +1060,18 @@ class vLLMRollout(BaseRollout):
                         self.verifier_lora_int_id = lora_ret
                     else:
                         self._register_verifier_lora()
-                    logger.info(f"Successfully loaded Verifier LoRA from {self.verifier_lora_path} with ID={self.verifier_lora_int_id}")
-                # #region agent log
-                # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-                # #endregion
+                    logger.info(
+                        f"Successfully loaded Verifier LoRA from {self.verifier_lora_path} with ID={self.verifier_lora_int_id}"
+                    )
+
             except Exception as e:
                 logger.warning(f"Failed to load Verifier LoRA via add_lora: {e}")
                 try:
                     self._register_verifier_lora()
                 except Exception as reg_e:
-                    logger.warning(f"Failed to register Verifier LoRA in fallback: {reg_e}")
+                    logger.warning(
+                        f"Failed to register Verifier LoRA in fallback: {reg_e}"
+                    )
         except Exception as e:
             logger.warning(f"Error trying to load Verifier LoRA: {e}")
         finally:
@@ -673,9 +1087,9 @@ class vLLMRollout(BaseRollout):
         old_sampling_params_args = {}
         if kwargs:
             # Check if stop sequences are being set - if so, detokenize must be True
-            has_stop_sequences = kwargs.get('stop', None) is not None
+            has_stop_sequences = kwargs.get("stop", None) is not None
             if has_stop_sequences:
-                kwargs['detokenize'] = True
+                kwargs["detokenize"] = True
 
             for key, value in kwargs.items():
                 # Always try to set the attribute, even if it doesn't exist yet
@@ -697,7 +1111,6 @@ class vLLMRollout(BaseRollout):
                     delattr(self.sampling_params, key)
                 except:
                     pass
-
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
@@ -725,17 +1138,34 @@ class vLLMRollout(BaseRollout):
 
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
-            non_tensor_batch["raw_prompt_ids"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [
+                    _pre_process_inputs(self.pad_token_id, idx[i])
+                    for i in range(batch_size)
+                ],
+                dtype=object,
+            )
 
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
             raise RuntimeError("vllm sharding manager is not work properly.")
 
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data")):
-                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+            for raw_prompt_ids, multi_modal_data in zip(
+                non_tensor_batch.pop("raw_prompt_ids"),
+                non_tensor_batch.pop("multi_modal_data"),
+            ):
+                vllm_inputs.append(
+                    {
+                        "prompt_token_ids": raw_prompt_ids,
+                        "multi_modal_data": multi_modal_data,
+                    }
+                )
         else:
-            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
+            vllm_inputs = [
+                {"prompt_token_ids": raw_prompt_ids}
+                for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
+            ]
 
         # ensure the type of `prompt_token_ids` passed to vllm is list[int]
         # https://github.com/volcengine/verl/pull/772
@@ -743,7 +1173,9 @@ class vLLMRollout(BaseRollout):
             if isinstance(input_data["prompt_token_ids"], np.ndarray):
                 input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
             elif not isinstance(input_data["prompt_token_ids"], list):
-                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+                raise TypeError(
+                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
+                )
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -799,8 +1231,12 @@ class vLLMRollout(BaseRollout):
                     #     curr_input_log_prob.append(logprob[output.prompt_token_ids[i]].logprob)
                     # input_log_probs.append(curr_input_log_prob)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+            response = pad_2d_list_to_length(
+                response, self.pad_token_id, max_length=self.config.response_length
+            ).to(idx.device)
+            rollout_log_probs = pad_2d_list_to_length(
+                rollout_log_probs, -1, max_length=self.config.response_length
+            ).to(idx.device)
             rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             # input_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=idx.size(1), left=True).to(idx.device).to(torch.float32)
@@ -820,10 +1256,14 @@ class vLLMRollout(BaseRollout):
             seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = torch.arange(
+            1, response_length + 1, device=position_ids.device
+        )
         delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
         if position_ids.dim() == 3:  # qwen2vl mrope
-            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(
+                batch_size, 3, -1
+            )
 
         # TODO(sgm): fix position_ids on right_pad
         # prompt: left pad + response: right pad
@@ -831,7 +1271,9 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
@@ -864,12 +1306,12 @@ class vLLMRollout(BaseRollout):
     def _register_verifier_lora(self, verifier_lora_path=None):
         """
         Register or load Verifier LoRA adapter.
-        
+
         Note: This is a placeholder implementation. In practice, you should:
         1. Pre-train a Verifier LoRA using SFT on critique data
         2. Save it to a path and pass via verifier_lora_config
         3. Load it here for inference
-        
+
         For now, this method attempts to find an existing LoRA or signals
         that LoRA loading is needed.
         """
@@ -878,15 +1320,12 @@ class vLLMRollout(BaseRollout):
                 return
             if not hasattr(self, "_verifier_register_debug_once"):
                 self._verifier_register_debug_once = False
-            # #region agent log
-            # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-            # #endregion
-            
+
             # Strategy: Check if LoRA is enabled via lora_kwargs, then use fallback strategy
             # This avoids calling list_loras() which requires lora_manager to be initialized
             # In vLLM, lora_manager may not be initialized even if enable_lora=True
             # unless an actual LoRA adapter is loaded
-            
+
             # Check if LoRA is enabled
             lora_enabled = False
             max_loras = 0
@@ -895,11 +1334,7 @@ class vLLMRollout(BaseRollout):
                 max_loras = self.lora_kwargs.get("max_loras", 0)
                 if max_loras is None:
                     max_loras = 0
-            
-            # #region agent log
-            # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-            # #endregion
-            
+
             # If LoRA is enabled, use a stable LoRA ID for Verifier requests.
             # NOTE: vLLM's LoRARequest requires an int id; we use 1 by convention.
             if lora_enabled and max_loras >= 1:
@@ -916,9 +1351,7 @@ class vLLMRollout(BaseRollout):
                         self.verifier_lora_int_id,
                     )
                     self._verifier_register_debug_once = True
-                # #region agent log
-                # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-                # #endregion
+
             else:
                 self.verifier_lora_int_id = None
                 logger.warning(
@@ -933,20 +1366,22 @@ class vLLMRollout(BaseRollout):
                         self.verifier_lora_int_id,
                     )
                     self._verifier_register_debug_once = True
-                # #region agent log
-                # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-                # #endregion
+
         except Exception as e:
             logger.warning(f"Error in _register_verifier_lora: {e}")
             import traceback
+
             logger.warning(traceback.format_exc())
-            # #region agent log
-            # NOTE: Disabled ad-hoc debug logging to `.cursor/debug.log` (not needed in normal runs).
-            # #endregion
+
             # Fallback: If max_loras > 1, use LoRA ID 1
-            if hasattr(self, "lora_kwargs") and self.lora_kwargs.get("max_loras", 0) > 1:
+            if (
+                hasattr(self, "lora_kwargs")
+                and self.lora_kwargs.get("max_loras", 0) > 1
+            ):
                 self.verifier_lora_int_id = 1
-                logger.info(f"Fallback: Using LoRA ID 1 for Verifier (max_loras={self.lora_kwargs.get('max_loras')})")
+                logger.info(
+                    f"Fallback: Using LoRA ID 1 for Verifier (max_loras={self.lora_kwargs.get('max_loras')})"
+                )
             else:
                 self.verifier_lora_int_id = None
 
@@ -961,7 +1396,9 @@ class vLLMRollout(BaseRollout):
             # Ensure we have a valid int id before calling vLLM add_lora/remove_lora.
             self._register_verifier_lora()
         if self.verifier_lora_int_id is None:
-            logger.warning("Verifier LoRA int id is None (LoRA likely disabled); cannot reload via vLLM add_lora.")
+            logger.warning(
+                "Verifier LoRA int id is None (LoRA likely disabled); cannot reload via vLLM add_lora."
+            )
             return False
         prev_lora_int_id = int(self.verifier_lora_int_id)
         lora_engine = self._get_lora_engine()
@@ -978,6 +1415,7 @@ class vLLMRollout(BaseRollout):
                     # Check if it uses LoRARequest or simple name
                     if hasattr(lora_engine.remove_lora, "__code__"):
                         import inspect
+
                         sig = inspect.signature(lora_engine.remove_lora)
                         if "lora_id" in sig.parameters:
                             # AsyncLLMEngine uses lora_id (int)
@@ -993,53 +1431,74 @@ class vLLMRollout(BaseRollout):
                 try:
                     # Check if add_lora expects LoRARequest (AsyncLLMEngine) or kwargs (older API)
                     import inspect
+
                     sig = inspect.signature(lora_engine.add_lora)
 
                     if "lora_request" in sig.parameters:
                         # AsyncLLMEngine API: add_lora(lora_request: LoRARequest) -> bool
                         from vllm.lora.request import LoRARequest
+
                         lora_req = LoRARequest(
                             lora_name=self.verifier_lora_name,
                             lora_int_id=prev_lora_int_id,
-                            lora_path=verifier_lora_path
+                            lora_path=verifier_lora_path,
                         )
                         success = lora_engine.add_lora(lora_request=lora_req)
                         if success:
                             self.verifier_lora_int_id = prev_lora_int_id
-                            logger.info(f"Successfully reloaded Verifier LoRA via AsyncLLMEngine API: {verifier_lora_path}")
+                            logger.info(
+                                f"Successfully reloaded Verifier LoRA via AsyncLLMEngine API: {verifier_lora_path}"
+                            )
                         else:
-                            logger.error(f"Failed to reload Verifier LoRA: add_lora returned False")
+                            logger.error(
+                                f"Failed to reload Verifier LoRA: add_lora returned False"
+                            )
                             return False
                     else:
                         # Older/unknown API: try kwargs
                         lora_ret = lora_engine.add_lora(
                             adapter_name=self.verifier_lora_name,
-                            adapter_path=verifier_lora_path
+                            adapter_path=verifier_lora_path,
                         )
                         if isinstance(lora_ret, int):
                             self.verifier_lora_int_id = lora_ret
                         else:
                             self.verifier_lora_int_id = prev_lora_int_id
-                        logger.info(f"Successfully reloaded Verifier LoRA via legacy API: {verifier_lora_path}")
+                        logger.info(
+                            f"Successfully reloaded Verifier LoRA via legacy API: {verifier_lora_path}"
+                        )
 
                     self._register_verifier_lora()
 
                     # Verify LoRA is actually loaded
-                    if hasattr(lora_engine, 'list_loras'):
+                    if hasattr(lora_engine, "list_loras"):
                         try:
                             loaded_loras = lora_engine.list_loras()
-                            if hasattr(loaded_loras, '__iter__'):
+                            if hasattr(loaded_loras, "__iter__"):
                                 if all(isinstance(l, int) for l in loaded_loras):
                                     if self.verifier_lora_int_id not in loaded_loras:
-                                        logger.warning(f"Verifier LoRA ID {self.verifier_lora_int_id} not found in loaded LoRAs: {loaded_loras}")
+                                        logger.warning(
+                                            f"Verifier LoRA ID {self.verifier_lora_int_id} not found in loaded LoRAs: {loaded_loras}"
+                                        )
                                     else:
-                                        logger.info(f"Verified Verifier LoRA ID {self.verifier_lora_int_id} is loaded")
+                                        logger.info(
+                                            f"Verified Verifier LoRA ID {self.verifier_lora_int_id} is loaded"
+                                        )
                                 else:
-                                    lora_names = [l.lora_name if hasattr(l, 'lora_name') else str(l) for l in loaded_loras]
+                                    lora_names = [
+                                        l.lora_name
+                                        if hasattr(l, "lora_name")
+                                        else str(l)
+                                        for l in loaded_loras
+                                    ]
                                     if self.verifier_lora_name not in lora_names:
-                                        logger.warning(f"Verifier LoRA {self.verifier_lora_name} not found in loaded LoRAs: {lora_names}")
+                                        logger.warning(
+                                            f"Verifier LoRA {self.verifier_lora_name} not found in loaded LoRAs: {lora_names}"
+                                        )
                                     else:
-                                        logger.info(f"Verified Verifier LoRA {self.verifier_lora_name} is loaded with ID={self.verifier_lora_int_id}")
+                                        logger.info(
+                                            f"Verified Verifier LoRA {self.verifier_lora_name} is loaded with ID={self.verifier_lora_int_id}"
+                                        )
                         except Exception as e:
                             logger.debug(f"Could not verify LoRA loading: {e}")
 
@@ -1049,7 +1508,9 @@ class vLLMRollout(BaseRollout):
                     logger.error(f"Failed to reload Verifier LoRA via add_lora: {e}")
                     return False
             else:
-                logger.warning("vLLM engine does not support add_lora; cannot reload verifier LoRA")
+                logger.warning(
+                    "vLLM engine does not support add_lora; cannot reload verifier LoRA"
+                )
                 return False
         finally:
             if hasattr(self.inference_engine, "sleep"):
@@ -1061,20 +1522,20 @@ class vLLMRollout(BaseRollout):
     @GPUMemoryLogger(role="vllm dual stream rollout", logger=logger)
     @torch.no_grad()
     def dual_stream_rollout(
-        self, 
-        prompts: DataProto, 
+        self,
+        prompts: DataProto,
         intervention_mode: str = "by_response",
         stream_mode: str = "both",
         token_check_interval: int = 1024,
         entropy_threshold: float = 0.5,
         use_entropy_filter: bool = True,
-        **kwargs
+        **kwargs,
     ) -> DataProto:
         """
         Perform dual-stream rollout for Co-GRPO:
         - Control Stream: Policy generates without Verifier guidance
         - Experimental Stream: Policy generates with Verifier intervention based on mode
-        
+
         Args:
             prompts: DataProto containing prompts
             intervention_mode: Verifier intervention mode. Options:
@@ -1084,15 +1545,15 @@ class vLLMRollout(BaseRollout):
             token_check_interval: For by_token mode, check every N tokens (default: 5)
             entropy_threshold: For by_token mode, entropy threshold for filtering (default: 0.5)
             use_entropy_filter: For by_token mode, whether to use entropy filtering (default: True)
-            
+
         Returns:
             DataProto with control_responses, exp_responses, hints, critiques, and associated metadata
         """
         timing_info = {}
         start_time = time.time()
-        
+
         tokenizer = self.tokenizer  # Use stored tokenizer
-        
+
         # Rebuild vllm cache engine (with version compatibility)
         if self.config.free_cache_engine:
             try:
@@ -1108,17 +1569,21 @@ class vLLMRollout(BaseRollout):
         attention_mask = prompts.batch["attention_mask"]
         position_ids = prompts.batch["position_ids"]
         eos_token_id = prompts.meta_info["eos_token_id"]
+        eos_token_ids = _normalize_eos_token_ids(eos_token_id)
         batch_size = idx.size(0)
-        
+
         # Handle empty batch
         if batch_size == 0:
             from tensordict import TensorDict
+
             empty_batch = TensorDict({}, batch_size=0)
             timing_info["total"] = time.time() - start_time
             meta_info = prompts.meta_info.copy()
             meta_info["timing"] = timing_info
-            return DataProto(batch=empty_batch, non_tensor_batch={}, meta_info=meta_info)
-        
+            return DataProto(
+                batch=empty_batch, non_tensor_batch={}, meta_info=meta_info
+            )
+
         # Route to appropriate intervention mode
         # TEMP: Disable by_response and by_token to focus on debugging by_step
         # if intervention_mode == "by_response":
@@ -1137,31 +1602,58 @@ class vLLMRollout(BaseRollout):
             # CRITICAL FIX: Pass dual_stream_rollout's explicit parameters to _dual_stream_rollout_by_step via kwargs
             # Otherwise token_check_interval won't be passed because it's an explicit parameter of dual_stream_rollout,
             # not included in **kwargs automatically
-            kwargs['token_check_interval'] = token_check_interval
+            kwargs["token_check_interval"] = token_check_interval
             # Keep min_step_tokens in sync with token_check_interval unless overridden
-            kwargs.setdefault('min_step_tokens', token_check_interval)
-            kwargs['entropy_threshold'] = entropy_threshold
-            kwargs['use_entropy_filter'] = use_entropy_filter
-            kwargs['stream_mode'] = stream_mode
+            kwargs.setdefault("min_step_tokens", token_check_interval)
+            kwargs["entropy_threshold"] = entropy_threshold
+            kwargs["use_entropy_filter"] = use_entropy_filter
+            kwargs["stream_mode"] = stream_mode
             return self._dual_stream_rollout_by_step(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-                position_ids, eos_token_id, batch_size, **kwargs
+                prompts,
+                timing_info,
+                start_time,
+                tokenizer,
+                idx,
+                attention_mask,
+                position_ids,
+                eos_token_id,
+                batch_size,
+                **kwargs,
             )
         else:
             # Fallback: Force by_step mode for debugging
-            logger.warning(f"intervention_mode={intervention_mode} not supported yet, forcing by_step mode")
-            kwargs['token_check_interval'] = token_check_interval
-            kwargs['entropy_threshold'] = entropy_threshold
-            kwargs['use_entropy_filter'] = use_entropy_filter
-            kwargs['stream_mode'] = stream_mode
-            return self._dual_stream_rollout_by_step(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-                position_ids, eos_token_id, batch_size, **kwargs
+            logger.warning(
+                f"intervention_mode={intervention_mode} not supported yet, forcing by_step mode"
             )
-    
+            kwargs["token_check_interval"] = token_check_interval
+            kwargs["entropy_threshold"] = entropy_threshold
+            kwargs["use_entropy_filter"] = use_entropy_filter
+            kwargs["stream_mode"] = stream_mode
+            return self._dual_stream_rollout_by_step(
+                prompts,
+                timing_info,
+                start_time,
+                tokenizer,
+                idx,
+                attention_mask,
+                position_ids,
+                eos_token_id,
+                batch_size,
+                **kwargs,
+            )
+
     def _dual_stream_rollout_by_response(
-        self, prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-        position_ids, eos_token_id, batch_size, **kwargs
+        self,
+        prompts,
+        timing_info,
+        start_time,
+        tokenizer,
+        idx,
+        attention_mask,
+        position_ids,
+        eos_token_id,
+        batch_size,
+        **kwargs,
     ) -> DataProto:
         """
         Original by_response mode: Generate complete response, then Verifier intervenes.
@@ -1182,8 +1674,12 @@ class vLLMRollout(BaseRollout):
         # 1. Basic configuration
         if not do_sample:
             control_kwargs = {
-                "best_of": 1, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
-                "temperature": 0, "n": 1,
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,
             }
         elif is_validate:
             control_kwargs = {
@@ -1200,7 +1696,9 @@ class vLLMRollout(BaseRollout):
         # So we MUST use n=1 here, otherwise vLLM will repeat again causing batch_size mismatch
         if do_sample and not is_validate and self.sampling_params.n > 1:
             target_n = self.sampling_params.n
-            logger.info(f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})")
+            logger.info(
+                f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})"
+            )
             control_kwargs["n"] = 1
 
         # =================================================================
@@ -1217,7 +1715,7 @@ class vLLMRollout(BaseRollout):
                 lora_request=None,  # No LoRA for control stream
                 use_tqdm=False,
             )
-        
+
         control_responses, control_log_probs = _extract_vllm_outputs(
             control_output, self.pad_token_id, self.config.response_length, idx.device
         )
@@ -1233,7 +1731,9 @@ class vLLMRollout(BaseRollout):
             # If batch_size >= n and is divisible by n, it was likely pre-repeated by trainer
             if batch_size % n == 0 and batch_size >= n:
                 # Batch was already repeated by trainer, don't repeat again
-                logger.info(f"Co-GRPO: Batch already repeated by trainer (size={batch_size}, n={n}), skipping rollout-side repeat")
+                logger.info(
+                    f"Co-GRPO: Batch already repeated by trainer (size={batch_size}, n={n}), skipping rollout-side repeat"
+                )
             else:
                 # Normal case: repeat batch in rollout
                 idx = _repeat_interleave(idx, n)
@@ -1242,7 +1742,9 @@ class vLLMRollout(BaseRollout):
                 # Repeat idx_list to match the expanded batch size
                 idx_list = idx_list * n
                 batch_size = batch_size * n
-                logger.info(f"Co-GRPO: Repeated batch in rollout (new size={batch_size})")
+                logger.info(
+                    f"Co-GRPO: Repeated batch in rollout (new size={batch_size})"
+                )
 
         # ========== Experimental Stream: Policy -> Verifier -> Policy ==========
         # Step 1: Policy generates initial draft (CoT)
@@ -1260,14 +1762,18 @@ class vLLMRollout(BaseRollout):
                 lora_request=None,  # No LoRA for initial draft
                 use_tqdm=False,
             )
-        
+
         draft_responses, draft_log_probs = _extract_vllm_outputs(
             draft_output, self.pad_token_id, self.config.response_length, idx.device
         )
-        
+
         if draft_responses.shape[1] < self.config.response_length:
-            draft_responses = pad_sequence_to_length(draft_responses, self.config.response_length, self.pad_token_id)
-            draft_log_probs = pad_sequence_to_length(draft_log_probs, self.config.response_length, self.pad_token_id)
+            draft_responses = pad_sequence_to_length(
+                draft_responses, self.config.response_length, self.pad_token_id
+            )
+            draft_log_probs = pad_sequence_to_length(
+                draft_log_probs, self.config.response_length, self.pad_token_id
+            )
         timing_info["draft_gen"] = time.time() - draft_start
 
         # Step 2: Decode draft responses and construct Verifier input
@@ -1276,12 +1782,16 @@ class vLLMRollout(BaseRollout):
         prompt_texts = []
         verifier_questions = []
         for i in range(batch_size):
-            prompt_text = tokenizer.decode(idx[i][attention_mask[i].bool()], skip_special_tokens=True)
+            prompt_text = tokenizer.decode(
+                idx[i][attention_mask[i].bool()], skip_special_tokens=True
+            )
             draft_text = tokenizer.decode(draft_responses[i], skip_special_tokens=True)
             prompt_texts.append(prompt_text)
-            verifier_questions.append(_extract_verifier_question_from_prompt(prompt_text))
+            verifier_questions.append(
+                _extract_verifier_question_from_prompt(prompt_text)
+            )
             draft_texts.append(draft_text)
-        
+
         # Construct Verifier input with system prompt and task instruction
         # Format matches format_training_data.py: system -> user (intervene_prompt + question + student response)
         # CRITICAL FIX: Use separate system and user messages to match training data format
@@ -1293,14 +1803,12 @@ class vLLMRollout(BaseRollout):
             # Format as separate system and user messages (matches training data)
             messages = [
                 {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content}
+                {"role": "user", "content": user_content},
             ]
 
             # Apply chat template to get final text
             chat_text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True
             )
             verifier_chat_inputs.append(chat_text)
 
@@ -1314,17 +1822,19 @@ class vLLMRollout(BaseRollout):
         )
         verifier_input_ids = verifier_encoded["input_ids"].to(idx.device)
         verifier_attention_mask = verifier_encoded["attention_mask"].to(idx.device)
-        
+
         # Convert to list format for vLLM
         verifier_idx_list = []
         for i in range(batch_size):
-            verifier_idx_list.append(_pre_process_inputs(self.pad_token_id, verifier_input_ids[i]))
+            verifier_idx_list.append(
+                _pre_process_inputs(self.pad_token_id, verifier_input_ids[i])
+            )
 
         # Step 3: Verifier generates Critique + Hint (using Verifier LoRA)
         verifier_start = time.time()
         if self.verifier_lora_int_id is None:
             self._register_verifier_lora()
-        
+
         verifier_lora_requests = None
         if self.verifier_lora_int_id is not None:
             verifier_lora_requests = [
@@ -1355,34 +1865,40 @@ class vLLMRollout(BaseRollout):
                 lora_request=verifier_lora_requests,
                 use_tqdm=False,
             )
-        
+
         verifier_responses, verifier_log_probs = _extract_vllm_outputs(
             verifier_output, self.pad_token_id, self.config.response_length, idx.device
         )
-        
+
         if verifier_responses.shape[1] < self.config.response_length:
-            verifier_responses = pad_sequence_to_length(verifier_responses, self.config.response_length, self.pad_token_id)
-            verifier_log_probs = pad_sequence_to_length(verifier_log_probs, self.config.response_length, self.pad_token_id)
+            verifier_responses = pad_sequence_to_length(
+                verifier_responses, self.config.response_length, self.pad_token_id
+            )
+            verifier_log_probs = pad_sequence_to_length(
+                verifier_log_probs, self.config.response_length, self.pad_token_id
+            )
 
         # Decode Verifier outputs and extract actual hints (remove think blocks, extract <GO> or <WAIT> content)
         verifier_texts = []  # Full output for logging
         hints = []  # Extracted hints for actual use
         for i in range(batch_size):
-            verifier_text = tokenizer.decode(verifier_responses[i].tolist(), skip_special_tokens=True)
+            verifier_text = tokenizer.decode(
+                verifier_responses[i].tolist(), skip_special_tokens=True
+            )
             verifier_texts.append(verifier_text)
             # Extract actual hint (removes think blocks, extracts <GO> or <WAIT> content)
             hint = self._extract_verifier_hint(verifier_text)
             hint = self._truncate_verifier_hint_tokens(hint, tokenizer)
             hints.append(hint)
         timing_info["verifier_gen"] = time.time() - verifier_start
-        
+
         # Step 4: Policy generates final answer with Verifier guidance
         # Use extracted hints (without think blocks)
         final_inputs = []
         for prompt, hint in zip(prompt_texts, hints):
             final_prompt = f"Prompt: {prompt}\n\nHint: {hint}\n\nFinal Answer:"
             final_inputs.append(final_prompt)
-        
+
         final_encoded = tokenizer(
             final_inputs,
             return_tensors="pt",
@@ -1392,10 +1908,12 @@ class vLLMRollout(BaseRollout):
         )
         final_input_ids = final_encoded["input_ids"].to(idx.device)
         final_attention_mask = final_encoded["attention_mask"].to(idx.device)
-        
+
         final_idx_list = []
         for i in range(batch_size):
-            final_idx_list.append(_pre_process_inputs(self.pad_token_id, final_input_ids[i]))
+            final_idx_list.append(
+                _pre_process_inputs(self.pad_token_id, final_input_ids[i])
+            )
 
         # Generate final responses (no LoRA, back to Policy)
         final_start = time.time()
@@ -1407,14 +1925,18 @@ class vLLMRollout(BaseRollout):
                 lora_request=None,  # No LoRA for final generation
                 use_tqdm=False,
             )
-        
+
         exp_responses, exp_log_probs = _extract_vllm_outputs(
             final_output, self.pad_token_id, self.config.response_length, idx.device
         )
-        
+
         if exp_responses.shape[1] < self.config.response_length:
-            exp_responses = pad_sequence_to_length(exp_responses, self.config.response_length, self.pad_token_id)
-            exp_log_probs = pad_sequence_to_length(exp_log_probs, self.config.response_length, self.pad_token_id)
+            exp_responses = pad_sequence_to_length(
+                exp_responses, self.config.response_length, self.pad_token_id
+            )
+            exp_log_probs = pad_sequence_to_length(
+                exp_log_probs, self.config.response_length, self.pad_token_id
+            )
         timing_info["final_gen"] = time.time() - final_start
 
         # Store the actual prompts used for experimental stream
@@ -1427,16 +1949,19 @@ class vLLMRollout(BaseRollout):
         # Store hints and critiques in non_tensor_batch
         # Use extracted hints (without think blocks) for actual use
         hints_array = np.array(hints, dtype=object)
-        critiques = np.array(verifier_texts, dtype=object)  # Keep full output for logging/critique
-        
+        critiques = np.array(
+            verifier_texts, dtype=object
+        )  # Keep full output for logging/critique
+
         # Store intervention statistics for penalty calculation
         # In by_response mode, each sample has 1 intervention (the verifier output)
         num_interventions = np.ones(batch_size, dtype=np.int32)
         # Calculate token counts based on extracted hints (not full verifier output)
-        hint_token_counts = np.array([
-            len(tokenizer.encode(hint, add_special_tokens=False)) for hint in hints
-        ], dtype=np.int32)
-        
+        hint_token_counts = np.array(
+            [len(tokenizer.encode(hint, add_special_tokens=False)) for hint in hints],
+            dtype=np.int32,
+        )
+
         # Combine control and experimental responses
         # Helper function to get last valid position id
         def get_last_valid_position_id(position_ids, attention_mask):
@@ -1448,64 +1973,103 @@ class vLLMRollout(BaseRollout):
             else:
                 last_pos = position_ids[torch.arange(batch_size), valid_lengths]
             return last_pos
-        
+
         last_valid_pos = get_last_valid_position_id(position_ids, attention_mask)
-        
+
         # Control stream data
         control_seq = torch.cat([idx, control_responses], dim=-1)
         control_response_length = control_responses.size(1)
-        control_delta_position_id = torch.arange(1, control_response_length + 1, device=position_ids.device)
-        control_delta_position_id = control_delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        control_delta_position_id = torch.arange(
+            1, control_response_length + 1, device=position_ids.device
+        )
+        control_delta_position_id = control_delta_position_id.unsqueeze(0).repeat(
+            batch_size, 1
+        )
         if position_ids.dim() == 3:
-            control_delta_position_id = control_delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+            control_delta_position_id = control_delta_position_id.view(
+                batch_size, 1, -1
+            ).expand(batch_size, 3, -1)
             last_valid_pos_expanded = last_valid_pos.unsqueeze(-1)  # [batch_size, 3, 1]
         else:
             last_valid_pos_expanded = last_valid_pos.unsqueeze(-1)  # [batch_size, 1]
-        control_response_position_ids = last_valid_pos_expanded + control_delta_position_id
-        control_position_ids = torch.cat([position_ids, control_response_position_ids], dim=-1)
-        control_response_attention_mask = get_response_mask(response_id=control_responses, eos_token=eos_token_id, dtype=attention_mask.dtype)
-        control_attention_mask = torch.cat((attention_mask, control_response_attention_mask), dim=-1)
+        control_response_position_ids = (
+            last_valid_pos_expanded + control_delta_position_id
+        )
+        control_position_ids = torch.cat(
+            [position_ids, control_response_position_ids], dim=-1
+        )
+        control_response_attention_mask = get_response_mask(
+            response_id=control_responses,
+            eos_token=eos_token_id,
+            dtype=attention_mask.dtype,
+        )
+        control_attention_mask = torch.cat(
+            (attention_mask, control_response_attention_mask), dim=-1
+        )
 
         # Experimental stream data
         # Use the actual prompt used (final_input_ids) instead of original idx
         exp_seq = torch.cat([exp_prompt_ids, exp_responses], dim=-1)
         exp_response_length = exp_responses.size(1)
-        exp_delta_position_id = torch.arange(1, exp_response_length + 1, device=position_ids.device)
+        exp_delta_position_id = torch.arange(
+            1, exp_response_length + 1, device=position_ids.device
+        )
         exp_delta_position_id = exp_delta_position_id.unsqueeze(0).repeat(batch_size, 1)
-        
+
         # Create position_ids for exp_prompt from scratch
         exp_prompt_len = exp_prompt_ids.size(1)
         if position_ids.dim() == 3:
             # Multi-dimensional position (e.g., qwen2vl)
-            exp_prompt_position_ids = torch.arange(exp_prompt_len, device=exp_prompt_ids.device)
-            exp_prompt_position_ids = exp_prompt_position_ids.unsqueeze(0).unsqueeze(1).expand(
-                batch_size, position_ids.size(1), -1
+            exp_prompt_position_ids = torch.arange(
+                exp_prompt_len, device=exp_prompt_ids.device
+            )
+            exp_prompt_position_ids = (
+                exp_prompt_position_ids.unsqueeze(0)
+                .unsqueeze(1)
+                .expand(batch_size, position_ids.size(1), -1)
             )
             # Prepare delta for 3D
-            exp_delta_position_id = exp_delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
+            exp_delta_position_id = exp_delta_position_id.view(
+                batch_size, 1, -1
+            ).expand(batch_size, position_ids.size(1), -1)
         else:
             # Standard 2D position
-            exp_prompt_position_ids = torch.arange(exp_prompt_len, device=exp_prompt_ids.device)
-            exp_prompt_position_ids = exp_prompt_position_ids.unsqueeze(0).expand(batch_size, -1)
-        
+            exp_prompt_position_ids = torch.arange(
+                exp_prompt_len, device=exp_prompt_ids.device
+            )
+            exp_prompt_position_ids = exp_prompt_position_ids.unsqueeze(0).expand(
+                batch_size, -1
+            )
+
         # Get last valid position from exp_prompt
         exp_last_valid_pos = get_last_valid_position_id(
-            exp_prompt_position_ids,
-            exp_prompt_attention_mask
+            exp_prompt_position_ids, exp_prompt_attention_mask
         )
-        
+
         # Calculate response position_ids based on last valid position
         if position_ids.dim() == 3:
-            exp_last_valid_pos_expanded = exp_last_valid_pos.unsqueeze(-1)  # [batch_size, 3, 1]
+            exp_last_valid_pos_expanded = exp_last_valid_pos.unsqueeze(
+                -1
+            )  # [batch_size, 3, 1]
         else:
-            exp_last_valid_pos_expanded = exp_last_valid_pos.unsqueeze(-1)  # [batch_size, 1]
+            exp_last_valid_pos_expanded = exp_last_valid_pos.unsqueeze(
+                -1
+            )  # [batch_size, 1]
         exp_response_position_ids = exp_last_valid_pos_expanded + exp_delta_position_id
-        
+
         # Concatenate prompt and response position_ids
-        exp_position_ids = torch.cat([exp_prompt_position_ids, exp_response_position_ids], dim=-1)
-        
-        exp_response_attention_mask = get_response_mask(response_id=exp_responses, eos_token=eos_token_id, dtype=attention_mask.dtype)
-        exp_attention_mask = torch.cat((exp_prompt_attention_mask, exp_response_attention_mask), dim=-1)
+        exp_position_ids = torch.cat(
+            [exp_prompt_position_ids, exp_response_position_ids], dim=-1
+        )
+
+        exp_response_attention_mask = get_response_mask(
+            response_id=exp_responses,
+            eos_token=eos_token_id,
+            dtype=attention_mask.dtype,
+        )
+        exp_attention_mask = torch.cat(
+            (exp_prompt_attention_mask, exp_response_attention_mask), dim=-1
+        )
 
         # Create batch with both streams
         batch = TensorDict(
@@ -1543,13 +2107,21 @@ class vLLMRollout(BaseRollout):
                 if isinstance(val, np.ndarray) and val.shape[0] == original_batch_size:
                     non_tensor_batch[key] = _repeat_interleave(val, repeat_factor)
 
-        non_tensor_batch.update({
-            "hints": hints_array,  # Use extracted hints (without think blocks)
-            "critiques": critiques,
-            "draft_responses": np.array([tokenizer.decode(draft_responses[i], skip_special_tokens=True) for i in range(batch_size)], dtype=object),
-            "num_interventions": num_interventions,
-            "hint_token_counts": hint_token_counts,
-        })
+        non_tensor_batch.update(
+            {
+                "hints": hints_array,  # Use extracted hints (without think blocks)
+                "critiques": critiques,
+                "draft_responses": np.array(
+                    [
+                        tokenizer.decode(draft_responses[i], skip_special_tokens=True)
+                        for i in range(batch_size)
+                    ],
+                    dtype=object,
+                ),
+                "num_interventions": num_interventions,
+                "hint_token_counts": hint_token_counts,
+            }
+        )
 
         # Free vllm cache engine (with version compatibility)
         if self.config.free_cache_engine:
@@ -1567,57 +2139,71 @@ class vLLMRollout(BaseRollout):
         meta_info = prompts.meta_info.copy()
         meta_info["timing"] = timing_info
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
-    
+        return DataProto(
+            batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info
+        )
+
     def _get_step_boundary_stop_config(self, tokenizer, eos_token_id=None):
         """
         获取 step boundary 的停止配置。
-        
+
         Args:
             tokenizer: Tokenizer instance
             eos_token_id: EOS token ID (optional)
-        
+
         Returns:
             dict: 包含 stop_token_ids 和 stop_sequences 的配置
         """
         stop_token_ids = set()
         stop_sequences = set()
-        
-        # 1. 思考结束标记 & 换行
-        # [".\n", "?\n","</think>", "<｜end of thought｜>", "\n\n", ".\n\n"]
+
+        # 1. Prefer coarser boundaries (used for local trimming / optional stop sequences).
         for seq in ["</think>", "<｜end of thought｜>", "\n\n", ".\n\n"]:
             stop_sequences.add(seq)
-        
-        # 2. 显式添加 \n 的 Token ID (防止 tokenizer 差异)
-        try:
-            nl_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
-            stop_token_ids.add(nl_id)
-        except:
-            pass
-            
+
         if eos_token_id is not None:
             # 处理 eos_token_id 可能是 list 的情况
             if isinstance(eos_token_id, (list, tuple)):
                 stop_token_ids.update(eos_token_id)
             else:
                 stop_token_ids.add(eos_token_id)
-            
+
+        # Also stop when the model starts a new chat message.
+        try:
+            im_start_id = tokenizer.encode("<|im_start|>", add_special_tokens=False)[-1]
+            stop_token_ids.add(int(im_start_id))
+        except Exception:
+            pass
+
+        # Treat pad/endoftext as a stop token as well.
+        try:
+            if getattr(self, "pad_token_id", None) is not None:
+                stop_token_ids.add(int(self.pad_token_id))
+        except Exception:
+            pass
+
         return {
-            'stop_token_ids': list(stop_token_ids), 
-            'stop_sequences': list(stop_sequences)
+            "stop_token_ids": list(stop_token_ids),
+            "stop_sequences": list(stop_sequences),
         }
 
-
-    def _run_verifier_inference(self, verifier_inputs, tokenizer, idx_device, exp_kwargs, return_trajectories: bool = False):
+    def _run_verifier_inference(
+        self,
+        verifier_inputs,
+        tokenizer,
+        idx_device,
+        exp_kwargs,
+        return_trajectories: bool = False,
+    ):
         """
         批量调用 Verifier 进行推理。
-        
+
         Args:
             verifier_inputs: List[str] - Verifier 输入文本列表
             tokenizer: Tokenizer instance
             idx_device: Device for tensors
             exp_kwargs: Sampling parameters
-        
+
         Returns:
             If return_trajectories is False:
                 List[dict]: 每个输入的决策结果，包含 'action', 'hint', 'critique'
@@ -1633,7 +2219,11 @@ class vLLMRollout(BaseRollout):
             if not hasattr(self, "_verifier_malformed_warn_count"):
                 self._verifier_malformed_warn_count = 0
 
-            verifier_cfg = self.config.get("verifier", {})
+            verifier_cfg = None
+            if getattr(self, "verifier_config", None) is not None:
+                verifier_cfg = self.verifier_config
+            if verifier_cfg is None:
+                verifier_cfg = self.config.get("verifier", {})
             verifier_max_new_tokens = int(verifier_cfg.get("max_new_tokens", 512))
             verifier_logprobs = int(verifier_cfg.get("logprobs", 1))
             verifier_lora_rank = int(verifier_cfg.get("lora_rank", 0))
@@ -1641,17 +2231,31 @@ class vLLMRollout(BaseRollout):
             # NOTE:
             # `self.config` here is rollout sub-config, which may not carry verifier.lora_rank.
             # Do not disable LoRA solely based on verifier_cfg.lora_rank.
-            lora_enabled = bool(getattr(self, "lora_kwargs", {}).get("enable_lora", False))
+            lora_enabled = bool(
+                getattr(self, "lora_kwargs", {}).get("enable_lora", False)
+            )
             verifier_lora_path = getattr(self, "verifier_lora_path", None)
             use_verifier_lora = lora_enabled and bool(verifier_lora_path)
 
             if use_verifier_lora and self.verifier_lora_int_id is None:
                 self._register_verifier_lora()
 
-            max_model_len = int(self.config.max_model_len or (self.config.prompt_length + self.config.response_length))
-            verifier_max_prompt_length = int(verifier_cfg.get("max_prompt_length", max_model_len - verifier_max_new_tokens))
+            max_model_len = int(
+                self.config.max_model_len
+                or (self.config.prompt_length + self.config.response_length)
+            )
+            verifier_max_prompt_length = int(
+                verifier_cfg.get(
+                    "max_prompt_length", max_model_len - verifier_max_new_tokens
+                )
+            )
             # vLLM requires: len(prompt) + max_tokens <= max_model_len
-            verifier_prompt_budget = max(1, min(verifier_max_prompt_length, max_model_len - verifier_max_new_tokens))
+            verifier_prompt_budget = max(
+                1,
+                min(
+                    verifier_max_prompt_length, max_model_len - verifier_max_new_tokens
+                ),
+            )
 
             verifier_temperature = float(verifier_cfg.get("temperature", 1.0))
             if verifier_temperature <= 0:
@@ -1675,7 +2279,9 @@ class vLLMRollout(BaseRollout):
             first_question_preview = ""
             for prompt_idx, verifier_prompt in enumerate(verifier_inputs):
                 # Heuristic structured truncation: keep the latest part of "Student Response".
-                prefix_text, sep, student_resp = verifier_prompt.partition("**Student Response (So Far):**")
+                prefix_text, sep, student_resp = verifier_prompt.partition(
+                    "**Student Response (So Far):**"
+                )
                 if sep:
                     user_prefix = f"{prefix_text}**Student Response (So Far):**\n"
                 else:
@@ -1685,9 +2291,15 @@ class vLLMRollout(BaseRollout):
                 if prompt_idx == 0:
                     first_sep_found = bool(sep)
                     first_student_resp_len = len(student_resp)
-                    first_student_resp_preview = str(student_resp)[:220].replace("\n", "\\n")
+                    first_student_resp_preview = str(student_resp)[:220].replace(
+                        "\n", "\\n"
+                    )
                     try:
-                        q_part = prefix_text.split("**Question:**", 1)[1] if "**Question:**" in prefix_text else prefix_text
+                        q_part = (
+                            prefix_text.split("**Question:**", 1)[1]
+                            if "**Question:**" in prefix_text
+                            else prefix_text
+                        )
                     except Exception:
                         q_part = prefix_text
                     first_question_preview = str(q_part)[:220].replace("\n", "\\n")
@@ -1710,7 +2322,9 @@ class vLLMRollout(BaseRollout):
                 if remaining > 0 and student_resp:
                     tail_ids = tokenizer.encode(student_resp, add_special_tokens=False)
                     tail_ids = tail_ids[-remaining:]
-                    truncated_student_resp = tokenizer.decode(tail_ids, skip_special_tokens=True)
+                    truncated_student_resp = tokenizer.decode(
+                        tail_ids, skip_special_tokens=True
+                    )
                     user_full = user_prefix + truncated_student_resp
                 else:
                     user_full = user_prefix
@@ -1735,7 +2349,7 @@ class vLLMRollout(BaseRollout):
 
                 verifier_idx_list.append(prompt_ids)
                 verifier_prompt_token_ids.append(prompt_ids)
-            
+
             # 准备 LoRA requests
             verifier_lora_requests = None
             if use_verifier_lora and self.verifier_lora_int_id is not None:
@@ -1750,7 +2364,11 @@ class vLLMRollout(BaseRollout):
 
             if not self._verifier_debug_once:
                 try:
-                    prompt_preview = str(verifier_inputs[0])[:260].replace("\n", "\\n") if verifier_inputs else ""
+                    prompt_preview = (
+                        str(verifier_inputs[0])[:260].replace("\n", "\\n")
+                        if verifier_inputs
+                        else ""
+                    )
                     logger.warning(
                         "[VerifierDebug] first_call: lora_rank=%s lora_enabled=%s use_verifier_lora=%s lora_int_id=%s has_lora_request=%s num_inputs=%s max_prompt_budget=%s max_new_tokens=%s lora_path=%s sep_found=%s student_resp_len=%s question_preview=%s student_resp_preview=%s prompt_preview=%s",
                         verifier_lora_rank,
@@ -1779,6 +2397,11 @@ class vLLMRollout(BaseRollout):
             verifier_kwargs["max_tokens"] = verifier_max_new_tokens
             verifier_kwargs["logprobs"] = verifier_logprobs
 
+            # Best-effort early stop for the common-pass case.
+            # NOTE: Do NOT stop on `<WAIT>`; we need the hint text after it.
+            verifier_kwargs["stop"] = ["\n<GO>"]
+            verifier_kwargs["include_stop_str_in_output"] = True
+
             # 批量生成 Verifier 响应
             with self.update_sampling_params(**verifier_kwargs):
                 verifier_output = self.inference_engine.generate(
@@ -1788,17 +2411,47 @@ class vLLMRollout(BaseRollout):
                     lora_request=verifier_lora_requests,
                     use_tqdm=False,
                 )
-            
+
+            # Extra debug: finish_reason distribution helps confirm truncation vs stop.
+            if not self._verifier_debug_once:
+                try:
+                    finish_reason_counts = {}
+                    for out in verifier_output:
+                        for seq_out in getattr(out, "outputs", []) or []:
+                            fr = getattr(seq_out, "finish_reason", None)
+                            fr = str(fr) if fr is not None else "None"
+                            finish_reason_counts[fr] = (
+                                finish_reason_counts.get(fr, 0) + 1
+                            )
+                    logger.warning(
+                        "[VerifierDebug] finish_reason_counts=%s",
+                        finish_reason_counts,
+                    )
+                except Exception:
+                    pass
+
             verifier_responses, verifier_log_probs = _extract_vllm_outputs(
                 verifier_output, self.pad_token_id, verifier_max_new_tokens, idx_device
             )
-            
+
             # 解析所有 Verifier 输出
             decisions = []
             malformed_like = 0
+            tag_go = 0
+            tag_wait = 0
+            closed_think = 0
             for i in range(len(verifier_inputs)):
                 verifier_response = verifier_responses[i]
-                verifier_text = tokenizer.decode(verifier_response.tolist(), skip_special_tokens=True)
+                verifier_text = tokenizer.decode(
+                    verifier_response.tolist(), skip_special_tokens=True
+                )
+                low_text = verifier_text.lower()
+                if "<go>" in low_text:
+                    tag_go += 1
+                if "<wait>" in low_text:
+                    tag_wait += 1
+                if "</think>" in low_text or "<｜end of thought｜>" in low_text:
+                    closed_think += 1
                 decision = self._parse_verifier_decision(verifier_text)
                 decisions.append(decision)
 
@@ -1818,7 +2471,22 @@ class vLLMRollout(BaseRollout):
                     except Exception:
                         pass
 
-            if len(verifier_inputs) > 0 and malformed_like / len(verifier_inputs) >= 0.5:
+            if not self._verifier_debug_once:
+                try:
+                    logger.warning(
+                        "[VerifierDebug] output_tag_stats: go=%s wait=%s closed_think=%s none_tag=%s",
+                        tag_go,
+                        tag_wait,
+                        closed_think,
+                        max(0, len(verifier_inputs) - tag_go - tag_wait),
+                    )
+                except Exception:
+                    pass
+
+            if (
+                len(verifier_inputs) > 0
+                and malformed_like / len(verifier_inputs) >= 0.5
+            ):
                 if self._verifier_malformed_warn_count < 5:
                     logger.warning(
                         "[VerifierDebug] malformed_like_outputs=%s/%s (final-answer-like with no valid decision)",
@@ -1840,13 +2508,16 @@ class vLLMRollout(BaseRollout):
                 "max_new_tokens": verifier_max_new_tokens,
             }
             return decisions, trajectories
-            
+
         except Exception as e:
             logger.warning(f"Verifier inference failed: {e}")
             # 返回默认决策（Pass）
-            fallback = [{'action': 'Pass', 'hint': None, 'critique': f'[Error: {str(e)}]'} for _ in verifier_inputs]
+            fallback = [
+                {"action": "Pass", "hint": None, "critique": f"[Error: {str(e)}]"}
+                for _ in verifier_inputs
+            ]
             return (fallback, {}) if return_trajectories else fallback
-    
+
     def _extract_verifier_hint(self, verifier_text: str) -> str:
         """
         Extract actual hint from Verifier output, removing think blocks and extracting <GO> or <WAIT> content.
@@ -1893,8 +2564,12 @@ class vLLMRollout(BaseRollout):
             decision_scope = think_tail_parts[-1]
         else:
             # Remove fully-closed think blocks; if we still have an unclosed <think>, drop from that tag onward.
-            decision_scope = re.sub(r"<think>.*?</think>", "", without_code, flags=re.IGNORECASE | re.DOTALL)
-            decision_scope = re.sub(r"<think>[\s\S]*$", "", decision_scope, flags=re.IGNORECASE)
+            decision_scope = re.sub(
+                r"<think>.*?</think>", "", without_code, flags=re.IGNORECASE | re.DOTALL
+            )
+            decision_scope = re.sub(
+                r"<think>[\s\S]*$", "", decision_scope, flags=re.IGNORECASE
+            )
 
         def _extract_from_lines(lines):
             tag_line_pattern = re.compile(r"^<(GO|WAIT)>\s*(.*)$", re.IGNORECASE)
@@ -1909,7 +2584,11 @@ class vLLMRollout(BaseRollout):
 
                 # WAIT: prefer same-line hint; if empty, allow one next non-tag line.
                 hint_line = match.group(2).strip()
-                if not hint_line and idx + 1 < len(lines) and not tag_line_pattern.match(lines[idx + 1]):
+                if (
+                    not hint_line
+                    and idx + 1 < len(lines)
+                    and not tag_line_pattern.match(lines[idx + 1])
+                ):
                     hint_line = lines[idx + 1].strip()
 
                 hint_line = _sanitize_hint_text(hint_line)
@@ -1918,7 +2597,11 @@ class vLLMRollout(BaseRollout):
                 return f"<WAIT> {hint_line}"
             return ""
 
-        lines = [line.strip() for line in decision_scope.replace("\r\n", "\n").split("\n") if line.strip()]
+        lines = [
+            line.strip()
+            for line in decision_scope.replace("\r\n", "\n").split("\n")
+            if line.strip()
+        ]
         hint = _extract_from_lines(lines)
         if hint:
             return hint
@@ -1929,15 +2612,29 @@ class vLLMRollout(BaseRollout):
             return ""
 
         # Legacy fallback (for outputs that do not use <think> blocks).
-        fallback_lines = [line.strip() for line in without_code.replace("\r\n", "\n").split("\n") if line.strip()]
+        fallback_lines = [
+            line.strip()
+            for line in without_code.replace("\r\n", "\n").split("\n")
+            if line.strip()
+        ]
         return _extract_from_lines(fallback_lines)
 
     def _truncate_verifier_hint_tokens(self, hint: str, tokenizer) -> str:
         if not hint:
             return ""
-        verifier_cfg = self.config.get("verifier", {}) if hasattr(self.config, "get") else {}
+        verifier_cfg = None
+        if getattr(self, "verifier_config", None) is not None:
+            verifier_cfg = self.verifier_config
+        if verifier_cfg is None:
+            verifier_cfg = (
+                self.config.get("verifier", {}) if hasattr(self.config, "get") else {}
+            )
         try:
-            max_hint_tokens = verifier_cfg.get("max_hint_tokens", None) if hasattr(verifier_cfg, "get") else None
+            max_hint_tokens = (
+                verifier_cfg.get("max_hint_tokens", None)
+                if hasattr(verifier_cfg, "get")
+                else None
+            )
         except Exception:
             max_hint_tokens = None
         if max_hint_tokens is None:
@@ -1952,60 +2649,68 @@ class vLLMRollout(BaseRollout):
             hint_ids = tokenizer.encode(hint, add_special_tokens=False)
             if len(hint_ids) <= max_hint_tokens:
                 return hint
-            return tokenizer.decode(hint_ids[:max_hint_tokens], skip_special_tokens=True).strip()
+            return tokenizer.decode(
+                hint_ids[:max_hint_tokens], skip_special_tokens=True
+            ).strip()
         except Exception:
             return hint
-    
+
     def _parse_verifier_decision(self, verifier_text: str) -> dict:
         """
         Parse Verifier output to extract decision (Pass/Intervene) and hint.
-        
+
         New format: Extract <GO> or <WAIT> content after removing think blocks.
-        
+
         Returns:
             dict with keys: "action" (str), "hint" (str), "critique" (str)
         """
         verifier_text = verifier_text.strip()
-        
+
         # Extract actual hint (removes think blocks, extracts <GO> or <WAIT> content)
         hint = self._extract_verifier_hint(verifier_text)
 
         # Determine action based on hint
-        if re.match(r'^\s*<WAIT>(?:\s|$)', hint, flags=re.IGNORECASE):
+        if re.match(r"^\s*<WAIT>(?:\s|$)", hint, flags=re.IGNORECASE):
             action = "Intervene"
             # Extract content after <WAIT>
-            hint_content = re.sub(r'^\s*<WAIT>\s*', '', hint, flags=re.IGNORECASE).strip()
-            hint = hint_content  # CRITICAL: Use just the content, NOT "<WAIT> {content}"
+            hint_content = re.sub(
+                r"^\s*<WAIT>\s*", "", hint, flags=re.IGNORECASE
+            ).strip()
+            hint = (
+                hint_content  # CRITICAL: Use just the content, NOT "<WAIT> {content}"
+            )
             # The <WAIT> tag confuses the Actor and causes it to repeat empty tokens!
             if not hint:
                 action = "Pass"
-        elif re.match(r'^\s*<GO>(?:\s|$)', hint, flags=re.IGNORECASE):
+        elif re.match(r"^\s*<GO>(?:\s|$)", hint, flags=re.IGNORECASE):
             action = "Pass"
             hint = ""
         else:
             action = "Pass"
             hint = ""
-        
+
         return {
             "action": action,
             "hint": hint,
-            "critique": verifier_text  # Keep full output for logging
+            "critique": verifier_text,  # Keep full output for logging
         }
-    
-    def _find_step_boundaries(self, response_tokens: torch.Tensor, tokenizer, device) -> torch.Tensor:
+
+    def _find_step_boundaries(
+        self, response_tokens: torch.Tensor, tokenizer, device
+    ) -> torch.Tensor:
         """
         Find step boundaries in response tokens using REPRO logic.
-        
+
         Args:
             response_tokens: [batch_size, seq_len] tensor of token IDs
             tokenizer: Tokenizer instance
             device: Device for tensors
-            
+
         Returns:
             step_boundaries: [batch_size, max_steps] tensor of boundary indices
         """
         batch_size, seq_len = response_tokens.shape
-        
+
         # Encode step boundary markers (similar to REPRO)
         try:
             end_think_token_id = tokenizer.encode("</think>", add_special_tokens=False)
@@ -2015,7 +2720,7 @@ class vLLMRollout(BaseRollout):
                 end_think_token_id = None
         except:
             end_think_token_id = None
-        
+
         # Line break tokens
         line_break_ids = []
         for pattern in [".\n", "?\n", "\n\n", ".\n\n", "?\n\n"]:
@@ -2025,70 +2730,85 @@ class vLLMRollout(BaseRollout):
                     line_break_ids.append(encoded[0])
             except:
                 pass
-        
+
         # Handle empty batch or zero sequence length
         if batch_size == 0 or seq_len == 0:
             return torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-        
+
         # Find boundaries
         boundaries_list = []
         for b in range(batch_size):
             boundaries = []
             tokens = response_tokens[b]
-            
+
             # Create think mask (similar to REPRO)
             if end_think_token_id is not None:
                 think_mask = ~(tokens == end_think_token_id).cumsum(0).bool()
             else:
                 think_mask = torch.ones(seq_len, dtype=torch.bool, device=device)
-            
+
             # Find line breaks
             line_break_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
             for lb_id in line_break_ids:
                 line_break_mask = line_break_mask | (tokens == lb_id)
-            
+
             # Shift line break mask (boundary is after the line break)
             line_break_mask = torch.roll(line_break_mask, 1, 0)
             line_break_mask[0] = False
-            
+
             # Combine with think mask
             valid_boundaries = think_mask & line_break_mask
-            
+
             # Get boundary indices
             boundary_indices = torch.where(valid_boundaries)[0].tolist()
             boundaries.extend(boundary_indices)
-            
+
             # Always include the end (if seq_len > 0)
             if seq_len > 0:
                 boundaries.append(seq_len - 1)
             boundaries = sorted(set(boundaries))
-            
+
             # Filter out invalid boundaries (negative or out of range)
             boundaries = [b for b in boundaries if 0 <= b < seq_len]
-            
+
             # Ensure at least one boundary (the end)
             if not boundaries and seq_len > 0:
                 boundaries = [seq_len - 1]
-            
+
             boundaries_list.append(boundaries)
-        
+
         # Handle empty boundaries_list
         if not boundaries_list:
             return torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-        
+
         # Pad to same length
         max_boundaries = max(len(b) for b in boundaries_list) if boundaries_list else 1
-        boundaries_tensor = torch.zeros(batch_size, max_boundaries, dtype=torch.long, device=device)
+        boundaries_tensor = torch.zeros(
+            batch_size, max_boundaries, dtype=torch.long, device=device
+        )
         for b, boundaries in enumerate(boundaries_list):
             if boundaries:
-                boundaries_tensor[b, :len(boundaries)] = torch.tensor(boundaries, device=device)
-        
+                boundaries_tensor[b, : len(boundaries)] = torch.tensor(
+                    boundaries, device=device
+                )
+
         return boundaries_tensor
-    
+
     def _dual_stream_rollout_by_token(
-        self, prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-        position_ids, eos_token_id, batch_size, token_check_interval,
-        entropy_threshold, use_entropy_filter, **kwargs
+        self,
+        prompts,
+        timing_info,
+        start_time,
+        tokenizer,
+        idx,
+        attention_mask,
+        position_ids,
+        eos_token_id,
+        batch_size,
+        token_check_interval,
+        entropy_threshold,
+        use_entropy_filter,
+        **kwargs,
     ) -> DataProto:
         """
         by_token mode: Incremental generation with token-level Verifier intervention.
@@ -2104,17 +2824,34 @@ class vLLMRollout(BaseRollout):
 
         # Use by_step as fallback
         return self._dual_stream_rollout_by_step(
-            prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-            position_ids, eos_token_id, batch_size, **kwargs
+            prompts,
+            timing_info,
+            start_time,
+            tokenizer,
+            idx,
+            attention_mask,
+            position_ids,
+            eos_token_id,
+            batch_size,
+            **kwargs,
         )
-    
+
     def _dual_stream_rollout_by_step(
-        self, prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-        position_ids, eos_token_id, batch_size, **kwargs
+        self,
+        prompts,
+        timing_info,
+        start_time,
+        tokenizer,
+        idx,
+        attention_mask,
+        position_ids,
+        eos_token_id,
+        batch_size,
+        **kwargs,
     ) -> DataProto:
         """
         by_step mode: 使用 stop_sequences 实现批量并行增量打断生成（修正版）。
-        
+
         关键修正：
         1. 统一 sampling_params（计算 max_remaining_tokens）
         2. 引入 loss_mask 区分 Hint（0）和生成内容（1）
@@ -2145,8 +2882,12 @@ class vLLMRollout(BaseRollout):
             # 1. Basic configuration
             if not do_sample:
                 control_kwargs = {
-                    "best_of": 1, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
-                    "temperature": 0, "n": 1,
+                    "best_of": 1,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "min_p": 0.0,
+                    "temperature": 0,
+                    "n": 1,
                 }
             elif is_validate:
                 control_kwargs = {
@@ -2163,7 +2904,9 @@ class vLLMRollout(BaseRollout):
             # So we MUST use n=1 here, otherwise vLLM will repeat again causing batch_size mismatch
             if do_sample and not is_validate and self.sampling_params.n > 1:
                 target_n = self.sampling_params.n
-                logger.info(f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})")
+                logger.info(
+                    f"Co-GRPO by_step: Forcing vLLM n=1 (trainer already repeated with n={target_n})"
+                )
                 control_kwargs["n"] = 1
 
             # =================================================================
@@ -2171,7 +2914,9 @@ class vLLMRollout(BaseRollout):
             # =================================================================
 
             # Store the actual n used for control generation (for batch expansion)
-            control_n = control_kwargs.get("n", self.sampling_params.n if do_sample and not is_validate else 1)
+            control_n = control_kwargs.get(
+                "n", self.sampling_params.n if do_sample and not is_validate else 1
+            )
 
             # Generate control responses (no LoRA)
             control_start = time.time()
@@ -2185,7 +2930,10 @@ class vLLMRollout(BaseRollout):
                 )
 
             control_responses, control_log_probs = _extract_vllm_outputs(
-                control_output, self.pad_token_id, self.config.response_length, idx.device
+                control_output,
+                self.pad_token_id,
+                self.config.response_length,
+                idx.device,
             )
             timing_info["control_gen"] = time.time() - control_start
 
@@ -2213,29 +2961,36 @@ class vLLMRollout(BaseRollout):
         # ========== Experimental Stream: 批量并行增量打断生成 ==========
         # 1. 获取停止配置
         stop_config = self._get_step_boundary_stop_config(tokenizer, eos_token_id)
-        if not stop_config['stop_sequences'] and not stop_config['stop_token_ids']:
-            logger.warning("No stop sequences found, using full generation without step boundaries")
+        # Normalize eos token ids (some tokenizers expose list/tuple).
+        eos_token_ids = _normalize_eos_token_ids(eos_token_id)
+        stop_token_ids_set = set(
+            int(x) for x in (stop_config.get("stop_token_ids") or [])
+        )
+        if not stop_config["stop_sequences"] and not stop_config["stop_token_ids"]:
+            logger.warning(
+                "No stop sequences found, using full generation without step boundaries"
+            )
             # Fall back to simple full generation (continue without step interruption)
             pass  # Continue with full generation
 
         # Pre-encode stop sequences for local detection (we ignore stop at the sampler level)
         stop_seq_token_ids = []
-        for seq in stop_config['stop_sequences']:
+        for seq in stop_config["stop_sequences"]:
             if not seq:
                 continue
             ids = tokenizer.encode(seq, add_special_tokens=False)
             if ids:
                 stop_seq_token_ids.append(ids)
-        stop_token_ids = stop_config['stop_token_ids'] or []
+        stop_token_ids = stop_config["stop_token_ids"] or []
 
         # 2. 初始化 InterventionPolicy
-        max_interventions = kwargs.get('max_interventions', 3)
-        confidence_threshold = kwargs.get('confidence_threshold', 0.7)
+        max_interventions = kwargs.get("max_interventions", 3)
+        confidence_threshold = kwargs.get("confidence_threshold", 0.7)
         intervention_policy = InterventionPolicy(
             max_interventions=max_interventions,
-            confidence_threshold=confidence_threshold
+            confidence_threshold=confidence_threshold,
         )
-        
+
         # 3. 准备采样参数
         if not do_sample:
             exp_kwargs = {
@@ -2257,7 +3012,7 @@ class vLLMRollout(BaseRollout):
             # IMPORTANT: When n > 1, we've already expanded idx/attention_mask/position_ids
             # so we need to set n=1 for experimental stream to avoid over-generating
             exp_kwargs = {"n": 1}
-        
+
         # Defensive: ensure budget values are ints even if overridden as strings
         # NOTE: Must be defined before sample_states init (used for prompt length checks).
         response_budget = int(self.config.response_length)
@@ -2268,40 +3023,50 @@ class vLLMRollout(BaseRollout):
         for b in range(batch_size):
             prompt_tokens = idx[b][attention_mask[b].bool()].tolist()
             # Defensive: strip trailing EOS to avoid immediate stop
-            if eos_token_id is not None and prompt_tokens and prompt_tokens[-1] == eos_token_id:
-                logger.warning(f"[PROMPT TRIM EOS] Sample {b}: stripping trailing EOS {eos_token_id}")
+            if eos_token_ids and prompt_tokens and prompt_tokens[-1] in eos_token_ids:
+                logger.warning(
+                    f"[PROMPT TRIM EOS] Sample {b}: stripping trailing EOS {eos_token_id}"
+                )
                 prompt_tokens = prompt_tokens[:-1]
             if len(prompt_tokens) > prompt_budget:
-                logger.warning(f"[PROMPT OVER BUDGET] Sample {b}: prompt_len={len(prompt_tokens)} > prompt_budget={prompt_budget}")
+                logger.warning(
+                    f"[PROMPT OVER BUDGET] Sample {b}: prompt_len={len(prompt_tokens)} > prompt_budget={prompt_budget}"
+                )
             prompt_text_raw = tokenizer.decode(prompt_tokens, skip_special_tokens=True)
             verifier_question = _extract_verifier_question_from_prompt(prompt_text_raw)
 
-            sample_states.append({
-                'prompt_tokens': prompt_tokens,
-                'prompt_text': prompt_text_raw,
-                'verifier_question': verifier_question,
-                'response_tokens': [],  # 关键：hint 追加到这里
-                'loss_masks': [],  # 关键新增：1 for Model Gen, 0 for Hint
-                'hints': [],
-                'critiques': [],
-                # Pending hint insertion (for natural insertion at punctuation/newline boundaries).
-                'pending_hint': None,
-                'pending_hint_delay_tokens': 0,  # model-generated tokens since pending
-                'step_count': 0,
-                'is_complete': False,
-                'error': None,
-                'tokens_since_boundary': 0,  # Model tokens since last accepted boundary
-                'last_finish_reason': None,  # track final finish reason for diagnostics/dump
-                'context_exhausted': False,   # flag if we hit context budget
-                'first_step_tokens_len': None,  # record first step token length for debugging
-            })
-        
+            sample_states.append(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "prompt_text": prompt_text_raw,
+                    "verifier_question": verifier_question,
+                    "response_tokens": [],  # 关键：hint 追加到这里
+                    "loss_masks": [],  # 关键新增：1 for Model Gen, 0 for Hint
+                    "hints": [],
+                    "critiques": [],
+                    # Pending hint insertion (for natural insertion at punctuation/newline boundaries).
+                    "pending_hint": None,
+                    "pending_hint_delay_tokens": 0,  # model-generated tokens since pending
+                    "step_count": 0,
+                    "is_complete": False,
+                    "error": None,
+                    "tokens_since_boundary": 0,  # Model tokens since last accepted boundary
+                    "last_finish_reason": None,  # track final finish reason for diagnostics/dump
+                    "context_exhausted": False,  # flag if we hit context budget
+                    "first_step_tokens_len": None,  # record first step token length for debugging
+                    "_prethink_rollback_used": False,  # allow at most one rollback-to-</think> per sample
+                    "_hint_skipped_late_stage": False,
+                }
+            )
+
         # 5. 监控指标
         metrics = {
-            'total_steps': 0,
-            'total_interventions': 0,
-            'stop_sequence_hits': 0,
-            'errors': 0,
+            "total_steps": 0,
+            "total_interventions": 0,
+            "stop_sequence_hits": 0,
+            "hint_skipped_late_stage": 0,
+            "verifier_skipped_no_insert_anchor": 0,
+            "errors": 0,
         }
 
         # Verifier PPO trajectories (only intervention steps are used for training).
@@ -2318,32 +3083,58 @@ class vLLMRollout(BaseRollout):
         verifier_train_parent_uids = []
         verifier_train_parent_sample_uids = []
         verifier_train_step_indices = []
-        
+
         exp_start = time.time()
         # Dynamic max_steps calculation based on response_budget and token_check_interval
         # This ensures we can generate up to response_budget tokens (not limited by hardcoded max_steps)
-        token_check_interval = int(kwargs.get('token_check_interval', 1024))
-        min_step_tokens = int(kwargs.get('min_step_tokens', token_check_interval))  # FIX: Extract from kwargs
+        token_check_interval = int(kwargs.get("token_check_interval", 1024))
+        min_step_tokens = int(
+            kwargs.get("min_step_tokens", token_check_interval)
+        )  # FIX: Extract from kwargs
 
         # Context budget: prompt + response(gen budget) + hint headroom
         # Reserve space for hints so that hint insertion doesn't cause context_exhausted.
         # Note: response_budget is for model-generated tokens only; hints are extra.
-        max_interventions = int(kwargs.get('max_interventions', 5))
+        max_interventions = int(kwargs.get("max_interventions", 5))
         # Natural hint insertion knobs.
-        pending_hint_step_token_cap = int(kwargs.get("pending_hint_step_token_cap", 256))
-        pending_hint_max_delay_tokens = int(kwargs.get("pending_hint_max_delay_tokens", 512))
-        pending_hint_tail_decode_tokens = int(kwargs.get("pending_hint_tail_decode_tokens", 128))
+        pending_hint_step_token_cap = int(
+            kwargs.get("pending_hint_step_token_cap", 256)
+        )
+        pending_hint_max_delay_tokens = int(
+            kwargs.get("pending_hint_max_delay_tokens", 512)
+        )
+        pending_hint_tail_decode_tokens = int(
+            kwargs.get("pending_hint_tail_decode_tokens", 128)
+        )
+        hint_rollback_window_tokens = int(kwargs.get("hint_rollback_window_tokens", 512))
 
         # Dynamic max_steps calculation must account for reduced per-step generation when
         # pending hints temporarily cap max_tokens (e.g. 256). Otherwise rollout can stop early
         # after only ~response_budget/token_check_interval rounds.
-        delayed_pending_step_cap = min(64, pending_hint_step_token_cap) if pending_hint_max_delay_tokens > 0 else pending_hint_step_token_cap
-        conservative_step_tokens = max(1, min(token_check_interval, pending_hint_step_token_cap, delayed_pending_step_cap))
-        default_max_steps = (response_budget + conservative_step_tokens - 1) // conservative_step_tokens
+        delayed_pending_step_cap = (
+            min(64, pending_hint_step_token_cap)
+            if pending_hint_max_delay_tokens > 0
+            else pending_hint_step_token_cap
+        )
+        conservative_step_tokens = max(
+            1,
+            min(
+                token_check_interval,
+                pending_hint_step_token_cap,
+                delayed_pending_step_cap,
+            ),
+        )
+        default_max_steps = (
+            response_budget + conservative_step_tokens - 1
+        ) // conservative_step_tokens
         # Extra slack for boundary-seeking / hint-commit rounds near the end.
         default_max_steps += max_interventions * 4 + 8
-        max_steps = int(kwargs.get('max_steps', default_max_steps))
-        verifier_cfg = self.config.get("verifier", {})
+        max_steps = int(kwargs.get("max_steps", default_max_steps))
+        verifier_cfg = None
+        if getattr(self, "verifier_config", None) is not None:
+            verifier_cfg = self.verifier_config
+        if verifier_cfg is None:
+            verifier_cfg = self.config.get("verifier", {})
         # Prefer using the configured hard cap for hint tokens as the headroom estimate.
         # This avoids under-reserving when hints are long (which can trigger context_exhausted / vLLM max_len errors).
         estimated_hint_tokens = int(verifier_cfg.get("max_hint_tokens", 256))
@@ -2353,17 +3144,21 @@ class vLLMRollout(BaseRollout):
         response_total_budget = response_budget + hint_headroom
         context_budget = prompt_budget + response_budget + hint_headroom
 
-        logger.info(f"[BY_STEP] max_steps={max_steps} (response_budget={response_budget}, token_check_interval={token_check_interval}, "
-                    f"min_step_tokens={min_step_tokens}, conservative_step_tokens={conservative_step_tokens}, "
-                    f"context_budget={context_budget}, hint_headroom={hint_headroom}, "
-                    f"response_total_budget={response_total_budget})")
+        logger.info(
+            f"[BY_STEP] max_steps={max_steps} (response_budget={response_budget}, token_check_interval={token_check_interval}, "
+            f"min_step_tokens={min_step_tokens}, conservative_step_tokens={conservative_step_tokens}, "
+            f"context_budget={context_budget}, hint_headroom={hint_headroom}, "
+            f"response_total_budget={response_total_budget})"
+        )
 
         # 6. 批量增量生成循环
         for global_step in range(max_steps):
-            metrics['total_steps'] += 1
+            metrics["total_steps"] += 1
 
             # 6.1 收集所有活跃样本（未完成的样本）
-            active_indices = [b for b in range(batch_size) if not sample_states[b]['is_complete']]
+            active_indices = [
+                b for b in range(batch_size) if not sample_states[b]["is_complete"]
+            ]
 
             if not active_indices:
                 break
@@ -2379,20 +3174,20 @@ class vLLMRollout(BaseRollout):
                 state = sample_states[b]
 
                 # Input = Prompt + Response (Hint included)
-                current_input = state['prompt_tokens'] + state['response_tokens']
+                current_input = state["prompt_tokens"] + state["response_tokens"]
                 context_remaining = context_budget - len(current_input)
 
                 # Only count model-generated tokens against response budget; hints do not consume budget.
-                gen_len = sum(1 for m in state['loss_masks'] if m == 1)
+                gen_len = sum(1 for m in state["loss_masks"] if m == 1)
                 gen_remaining = response_budget - gen_len
 
                 if context_remaining <= 0:
                     logger.error(
                         f"[BUDGET EXHAUSTED] Sample {b}: context_len={len(current_input)} >= budget={context_budget}; marking complete"
                     )
-                    state['is_complete'] = True
-                    state['context_exhausted'] = True
-                    state['last_finish_reason'] = 'context_exhausted'
+                    state["is_complete"] = True
+                    state["context_exhausted"] = True
+                    state["last_finish_reason"] = "context_exhausted"
                     continue
 
                 if gen_remaining <= 0:
@@ -2400,19 +3195,19 @@ class vLLMRollout(BaseRollout):
                     logger.info(
                         f"[GEN BUDGET EXHAUSTED] Sample {b}: gen_len={gen_len} >= response_budget={response_budget}; marking complete"
                     )
-                    state['is_complete'] = True
-                    state['last_finish_reason'] = 'gen_budget_exhausted'
+                    state["is_complete"] = True
+                    state["last_finish_reason"] = "gen_budget_exhausted"
                     continue
 
                 batch_inputs.append(current_input)
                 batch_indices.append(b)
-                current_response_lens.append(len(state['response_tokens']))
+                current_response_lens.append(len(state["response_tokens"]))
                 gen_remaining_list.append(gen_remaining)
                 context_remaining_list.append(context_remaining)
-            
+
             if not batch_inputs:
                 break
-            
+
             # 6.3 计算统一的 max_tokens（FIX: 使用 max 而不是 min）
             #
             # 问题：之前使用 min(gen_remaining_list) 导致 batch 中任何一个样本接近完成时，
@@ -2437,20 +3232,28 @@ class vLLMRollout(BaseRollout):
             max_gen_remaining = max(active_gen_remaining)
             max_context_remaining = max(active_context_remaining)  # FIX: min → max
             raw_max_remaining = min(max_gen_remaining, max_context_remaining)
+
+            # Fixed-step generation (e.g., 2k tokens). We'll trim locally to a natural boundary.
             max_remaining = min(token_check_interval, raw_max_remaining)
             # If any sample has a pending hint, reduce step size to increase the chance of hitting a natural
             # boundary soon (punctuation/newline) before committing the hint.
             if any(sample_states[b].get("pending_hint") for b in batch_indices):
-                max_remaining = min(int(max_remaining), int(pending_hint_step_token_cap))
+                max_remaining = min(
+                    int(max_remaining), int(pending_hint_step_token_cap)
+                )
                 # If a pending hint has been waiting for a long time, tighten the cap further (still only
                 # committing at natural boundaries) to avoid very-late insertions.
                 try:
                     if any(
                         sample_states[b].get("pending_hint")
-                        and int(sample_states[b].get("pending_hint_delay_tokens", 0)) >= int(pending_hint_max_delay_tokens)
+                        and int(sample_states[b].get("pending_hint_delay_tokens", 0))
+                        >= int(pending_hint_max_delay_tokens)
                         for b in batch_indices
                     ):
-                        max_remaining = min(int(max_remaining), int(min(64, pending_hint_step_token_cap)))
+                        max_remaining = min(
+                            int(max_remaining),
+                            int(min(64, pending_hint_step_token_cap)),
+                        )
                 except Exception:
                     pass
                 max_remaining = max(1, int(max_remaining))
@@ -2464,20 +3267,24 @@ class vLLMRollout(BaseRollout):
                 )
 
             if max_remaining <= 0:
-                logger.error(f"[BY_STEP] Step {global_step}: max_remaining<=0; breaking.")
+                logger.error(
+                    f"[BY_STEP] Step {global_step}: max_remaining<=0; breaking."
+                )
                 break
 
             # 6.4 批量生成到下一个 boundary
             batch_inputs_processed = []
             for inp in batch_inputs:
                 batch_inputs_processed.append(
-                    _pre_process_inputs(self.pad_token_id, torch.tensor(inp, device=idx.device))
+                    _pre_process_inputs(
+                        self.pad_token_id, torch.tensor(inp, device=idx.device)
+                    )
                 )
 
             try:
                 sampling_override = dict(
-                    stop=[],  # handle stop locally
-                    stop_token_ids=[],
+                    stop=[],
+                    stop_token_ids=stop_token_ids or [],
                     max_tokens=max_remaining,
                     include_stop_str_in_output=True,
                     **exp_kwargs,
@@ -2498,10 +3305,10 @@ class vLLMRollout(BaseRollout):
                     )
             except Exception as e:
                 logger.error(f"Generation error at step {global_step}: {e}")
-                metrics['errors'] += len(batch_indices)
+                metrics["errors"] += len(batch_indices)
                 for b in batch_indices:
-                    sample_states[b]['is_complete'] = True
-                    sample_states[b]['error'] = str(e)
+                    sample_states[b]["is_complete"] = True
+                    sample_states[b]["error"] = str(e)
                 continue
 
             # 6.5 提取新生成的 tokens（批量处理）
@@ -2530,41 +3337,55 @@ class vLLMRollout(BaseRollout):
                     f"len(step_responses)={len(step_responses)}, len(batch_indices)={len(batch_indices)}, "
                     f"len(batch_inputs)={len(batch_inputs)}, global_step={global_step}"
                 )
-                metrics['errors'] += len(batch_indices)
+                metrics["errors"] += len(batch_indices)
                 for b in batch_indices:
-                    sample_states[b]['is_complete'] = True
-                    sample_states[b]['error'] = 'vllm_output_count_mismatch'
-                    sample_states[b]['last_finish_reason'] = 'vllm_output_count_mismatch'
+                    sample_states[b]["is_complete"] = True
+                    sample_states[b]["error"] = "vllm_output_count_mismatch"
+                    sample_states[b]["last_finish_reason"] = (
+                        "vllm_output_count_mismatch"
+                    )
                 continue
-            logger.debug(f"[MATCH] vLLM output count matches input count: {len(step_responses)}")
+            logger.debug(
+                f"[MATCH] vLLM output count matches input count: {len(step_responses)}"
+            )
 
             # 6.6 更新每个样本的状态并检测停止
             verifier_inputs = []
-            verifier_input_map = []  # (batch_idx, step_idx)
+            verifier_input_map = []  # (batch_idx, step_idx, hint_anchor_keep, use_prethink_anchor)
 
             for i, b in enumerate(batch_indices):
                 state = sample_states[b]
-                step_tokens = list(step_responses[i])  # FIX: 确保是 list，vLLM 可能返回 tuple
+                state["_intervened_this_step"] = False
+                step_tokens = list(
+                    step_responses[i]
+                )  # FIX: 确保是 list，vLLM 可能返回 tuple
                 finish_reason = step_finish_reasons[i]  # 获取结束原因
-                state['last_finish_reason'] = finish_reason  # Track last finish reason
-                if state.get('first_step_tokens_len') is None:
-                    state['first_step_tokens_len'] = len(step_tokens)
+                state["last_finish_reason"] = finish_reason  # Track last finish reason
+                if state.get("first_step_tokens_len") is None:
+                    state["first_step_tokens_len"] = len(step_tokens)
 
                 # 获取该样本的剩余 budget
-                gen_len = sum(1 for m in state['loss_masks'] if m == 1)
+                gen_len = sum(1 for m in state["loss_masks"] if m == 1)
                 sample_gen_remaining = response_budget - gen_len
 
                 # 获取该样本的剩余 context budget（FIX: 也需要检查，防止超出 context budget）
-                current_input_len = len(state['prompt_tokens']) + len(state['response_tokens'])
+                current_input_len = len(state["prompt_tokens"]) + len(
+                    state["response_tokens"]
+                )
                 sample_context_remaining = context_budget - current_input_len
 
                 # 获取实际发送给 vLLM 的输入（去 padding 后），用于前缀检测
                 sent_input_ids = batch_inputs_processed[i]
 
                 # ========== 前缀检测：防止 vLLM 回显输入 ==========
-                if len(step_tokens) >= len(sent_input_ids) and step_tokens[:len(sent_input_ids)] == sent_input_ids:
-                    logger.warning(f"[ECHO DETECTED] Step {global_step}, Sample {b}: vLLM echoed input; stripping prefix len={len(sent_input_ids)}.")
-                    new_tokens = step_tokens[len(sent_input_ids):]
+                if (
+                    len(step_tokens) >= len(sent_input_ids)
+                    and step_tokens[: len(sent_input_ids)] == sent_input_ids
+                ):
+                    logger.warning(
+                        f"[ECHO DETECTED] Step {global_step}, Sample {b}: vLLM echoed input; stripping prefix len={len(sent_input_ids)}."
+                    )
+                    new_tokens = step_tokens[len(sent_input_ids) :]
                 else:
                     new_tokens = step_tokens
 
@@ -2580,8 +3401,8 @@ class vLLMRollout(BaseRollout):
                         f"[BUDGET OVERFLOW] Step {global_step}, Sample {b}: effective_budget={effective_budget} <= 0 "
                         f"(gen={sample_gen_remaining}, context={sample_context_remaining}), discarding new_tokens."
                     )
-                    state['is_complete'] = True
-                    state['last_finish_reason'] = 'budget_overflow'
+                    state["is_complete"] = True
+                    state["last_finish_reason"] = "budget_overflow"
                     continue
 
                 truncated = False
@@ -2602,7 +3423,7 @@ class vLLMRollout(BaseRollout):
                         f"sample_gen_remaining={sample_gen_remaining}, sample_context_remaining={sample_context_remaining}, "
                         f"max_remaining={max_remaining}, prompt_tail={sent_input_ids[-5:]}, raw_output_snippet={step_tokens[:10]}..."
                     )
-                    if finish_reason == 'length':
+                    if finish_reason == "length":
                         logger.error(
                             f"[CRITICAL] Step {global_step}, Sample {b}: length stop with 0 new tokens. "
                             f"state_response_len={len(state['response_tokens'])}, budget={response_budget}, "
@@ -2610,101 +3431,177 @@ class vLLMRollout(BaseRollout):
                         )
 
                 # 调试日志 - 增强版
-                logger.debug(f"Step {global_step}, Sample {b}: step_tokens_len={len(step_tokens)}, new_tokens_len={len(new_tokens)}, "
-                            f"finish_reason={finish_reason}, current_input_len={current_input_len}, "
-                            f"sample_gen_remaining={sample_gen_remaining}, sample_context_remaining={sample_context_remaining}")
+                logger.debug(
+                    f"Step {global_step}, Sample {b}: step_tokens_len={len(step_tokens)}, new_tokens_len={len(new_tokens)}, "
+                    f"finish_reason={finish_reason}, current_input_len={current_input_len}, "
+                    f"sample_gen_remaining={sample_gen_remaining}, sample_context_remaining={sample_context_remaining}"
+                )
 
-                # CRITICAL DIAGNOSTIC: Check for PAD tokens in new_tokens
-                if self.pad_token_id in new_tokens:
-                    pad_count = new_tokens.count(self.pad_token_id)
-                    logger.warning(f"[PAD BUG] Step {global_step}, Sample {b}: Found {pad_count} PAD tokens in new_tokens! "
-                                  f"This indicates padding bug not fully fixed.")
-                else:
-                    logger.debug(f"[PAD FIX] Step {global_step}, Sample {b}: No PAD tokens in new_tokens ✓")
+                saw_stop_token = False
+                if stop_token_ids_set and new_tokens:
+                    stop_rel = None
+                    stop_tok = None
+                    for j, t in enumerate(new_tokens):
+                        if int(t) in stop_token_ids_set:
+                            stop_rel = j
+                            stop_tok = int(t)
+                            break
+                    if stop_rel is not None:
+                        saw_stop_token = True
+                        # Do not keep special stop tokens in the stored response.
+                        new_tokens = new_tokens[: int(stop_rel)]
+                        logger.info(
+                            f"[STOP TOKEN] Step {global_step}, Sample {b}: saw stop_token_id={stop_tok}, truncating output and completing."
+                        )
 
                 # Note: Echo handling is done above using the exact input ids sent to vLLM.
 
+                # If we hit the fixed per-step budget (finish_reason==length), roll back to a natural
+                # boundary within this chunk to avoid keeping an unfinished trailing fragment.
+                if finish_reason == "length" and new_tokens:
+                    cut = _find_last_trim_boundary(new_tokens, tokenizer)
+                    if cut is not None:
+                        new_tokens = new_tokens[: int(cut)]
+
                 # 检查是否生成了新内容
                 if len(new_tokens) == 0:
+                    if finish_reason == "stop" or saw_stop_token:
+                        state["is_complete"] = True
+                        state["last_finish_reason"] = "eos"
+                        continue
                     # Enhanced diagnostic for empty output - CRITICAL for debugging
-                    logger.warning(f"[EMPTY OUTPUT] Step {global_step}, Sample {b}: No new tokens generated! "
-                                   f"finish_reason={finish_reason}, current_input_len={current_input_len}, "
-                                   f"max_remaining={max_remaining}, step_tokens_raw_len={len(step_tokens)}")
+                    logger.warning(
+                        f"[EMPTY OUTPUT] Step {global_step}, Sample {b}: No new tokens generated! "
+                        f"finish_reason={finish_reason}, current_input_len={current_input_len}, "
+                        f"max_remaining={max_remaining}, step_tokens_raw_len={len(step_tokens)}"
+                    )
 
                     # Show vLLM output details for debugging
                     if len(step_tokens) > 0:
                         # Show first few tokens to diagnose echo/padding
-                        first_tokens = step_tokens[:10] if len(step_tokens) >= 10 else step_tokens
-                        logger.warning(f"[EMPTY OUTPUT] step_tokens first 10: {first_tokens}")
+                        first_tokens = (
+                            step_tokens[:10] if len(step_tokens) >= 10 else step_tokens
+                        )
+                        logger.warning(
+                            f"[EMPTY OUTPUT] step_tokens first 10: {first_tokens}"
+                        )
                         # Check if it matches prompt (echo case not caught above)
-                        if len(step_tokens) <= len(state['prompt_tokens']):
-                            prefix_match = step_tokens == state['prompt_tokens'][:len(step_tokens)]
-                            logger.warning(f"[EMPTY OUTPUT] Matches prompt prefix? {prefix_match}")
+                        if len(step_tokens) <= len(state["prompt_tokens"]):
+                            prefix_match = (
+                                step_tokens
+                                == state["prompt_tokens"][: len(step_tokens)]
+                            )
+                            logger.warning(
+                                f"[EMPTY OUTPUT] Matches prompt prefix? {prefix_match}"
+                            )
                     else:
                         # vLLM returned completely empty - this is the critical case
-                        logger.error(f"[CRITICAL] Sample {b}: vLLM returned COMPLETELY EMPTY output! "
-                                    f"finish_reason={finish_reason}, max_remaining={max_remaining}, "
-                                    f"batch_idx={i}, global_step={global_step}")
+                        logger.error(
+                            f"[CRITICAL] Sample {b}: vLLM returned COMPLETELY EMPTY output! "
+                            f"finish_reason={finish_reason}, max_remaining={max_remaining}, "
+                            f"batch_idx={i}, global_step={global_step}"
+                        )
 
-                    state['is_complete'] = True
+                    state["is_complete"] = True
                     continue
 
                 # 关键：追加到 response_tokens（不是 prompt_tokens）
-                state['response_tokens'].extend(new_tokens)
-                state['loss_masks'].extend([1] * len(new_tokens))  # Model Gen = 1
-                state['step_count'] += 1
-                state['tokens_since_boundary'] += len(new_tokens)
+                state["response_tokens"].extend(new_tokens)
+                state["loss_masks"].extend([1] * len(new_tokens))  # Model Gen = 1
+                state["step_count"] += 1
+                state["tokens_since_boundary"] += len(new_tokens)
 
                 # If we have a pending hint, commit it only at a natural boundary.
                 # Only force-commit when the sample is about to finish (EOS / budget), to avoid mid-sentence insertions.
                 pending_hint = state.get("pending_hint")
                 if pending_hint:
                     try:
-                        state["pending_hint_delay_tokens"] = int(state.get("pending_hint_delay_tokens", 0)) + len(new_tokens)
+                        state["pending_hint_delay_tokens"] = int(
+                            state.get("pending_hint_delay_tokens", 0)
+                        ) + len(new_tokens)
                     except Exception:
                         state["pending_hint_delay_tokens"] = len(new_tokens)
 
                     # Decode tail for boundary detection and prefix choice.
                     tail = ""
                     try:
-                        tail = tokenizer.decode(state["response_tokens"][-int(pending_hint_tail_decode_tokens):], skip_special_tokens=True)
+                        tail = tokenizer.decode(
+                            state["response_tokens"][
+                                -int(pending_hint_tail_decode_tokens) :
+                            ],
+                            skip_special_tokens=True,
+                        )
                     except Exception:
                         tail = ""
 
                     force_commit = False
-                    if eos_token_id is not None and eos_token_id in new_tokens:
+                    if _find_first_eos_index(new_tokens, eos_token_ids) is not None:
                         force_commit = True
                     if len(new_tokens) >= int(sample_gen_remaining):
                         force_commit = True
+                    # If a think block is already closed, insert the hint before </think> immediately.
+                    if (
+                        _find_think_close_pos(state["response_tokens"], tokenizer)
+                        is not None
+                    ):
+                        force_commit = True
+                    # If a pending hint has waited too long, commit it even if we haven't hit a clean boundary.
+                    try:
+                        if int(pending_hint_max_delay_tokens) > 0 and int(
+                            state.get("pending_hint_delay_tokens", 0)
+                        ) >= int(pending_hint_max_delay_tokens):
+                            force_commit = True
+                    except Exception:
+                        pass
 
                     if force_commit or _is_natural_insert_boundary(tail):
                         hint = (pending_hint or "").strip()
                         if hint:
+                            # Roll back a trailing fragment so the hint can influence regenerated content
+                            # and won't be appended after an already-completed answer.
+                            rolled = _rollback_tail_for_hint(
+                                state,
+                                tokenizer,
+                                window_tokens=hint_rollback_window_tokens,
+                            )
+                            if rolled:
+                                state["tokens_since_boundary"] = 0
+
+                            try:
+                                tail = tokenizer.decode(
+                                    state["response_tokens"][
+                                        -int(pending_hint_tail_decode_tokens) :
+                                    ],
+                                    skip_special_tokens=True,
+                                )
+                            except Exception:
+                                tail = ""
+
                             prefix = _hint_prefix_for_tail(tail)
                             hint_text = f"{prefix}{hint}\n\n"
-                            hint_tokens = tokenizer.encode(hint_text, add_special_tokens=False)
+                            hint_tokens = tokenizer.encode(
+                                hint_text, add_special_tokens=False
+                            )
 
-                            # If EOS is in the newly generated tokens, insert BEFORE EOS so the hint is visible.
-                            inserted = False
-                            if eos_token_id is not None and eos_token_id in new_tokens:
-                                try:
-                                    eos_rel = new_tokens.index(eos_token_id)
-                                    eos_pos = len(state["response_tokens"]) - len(new_tokens) + int(eos_rel)
-                                    state["response_tokens"][eos_pos:eos_pos] = hint_tokens
-                                    state["loss_masks"][eos_pos:eos_pos] = [0] * len(hint_tokens)
-                                    inserted = True
-                                except Exception:
-                                    inserted = False
-
-                            if not inserted and hint_tokens:
-                                state["response_tokens"].extend(hint_tokens)
-                                state["loss_masks"].extend([0] * len(hint_tokens))
+                            # Prefer inserting before </think> (or before EOS as fallback).
+                            inserted = _insert_hint_tokens(
+                                state, hint_tokens, tokenizer, eos_token_ids
+                            )
+                            if (not inserted) and state.pop("_hint_skipped_late_stage", False):
+                                metrics["hint_skipped_late_stage"] += 1
+                                logger.info(
+                                    f"[HINT SKIP LATE] sample={b}, step={state.get('step_count', -1)}: skip pending hint after final answer marker."
+                                )
 
                             # 验证编码正确性（best-effort）
                             try:
-                                decoded = tokenizer.decode(hint_tokens, skip_special_tokens=True)
+                                decoded = tokenizer.decode(
+                                    hint_tokens, skip_special_tokens=True
+                                )
                                 if decoded != hint_text:
-                                    logger.warning(f"Hint encoding mismatch: expected '{hint_text}', got '{decoded}'")
+                                    logger.warning(
+                                        f"Hint encoding mismatch: expected '{hint_text}', got '{decoded}'"
+                                    )
                             except Exception:
                                 pass
 
@@ -2715,14 +3612,18 @@ class vLLMRollout(BaseRollout):
                 pending_complete_reason = None
                 if truncated:
                     if effective_budget == sample_gen_remaining:
-                        pending_complete_reason = 'gen_budget_exhausted'
+                        pending_complete_reason = "gen_budget_exhausted"
                     else:
-                        pending_complete_reason = 'context_budget_exhausted'
-                elif eos_token_id is not None and eos_token_id in new_tokens:
-                    pending_complete_reason = 'eos'
+                        pending_complete_reason = "context_budget_exhausted"
+                elif _find_first_eos_index(new_tokens, eos_token_ids) is not None:
+                    pending_complete_reason = "eos"
+                elif finish_reason == "stop" or saw_stop_token:
+                    pending_complete_reason = "eos"
+                # NOTE: In fixed-chunk mode we do not pass stop_sequences to vLLM. Therefore
+                # finish_reason == "stop" is only expected from stop_token_ids (EOS/pad/<|im_start|>).
                 # Hints do not consume the response budget; only model-generated tokens count.
-                elif sum(1 for m in state['loss_masks'] if m == 1) >= response_budget:
-                    pending_complete_reason = 'gen_budget_exhausted'
+                elif sum(1 for m in state["loss_masks"] if m == 1) >= response_budget:
+                    pending_complete_reason = "gen_budget_exhausted"
 
                 # Boundary detection for step/end markers.
                 boundary_hit = False
@@ -2730,130 +3631,272 @@ class vLLMRollout(BaseRollout):
                     boundary_hit = True
                 else:
                     for seq_ids in stop_seq_token_ids:
-                        if len(state['response_tokens']) >= len(seq_ids) and state['response_tokens'][-len(seq_ids):] == seq_ids:
+                        if (
+                            len(state["response_tokens"]) >= len(seq_ids)
+                            and state["response_tokens"][-len(seq_ids) :] == seq_ids
+                        ):
                             boundary_hit = True
                             break
 
                 # Verifier trigger policy (strict):
                 # 1) periodic trigger every min_step_tokens policy tokens;
                 # 2) for short outputs near completion, allow one final trigger when a boundary appears.
-                periodic_hit = state['tokens_since_boundary'] >= min_step_tokens
-                final_boundary_hit = (pending_complete_reason is not None) and boundary_hit
+                periodic_hit = state["tokens_since_boundary"] >= min_step_tokens
+                final_boundary_hit = (
+                    pending_complete_reason is not None
+                ) and boundary_hit
                 should_trigger_verifier = periodic_hit or final_boundary_hit
 
                 # Only request Verifier when trigger condition is met and no pending hint is waiting.
                 should_request_verifier = (
-                    (not state.get('is_complete', False))
-                    and (len(state['hints']) < intervention_policy.max_interventions)
+                    (not state.get("is_complete", False))
+                    and (len(state["hints"]) < intervention_policy.max_interventions)
                     and (not state.get("pending_hint"))
                     and should_trigger_verifier
                 )
 
                 if should_request_verifier:
                     if boundary_hit:
-                        metrics['stop_sequence_hits'] += 1
+                        metrics["stop_sequence_hits"] += 1
                     # Reset periodic window only when a verifier request is actually issued.
-                    state['tokens_since_boundary'] = 0
+                    state["tokens_since_boundary"] = 0
 
-                    # Prepare Verifier input
-                    current_reasoning = tokenizer.decode(state['response_tokens'], skip_special_tokens=True)
+                    # Prepare Verifier input from the same anchor where hint will be inserted.
+                    hint_anchor_keep = len(state["response_tokens"])
+                    tail_keep = _compute_tail_rollback_keep_len(
+                        state["response_tokens"],
+                        tokenizer,
+                        hint_rollback_window_tokens,
+                    )
+                    if tail_keep is not None:
+                        hint_anchor_keep = int(tail_keep)
+
+                    use_prethink_anchor = False
+                    anchor_tokens = state["response_tokens"][:hint_anchor_keep]
+                    if pending_complete_reason is not None and (not state.get("_prethink_rollback_used", False)):
+                        if (
+                            _find_think_close_pos(anchor_tokens, tokenizer) is None
+                            and _is_post_think_finalized(
+                                anchor_tokens,
+                                tokenizer,
+                                decode_tail_tokens=pending_hint_tail_decode_tokens,
+                            )
+                        ):
+                            prethink_keep = _find_prethink_rollback_keep_len(
+                                anchor_tokens, tokenizer
+                            )
+                            if (
+                                prethink_keep is not None
+                                and int(prethink_keep) < int(hint_anchor_keep)
+                            ):
+                                hint_anchor_keep = int(prethink_keep)
+                                use_prethink_anchor = True
+
+                    # Strong coupling: only request Verifier when a same-round insertion anchor exists.
+                    anchor_tokens = state["response_tokens"][:hint_anchor_keep]
+                    has_safe_think_anchor = (
+                        _find_think_close_pos(anchor_tokens, tokenizer) is not None
+                    )
+                    is_post_think_finalized = _is_post_think_finalized(
+                        anchor_tokens,
+                        tokenizer,
+                        decode_tail_tokens=pending_hint_tail_decode_tokens,
+                    )
+                    anchor_insertable = has_safe_think_anchor or (
+                        not is_post_think_finalized
+                    )
+                    if not anchor_insertable:
+                        metrics["verifier_skipped_no_insert_anchor"] += 1
+                        logger.info(
+                            f"[VERIFIER SKIP NO ANCHOR] sample={b}, step={state.get('step_count', -1)}: "
+                            "no safe insertion anchor (post-final and no think-close)."
+                        )
+                        continue
+
+                    verifier_state = {
+                        "response_tokens": list(state["response_tokens"][:hint_anchor_keep]),
+                        "loss_masks": list(state["loss_masks"][:hint_anchor_keep]),
+                    }
+                    current_reasoning = tokenizer.decode(
+                        verifier_state["response_tokens"], skip_special_tokens=True
+                    )
 
                     # CRITICAL FIX: Use training data format for Verifier input
                     # Format matches format_training_data.py: system -> user (intervene_prompt + question + student response)
                     # by_step mode: current_reasoning is the partial response so far
-                    verifier_question = state.get('verifier_question', state.get('prompt_text', ''))
-                    user_content = build_verifier_user_prompt(verifier_question, current_reasoning)
+                    verifier_question = state.get(
+                        "verifier_question", state.get("prompt_text", "")
+                    )
+                    user_content = build_verifier_user_prompt(
+                        verifier_question, current_reasoning
+                    )
                     verifier_input = user_content  # Will be formatted with system message in _run_verifier_inference
                     verifier_inputs.append(verifier_input)
-                    verifier_input_map.append((b, state['step_count']))
+                    verifier_input_map.append(
+                        (
+                            b,
+                            state["step_count"],
+                            int(hint_anchor_keep),
+                            bool(use_prethink_anchor),
+                        )
+                    )
 
                 # Verifier 输入准备完后再执行完成标记，确保短输出有机会被介入一次。
-                if pending_complete_reason is not None:
-                    state['is_complete'] = True
-                    if pending_complete_reason != 'eos':
-                        state['last_finish_reason'] = pending_complete_reason
+                state["_pending_complete_reason"] = pending_complete_reason
 
             # 6.7 批量调用 Verifier
             if verifier_inputs:
                 decisions, verifier_traj = self._run_verifier_inference(
-                    verifier_inputs, tokenizer, idx.device, exp_kwargs, return_trajectories=True
+                    verifier_inputs,
+                    tokenizer,
+                    idx.device,
+                    exp_kwargs,
+                    return_trajectories=True,
                 )
 
-                for i, (b, step_idx) in enumerate(verifier_input_map):
+                for i, (b, step_idx, hint_anchor_keep, use_prethink_anchor) in enumerate(
+                    verifier_input_map
+                ):
                     state = sample_states[b]
                     decision = decisions[i]
                     if decision.get("hint"):
-                        decision["hint"] = self._truncate_verifier_hint_tokens(decision["hint"], tokenizer)
+                        decision["hint"] = self._truncate_verifier_hint_tokens(
+                            decision["hint"], tokenizer
+                        )
 
                     # 记录 critique
-                    critique = decision.get('critique', decision.get('hint', ''))
-                    state['critiques'].append(critique)
+                    critique = decision.get("critique", decision.get("hint", ""))
+                    state["critiques"].append(critique)
 
                     # 使用 InterventionPolicy 判断是否应该干预
                     if intervention_policy.should_intervene(state, decision):
-                        hint = decision['hint']
-                        state['hints'].append(hint)
-                        metrics['total_interventions'] += 1
-                        if state.get("pending_hint"):
-                            # Avoid stacking multiple hints before the previous one is inserted.
-                            continue
-                        state["pending_hint"] = (hint or "").strip()
-                        state["pending_hint_delay_tokens"] = 0
+                        hint = decision["hint"]
+                        hint_applied = False
+
+                        # Restore to verifier anchor first, so generated hint context and
+                        # insertion position are strictly aligned.
+                        _rollback_state_to_keep_len(state, int(hint_anchor_keep))
+                        if use_prethink_anchor:
+                            state["_prethink_rollback_used"] = True
+
+                        # If anchor is still post-final and not a safe think-close insertion,
+                        # allow one best-effort rollback to prethink boundary.
+                        if (
+                            state.get("_pending_complete_reason") is not None
+                            and (
+                            _find_think_close_pos(state["response_tokens"], tokenizer)
+                            is None
+                            )
+                            and _is_post_think_finalized(
+                                state["response_tokens"],
+                                tokenizer,
+                                decode_tail_tokens=pending_hint_tail_decode_tokens,
+                            )
+                        ):
+                            _rollback_prethink_once(state, tokenizer)
+
+                        # Then trim tail fragment at the anchor view.
+                        _rollback_tail_for_hint(
+                            state,
+                            tokenizer,
+                            window_tokens=hint_rollback_window_tokens,
+                        )
+                        try:
+                            tail = tokenizer.decode(
+                                state["response_tokens"][
+                                    -int(pending_hint_tail_decode_tokens) :
+                                ],
+                                skip_special_tokens=True,
+                            )
+                        except Exception:
+                            tail = ""
+                        prefix = _hint_prefix_for_tail(tail)
+                        hint_text = f"{prefix}{(hint or '').strip()}\n\n"
+                        hint_tokens = tokenizer.encode(
+                            hint_text, add_special_tokens=False
+                        )
+                        if hint_tokens:
+                            inserted = _insert_hint_tokens(
+                                state, hint_tokens, tokenizer, eos_token_ids
+                            )
+                            if not inserted and state.pop("_hint_skipped_late_stage", False):
+                                metrics["hint_skipped_late_stage"] += 1
+                                logger.info(
+                                    f"[HINT SKIP LATE] sample={b}, step={step_idx}: skip hint insertion after final answer marker."
+                                )
+                            hint_applied = bool(inserted)
+
+                        if hint_applied:
+                            state["hints"].append(hint)
+                            metrics["total_interventions"] += 1
+                            state["_intervened_this_step"] = True
+                            state["tokens_since_boundary"] = 0
+
+                            # If the sample was about to finish (EOS/stop), keep it running so the hint
+                            # can affect the continuation.
+                            state["_pending_complete_reason"] = None
 
                         # Record verifier trajectories for training (prompt + full response + old logprobs).
                         try:
-                            if verifier_traj:
-                                parent_uid = str(prompt_uids[b]) if prompt_uids is not None else str(b)
-                                parent_sample_uid = str(prompt_sample_uids[b]) if prompt_sample_uids is not None else str(b)
+                            if verifier_traj and hint_applied:
+                                parent_uid = (
+                                    str(prompt_uids[b])
+                                    if prompt_uids is not None
+                                    else str(b)
+                                )
+                                parent_sample_uid = (
+                                    str(prompt_sample_uids[b])
+                                    if prompt_sample_uids is not None
+                                    else str(b)
+                                )
                                 prompt_token_ids = verifier_traj["prompt_token_ids"][i]
-                                response_ids = verifier_traj["responses"][i].detach().to("cpu")
-                                old_log_probs = verifier_traj["old_log_probs"][i].detach().to("cpu").to(torch.float32)
+                                response_ids = (
+                                    verifier_traj["responses"][i].detach().to("cpu")
+                                )
+                                old_log_probs = (
+                                    verifier_traj["old_log_probs"][i]
+                                    .detach()
+                                    .to("cpu")
+                                    .to(torch.float32)
+                                )
 
                                 verifier_train_prompt_token_ids.append(prompt_token_ids)
                                 verifier_train_response_ids.append(response_ids)
                                 verifier_train_old_log_probs.append(old_log_probs)
                                 verifier_train_parent_uids.append(parent_uid)
-                                verifier_train_parent_sample_uids.append(parent_sample_uid)
+                                verifier_train_parent_sample_uids.append(
+                                    parent_sample_uid
+                                )
                                 verifier_train_step_indices.append(int(step_idx))
                         except Exception as e:
-                            logger.warning(f"Failed to record verifier trajectory (b={b}, step_idx={step_idx}): {e}")
+                            logger.warning(
+                                f"Failed to record verifier trajectory (b={b}, step_idx={step_idx}): {e}"
+                            )
 
-                        # Try to commit immediately if we are already at a natural boundary.
-                        # Otherwise, it will be committed after more model tokens are generated.
-                        pending_hint = state.get("pending_hint")
-                        if pending_hint:
-                            try:
-                                tail = tokenizer.decode(
-                                    state["response_tokens"][-int(pending_hint_tail_decode_tokens):],
-                                    skip_special_tokens=True,
-                                )
-                            except Exception:
-                                tail = ""
-                            if _is_natural_insert_boundary(tail):
-                                prefix = _hint_prefix_for_tail(tail)
-                                hint_text = f"{prefix}{pending_hint}\n\n"
-                                hint_tokens = tokenizer.encode(hint_text, add_special_tokens=False)
-                                if hint_tokens:
-                                    state["response_tokens"].extend(hint_tokens)
-                                    state["loss_masks"].extend([0] * len(hint_tokens))  # Hint = 0 (No Loss)
-                                try:
-                                    decoded = tokenizer.decode(hint_tokens, skip_special_tokens=True)
-                                    if decoded != hint_text:
-                                        logger.warning(f"Hint encoding mismatch: expected '{hint_text}', got '{decoded}'")
-                                except Exception:
-                                    pass
-                                state["pending_hint"] = None
-                                state["pending_hint_delay_tokens"] = 0
+                        # no pending_hint: we insert immediately above.
 
-        remaining_active = [b for b in range(batch_size) if not sample_states[b].get('is_complete', False)]
+            # Finalize completion for this step.
+            for b in batch_indices:
+                st = sample_states[b]
+                reason = st.pop("_pending_complete_reason", None)
+                intervened = bool(st.pop("_intervened_this_step", False))
+                if reason is not None and (not intervened):
+                    st["is_complete"] = True
+                    st["last_finish_reason"] = reason
+
+        remaining_active = [
+            b
+            for b in range(batch_size)
+            if not sample_states[b].get("is_complete", False)
+        ]
         if remaining_active:
             logger.warning(
                 f"[BY_STEP] Reached max_steps={max_steps} with active_samples={len(remaining_active)}/{batch_size}; "
                 f"responses may be early-stopped (consider increasing max_steps or step-token caps)."
             )
             for b in remaining_active:
-                if not sample_states[b].get('last_finish_reason'):
-                    sample_states[b]['last_finish_reason'] = 'max_steps_exhausted'
+                if not sample_states[b].get("last_finish_reason"):
+                    sample_states[b]["last_finish_reason"] = "max_steps_exhausted"
 
         # Flush any remaining pending hints (best-effort) so interventions are reflected in the response text.
         for state in sample_states:
@@ -2862,7 +3905,8 @@ class vLLMRollout(BaseRollout):
                 continue
             try:
                 tail = tokenizer.decode(
-                    state["response_tokens"][-int(pending_hint_tail_decode_tokens):], skip_special_tokens=True
+                    state["response_tokens"][-int(pending_hint_tail_decode_tokens) :],
+                    skip_special_tokens=True,
                 )
             except Exception:
                 tail = ""
@@ -2870,19 +3914,9 @@ class vLLMRollout(BaseRollout):
             hint_text = f"{prefix}{str(pending_hint).strip()}\n\n"
             hint_tokens = tokenizer.encode(hint_text, add_special_tokens=False)
             if hint_tokens:
-                inserted = False
-                if eos_token_id is not None and eos_token_id in state["response_tokens"]:
-                    try:
-                        # Insert before the *last* EOS if multiple are present (more robust than index()).
-                        eos_pos = len(state["response_tokens"]) - 1 - state["response_tokens"][::-1].index(eos_token_id)
-                        state["response_tokens"][eos_pos:eos_pos] = hint_tokens
-                        state["loss_masks"][eos_pos:eos_pos] = [0] * len(hint_tokens)
-                        inserted = True
-                    except Exception:
-                        inserted = False
-                if not inserted:
-                    state["response_tokens"].extend(hint_tokens)
-                    state["loss_masks"].extend([0] * len(hint_tokens))
+                inserted = _insert_hint_tokens(state, hint_tokens, tokenizer, eos_token_ids)
+                if (not inserted) and state.pop("_hint_skipped_late_stage", False):
+                    metrics["hint_skipped_late_stage"] += 1
             state["pending_hint"] = None
             state["pending_hint_delay_tokens"] = 0
 
@@ -2890,13 +3924,25 @@ class vLLMRollout(BaseRollout):
 
         # 7. 记录监控指标
         timing_info["exp_metrics"] = {
-            'avg_steps': sum(s['step_count'] for s in sample_states) / batch_size if batch_size > 0 else 0,
-            'intervention_rate': metrics['total_interventions'] / batch_size if batch_size > 0 else 0,
-            'stop_sequence_hit_rate': metrics['stop_sequence_hits'] / metrics['total_steps'] if metrics['total_steps'] > 0 else 0,
-            'error_rate': metrics['errors'] / batch_size if batch_size > 0 else 0,
+            "avg_steps": sum(s["step_count"] for s in sample_states) / batch_size
+            if batch_size > 0
+            else 0,
+            "intervention_rate": metrics["total_interventions"] / batch_size
+            if batch_size > 0
+            else 0,
+            "stop_sequence_hit_rate": metrics["stop_sequence_hits"]
+            / metrics["total_steps"]
+            if metrics["total_steps"] > 0
+            else 0,
+            "error_rate": metrics["errors"] / batch_size if batch_size > 0 else 0,
         }
-        logger.info(f"[BY_STEP] metrics: avg_steps={timing_info['exp_metrics']['avg_steps']:.1f}, "
-                   f"interventions={metrics['total_interventions']}, errors={metrics['errors']}")
+        logger.info(
+            f"[BY_STEP] metrics: avg_steps={timing_info['exp_metrics']['avg_steps']:.1f}, "
+            f"interventions={metrics['total_interventions']}, "
+            f"hint_skipped_late_stage={metrics['hint_skipped_late_stage']}, "
+            f"verifier_skipped_no_insert_anchor={metrics['verifier_skipped_no_insert_anchor']}, "
+            f"errors={metrics['errors']}"
+        )
 
         # 8. 数据后处理：构建完整的 DataProto（关键修正）
         exp_input_ids_list = []
@@ -2907,7 +3953,7 @@ class vLLMRollout(BaseRollout):
         exp_last_valid_pos_list = []
         all_hints = []
         all_critiques = []
-        
+
         for b in range(batch_size):
             state = sample_states[b]
             # -----------------------------------------------------------------
@@ -2942,13 +3988,25 @@ class vLLMRollout(BaseRollout):
                 else torch.tensor([], dtype=torch.long, device=idx.device)
             )
             if prompt_ids.numel() == 0:
-                prompt_seg_ids = torch.full((prompt_budget,), self.pad_token_id, dtype=torch.long, device=idx.device)
-                prompt_seg_att = torch.zeros((prompt_budget,), dtype=torch.long, device=idx.device)
+                prompt_seg_ids = torch.full(
+                    (prompt_budget,),
+                    self.pad_token_id,
+                    dtype=torch.long,
+                    device=idx.device,
+                )
+                prompt_seg_att = torch.zeros(
+                    (prompt_budget,), dtype=torch.long, device=idx.device
+                )
             else:
                 prompt_seg_ids = pad_sequence_to_length(
-                    prompt_ids.unsqueeze(0), prompt_budget, self.pad_token_id, left_pad=True
+                    prompt_ids.unsqueeze(0),
+                    prompt_budget,
+                    self.pad_token_id,
+                    left_pad=True,
                 ).squeeze(0)
-                prompt_seg_att = pad_sequence_to_length(prompt_att.unsqueeze(0), prompt_budget, 0, left_pad=True).squeeze(0)
+                prompt_seg_att = pad_sequence_to_length(
+                    prompt_att.unsqueeze(0), prompt_budget, 0, left_pad=True
+                ).squeeze(0)
 
             # 8.2 Response segment (right-pad); ensure ids and loss_masks stay aligned.
             response_tokens = list(state.get("response_tokens") or [])
@@ -2989,19 +4047,37 @@ class vLLMRollout(BaseRollout):
             )
 
             if resp_ids.numel() == 0:
-                resp_seg_ids = torch.full((response_total_budget,), self.pad_token_id, dtype=torch.long, device=idx.device)
-                resp_seg_att = torch.zeros((response_total_budget,), dtype=torch.long, device=idx.device)
-                resp_seg_loss = torch.zeros((response_total_budget,), dtype=torch.long, device=idx.device)
+                resp_seg_ids = torch.full(
+                    (response_total_budget,),
+                    self.pad_token_id,
+                    dtype=torch.long,
+                    device=idx.device,
+                )
+                resp_seg_att = torch.zeros(
+                    (response_total_budget,), dtype=torch.long, device=idx.device
+                )
+                resp_seg_loss = torch.zeros(
+                    (response_total_budget,), dtype=torch.long, device=idx.device
+                )
             else:
-                resp_seg_ids = pad_sequence_to_length(resp_ids.unsqueeze(0), response_total_budget, self.pad_token_id).squeeze(0)
-                resp_seg_att = pad_sequence_to_length(resp_att.unsqueeze(0), response_total_budget, 0).squeeze(0)
-                resp_seg_loss = pad_sequence_to_length(resp_loss.unsqueeze(0), response_total_budget, 0).squeeze(0)
+                resp_seg_ids = pad_sequence_to_length(
+                    resp_ids.unsqueeze(0), response_total_budget, self.pad_token_id
+                ).squeeze(0)
+                resp_seg_att = pad_sequence_to_length(
+                    resp_att.unsqueeze(0), response_total_budget, 0
+                ).squeeze(0)
+                resp_seg_loss = pad_sequence_to_length(
+                    resp_loss.unsqueeze(0), response_total_budget, 0
+                ).squeeze(0)
 
             # 8.3 Assemble full sequence (fixed boundary at prompt_budget)
             full_ids = torch.cat([prompt_seg_ids, resp_seg_ids], dim=0)
             att_mask = torch.cat([prompt_seg_att, resp_seg_att], dim=0)
             loss_mask = torch.cat(
-                [torch.zeros((prompt_budget,), dtype=torch.long, device=idx.device), resp_seg_loss],
+                [
+                    torch.zeros((prompt_budget,), dtype=torch.long, device=idx.device),
+                    resp_seg_loss,
+                ],
                 dim=0,
             )
 
@@ -3010,72 +4086,108 @@ class vLLMRollout(BaseRollout):
             pos_ids = pos_ids.to(torch.long)
 
             # Track last valid position in the response segment (hints included but capped by response_budget).
-            exp_last_valid_pos_list.append(int(min(len(response_tokens), response_total_budget)))
+            exp_last_valid_pos_list.append(
+                int(min(len(response_tokens), response_total_budget))
+            )
 
             exp_input_ids_list.append(full_ids)
             exp_attention_mask_list.append(att_mask)
             exp_loss_mask_list.append(loss_mask)
             exp_position_ids_list.append(pos_ids)
             exp_responses_list.append(resp_seg_ids)
-            
-            all_hints.append("\n".join(state['hints']))
-            all_critiques.append("\n---\n".join(state['critiques']) if state['critiques'] else "No interventions")
-        
+
+            all_hints.append("\n".join(state["hints"]))
+            all_critiques.append(
+                "\n---\n".join(state["critiques"])
+                if state["critiques"]
+                else "No interventions"
+            )
+
         # 9. Stack Tensors
         exp_input_ids = torch.stack(exp_input_ids_list)  # [batch_size, total_len]
         exp_attention_mask = torch.stack(exp_attention_mask_list)
         exp_loss_mask = torch.stack(exp_loss_mask_list)  # 关键新增
         exp_position_ids = torch.stack(exp_position_ids_list)
         exp_responses = torch.stack(exp_responses_list)  # [batch_size, response_length]
-        
+
         # 10. 构建完整的 DataProto（参考现有实现）
-        exp_last_valid_pos = torch.tensor(exp_last_valid_pos_list, dtype=torch.long, device=idx.device)
+        exp_last_valid_pos = torch.tensor(
+            exp_last_valid_pos_list, dtype=torch.long, device=idx.device
+        )
         from tensordict import TensorDict
+
         batch_dict = {
-            'exp_input_ids': exp_input_ids,
-            'exp_attention_mask': exp_attention_mask,
-            'exp_position_ids': exp_position_ids,
-            'exp_loss_mask': exp_loss_mask,  # 关键新增
-            'exp_responses': exp_responses,
-            'exp_last_valid_pos': exp_last_valid_pos,
+            "exp_input_ids": exp_input_ids,
+            "exp_attention_mask": exp_attention_mask,
+            "exp_position_ids": exp_position_ids,
+            "exp_loss_mask": exp_loss_mask,  # 关键新增
+            "exp_responses": exp_responses,
+            "exp_last_valid_pos": exp_last_valid_pos,
         }
 
         if stream_mode in ("both", "control"):
             # Control stream data
             # Pad to match exp response window so Co-GRPO can mix streams without shape mismatch.
             if control_responses is None:
-                raise RuntimeError("stream_mode includes control but control_responses is None")
+                raise RuntimeError(
+                    "stream_mode includes control but control_responses is None"
+                )
             if control_log_probs is None:
-                raise RuntimeError("stream_mode includes control but control_log_probs is None")
+                raise RuntimeError(
+                    "stream_mode includes control but control_log_probs is None"
+                )
 
-            control_responses = pad_sequence_to_length(control_responses, response_total_budget, self.pad_token_id)
+            control_responses = pad_sequence_to_length(
+                control_responses, response_total_budget, self.pad_token_id
+            )
             # control_log_probs uses -1 padding in other helpers; keep 0 for masked tokens.
-            control_log_probs = pad_sequence_to_length(control_log_probs, response_total_budget, 0)
+            control_log_probs = pad_sequence_to_length(
+                control_log_probs, response_total_budget, 0
+            )
 
             control_seq = torch.cat([idx, control_responses], dim=-1)
-            control_att = torch.cat([attention_mask, (control_responses != self.pad_token_id).to(attention_mask.dtype)], dim=-1)
+            control_att = torch.cat(
+                [
+                    attention_mask,
+                    (control_responses != self.pad_token_id).to(attention_mask.dtype),
+                ],
+                dim=-1,
+            )
             control_pos = (control_att.cumsum(dim=1) - 1) * control_att
             control_pos = control_pos.to(torch.long)
-            control_last_valid_pos = (control_att[:, -response_total_budget:].sum(dim=1)).to(torch.long)
+            control_last_valid_pos = (
+                control_att[:, -response_total_budget:].sum(dim=1)
+            ).to(torch.long)
 
-            batch_dict.update({
-                'control_input_ids': control_seq,
-                'control_attention_mask': control_att,
-                'control_position_ids': control_pos,
-                'control_rollout_log_probs': control_log_probs,
-                'control_last_valid_pos': control_last_valid_pos,
-                'control_responses': control_responses,  # Add responses separately for trainer
-            })
+            batch_dict.update(
+                {
+                    "control_input_ids": control_seq,
+                    "control_attention_mask": control_att,
+                    "control_position_ids": control_pos,
+                    "control_rollout_log_probs": control_log_probs,
+                    "control_last_valid_pos": control_last_valid_pos,
+                    "control_responses": control_responses,  # Add responses separately for trainer
+                }
+            )
 
         # Provide per-stream response masks to avoid trainer-side recomputation (and to correctly ignore PADs).
         # Combine: before-eos mask AND non-pad mask.
         from verl.utils.torch_functional import get_response_mask
-        exp_response_mask = get_response_mask(exp_responses, eos_token=eos_token_id, dtype=exp_attention_mask.dtype)
-        exp_response_mask = exp_response_mask * (exp_responses != self.pad_token_id).to(exp_attention_mask.dtype)
+
+        exp_response_mask = get_response_mask(
+            exp_responses, eos_token=eos_token_id, dtype=exp_attention_mask.dtype
+        )
+        exp_response_mask = exp_response_mask * (exp_responses != self.pad_token_id).to(
+            exp_attention_mask.dtype
+        )
         batch_dict["exp_response_mask"] = exp_response_mask
         if stream_mode in ("both", "control"):
-            control_response_mask = get_response_mask(control_responses, eos_token=eos_token_id, dtype=control_att.dtype)
-            control_response_mask = control_response_mask * (control_responses != self.pad_token_id).to(control_att.dtype)
+            control_response_mask = get_response_mask(
+                control_responses, eos_token=eos_token_id, dtype=control_att.dtype
+            )
+            control_response_mask = control_response_mask * (
+                control_responses != self.pad_token_id
+            ).to(control_att.dtype)
             batch_dict["control_response_mask"] = control_response_mask
 
         # 11. 构建 TensorDict batch
@@ -3096,31 +4208,95 @@ class vLLMRollout(BaseRollout):
                 if isinstance(val, np.ndarray) and val.shape[0] == original_batch_size:
                     non_tensor_batch[key] = _repeat_interleave(val, repeat_factor)
 
-        non_tensor_batch.update({
-            'exp_prompts': np.array([state['prompt_text'] for state in sample_states], dtype=object),
-            'exp_responses': np.array([tokenizer.decode(exp_responses[i].tolist(), skip_special_tokens=False) for i in range(batch_size)], dtype=object),
-            'hints': np.array(all_hints, dtype=object),
-            'critiques': np.array(all_critiques, dtype=object),
-            'num_interventions': np.array([len(state['hints']) for state in sample_states], dtype=np.int32),
-            'hint_token_counts': np.array([
-                sum(len(tokenizer.encode(h, add_special_tokens=False)) for h in state['hints'])
-                if state['hints'] else 0
-                for state in sample_states
-            ], dtype=np.int32),
-            # Extra diagnostics for dump/offline analysis
-            'prompt_len': np.array([len(state['prompt_tokens']) for state in sample_states], dtype=np.int32),
-            'response_len': np.array([len(state['response_tokens']) for state in sample_states], dtype=np.int32),
-            'gen_len': np.array([sum(1 for m in state['loss_masks'] if m == 1) for state in sample_states], dtype=np.int32),
-            'hint_len': np.array([sum(1 for m in state['loss_masks'] if m == 0) for state in sample_states], dtype=np.int32),
-            'last_finish_reason': np.array([state.get('last_finish_reason') for state in sample_states], dtype=object),
-            'context_exhausted': np.array([state.get('context_exhausted', False) for state in sample_states], dtype=np.bool_),
-            'first_step_tokens_len': np.array([state.get('first_step_tokens_len') for state in sample_states], dtype=object),
-        })
+        non_tensor_batch.update(
+            {
+                "exp_prompts": np.array(
+                    [state["prompt_text"] for state in sample_states], dtype=object
+                ),
+                "exp_responses": np.array(
+                    [
+                        tokenizer.decode(
+                            exp_responses[i].tolist(), skip_special_tokens=False
+                        )
+                        for i in range(batch_size)
+                    ],
+                    dtype=object,
+                ),
+                "hints": np.array(all_hints, dtype=object),
+                "critiques": np.array(all_critiques, dtype=object),
+                "num_interventions": np.array(
+                    [len(state["hints"]) for state in sample_states], dtype=np.int32
+                ),
+                "hint_token_counts": np.array(
+                    [
+                        sum(
+                            len(tokenizer.encode(h, add_special_tokens=False))
+                            for h in state["hints"]
+                        )
+                        if state["hints"]
+                        else 0
+                        for state in sample_states
+                    ],
+                    dtype=np.int32,
+                ),
+                # Extra diagnostics for dump/offline analysis
+                "prompt_len": np.array(
+                    [len(state["prompt_tokens"]) for state in sample_states],
+                    dtype=np.int32,
+                ),
+                "response_len": np.array(
+                    [len(state["response_tokens"]) for state in sample_states],
+                    dtype=np.int32,
+                ),
+                "gen_len": np.array(
+                    [
+                        sum(1 for m in state["loss_masks"] if m == 1)
+                        for state in sample_states
+                    ],
+                    dtype=np.int32,
+                ),
+                "hint_len": np.array(
+                    [
+                        sum(1 for m in state["loss_masks"] if m == 0)
+                        for state in sample_states
+                    ],
+                    dtype=np.int32,
+                ),
+                "last_finish_reason": np.array(
+                    [state.get("last_finish_reason") for state in sample_states],
+                    dtype=object,
+                ),
+                "context_exhausted": np.array(
+                    [state.get("context_exhausted", False) for state in sample_states],
+                    dtype=np.bool_,
+                ),
+                "first_step_tokens_len": np.array(
+                    [state.get("first_step_tokens_len") for state in sample_states],
+                    dtype=object,
+                ),
+            }
+        )
         if stream_mode in ("both", "control"):
-            non_tensor_batch.update({
-                'control_prompts': np.array([tokenizer.decode(idx[i].tolist(), skip_special_tokens=False) for i in range(batch_size)], dtype=object),
-                'control_responses': np.array([tokenizer.decode(control_responses[i].tolist(), skip_special_tokens=False) for i in range(batch_size)], dtype=object),
-            })
+            non_tensor_batch.update(
+                {
+                    "control_prompts": np.array(
+                        [
+                            tokenizer.decode(idx[i].tolist(), skip_special_tokens=False)
+                            for i in range(batch_size)
+                        ],
+                        dtype=object,
+                    ),
+                    "control_responses": np.array(
+                        [
+                            tokenizer.decode(
+                                control_responses[i].tolist(), skip_special_tokens=False
+                            )
+                            for i in range(batch_size)
+                        ],
+                        dtype=object,
+                    ),
+                }
+            )
 
         # Ensure all vector-like fields in non_tensor_batch align with batch_size
         for key, val in list(non_tensor_batch.items()):
@@ -3141,7 +4317,7 @@ class vLLMRollout(BaseRollout):
                 non_tensor_batch[key] = np.array(val, dtype=object)
 
         # 13. 释放 KV Cache
-        if hasattr(self.inference_engine, 'sleep_mode'):
+        if hasattr(self.inference_engine, "sleep_mode"):
             try:
                 self.inference_engine.sleep(level=1)
             except AttributeError:
@@ -3164,17 +4340,36 @@ class vLLMRollout(BaseRollout):
 
             verifier_prompt_len = max(len(p) for p in verifier_train_prompt_token_ids)
             verifier_prompt_ids = pad_2d_list_to_length(
-                verifier_train_prompt_token_ids, self.pad_token_id, max_length=verifier_prompt_len, left=True
+                verifier_train_prompt_token_ids,
+                self.pad_token_id,
+                max_length=verifier_prompt_len,
+                left=True,
             ).to("cpu")
-            verifier_prompt_att = (verifier_prompt_ids != self.pad_token_id).to(torch.long)
+            verifier_prompt_att = (verifier_prompt_ids != self.pad_token_id).to(
+                torch.long
+            )
 
-            verifier_responses = torch.stack(verifier_train_response_ids, dim=0).to("cpu")
-            verifier_old_log_probs = torch.stack(verifier_train_old_log_probs, dim=0).to("cpu").to(torch.float32)
-            verifier_response_att = (verifier_responses != self.pad_token_id).to(torch.long)
+            verifier_responses = torch.stack(verifier_train_response_ids, dim=0).to(
+                "cpu"
+            )
+            verifier_old_log_probs = (
+                torch.stack(verifier_train_old_log_probs, dim=0)
+                .to("cpu")
+                .to(torch.float32)
+            )
+            verifier_response_att = (verifier_responses != self.pad_token_id).to(
+                torch.long
+            )
 
-            verifier_input_ids = torch.cat([verifier_prompt_ids, verifier_responses], dim=1)
-            verifier_attention_mask = torch.cat([verifier_prompt_att, verifier_response_att], dim=1)
-            verifier_position_ids = (verifier_attention_mask.cumsum(dim=1) - 1) * verifier_attention_mask
+            verifier_input_ids = torch.cat(
+                [verifier_prompt_ids, verifier_responses], dim=1
+            )
+            verifier_attention_mask = torch.cat(
+                [verifier_prompt_att, verifier_response_att], dim=1
+            )
+            verifier_position_ids = (
+                verifier_attention_mask.cumsum(dim=1) - 1
+            ) * verifier_attention_mask
 
             verifier_batch = TensorDict(
                 {
@@ -3189,7 +4384,9 @@ class vLLMRollout(BaseRollout):
 
             verifier_non_tensor_batch = {
                 "parent_uid": np.array(verifier_train_parent_uids, dtype=object),
-                "parent_sample_uid": np.array(verifier_train_parent_sample_uids, dtype=object),
+                "parent_sample_uid": np.array(
+                    verifier_train_parent_sample_uids, dtype=object
+                ),
                 "step_idx": np.array(verifier_train_step_indices, dtype=np.int32),
             }
             verifier_meta_info = {
@@ -3198,10 +4395,14 @@ class vLLMRollout(BaseRollout):
                 "verifier_response_len": int(verifier_responses.size(1)),
             }
             meta_info["verifier_batch"] = DataProto(
-                batch=verifier_batch, non_tensor_batch=verifier_non_tensor_batch, meta_info=verifier_meta_info
+                batch=verifier_batch,
+                non_tensor_batch=verifier_non_tensor_batch,
+                meta_info=verifier_meta_info,
             )
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
+        return DataProto(
+            batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info
+        )
 
 
 class vLLMAsyncRollout(vLLMRollout):
@@ -3209,15 +4410,21 @@ class vLLMAsyncRollout(vLLMRollout):
     which is engine in single worker process.
     """
 
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
+    def __init__(
+        self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs
+    ):
         # Skip vLLMRollout.__init__ to avoid building a local LLM engine.
         BaseRollout.__init__(self)
         self.config = config
         self.tokenizer = tokenizer
-        assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
+        assert not (not config.enforce_eager and config.free_cache_engine), (
+            "disable CUDA graph (enforce_eager = False) if free cache engine"
+        )
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
+        assert tensor_parallel_size <= torch.distributed.get_world_size(), (
+            "tensor parallel size should be less than or equal to the world size"
+        )
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
         if kwargs.get("train_tp") is not None:
@@ -3229,26 +4436,46 @@ class vLLMAsyncRollout(vLLMRollout):
             ):
                 train_tp = kwargs.get("train_tp")
                 num_tp_per_train_tp = train_tp // tensor_parallel_size
-                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
+                vllm_ps.initialize_parallel_state(
+                    tensor_model_parallel_size=tensor_parallel_size,
+                    num_tp_per_train_tp=num_tp_per_train_tp,
+                )
             else:
-                vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
+                vllm_ps.initialize_model_parallel(
+                    tensor_model_parallel_size=tensor_parallel_size
+                )
 
         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
         if not rope_scaling_config:
             max_position_embeddings = None
             if hasattr(model_hf_config, "max_position_embeddings"):
                 max_position_embeddings = model_hf_config.max_position_embeddings
-            elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
-            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
+            elif hasattr(model_hf_config, "llm_config") and hasattr(
+                model_hf_config.llm_config, "max_position_embeddings"
+            ):
+                max_position_embeddings = (
+                    model_hf_config.llm_config.max_position_embeddings
+                )
+            elif hasattr(model_hf_config, "text_config") and hasattr(
+                model_hf_config.text_config, "max_position_embeddings"
+            ):
+                max_position_embeddings = (
+                    model_hf_config.text_config.max_position_embeddings
+                )
             if max_position_embeddings is None:
                 raise ValueError("max_position_embeddings not found in model_hf_config")
 
-            assert max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
+            assert (
+                max_position_embeddings >= config.prompt_length + config.response_length
+            ), "model context length should be greater than total sequence length"
 
-        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
-        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+        max_model_len = int(
+            config.max_model_len or config.prompt_length + config.response_length
+        )
+        if (
+            max_num_batched_tokens < max_model_len
+            and self.config.enable_chunked_prefill
+        ):
             raise ValueError(
                 "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, "
                 "please increase max_num_batched_tokens or disable chunked prefill"
@@ -3261,20 +4488,29 @@ class vLLMAsyncRollout(vLLMRollout):
         self.lora_kwargs = lora_kwargs
         verifier_lora_name = kwargs.pop("verifier_lora_name", None)
         verifier_lora_path = kwargs.pop("verifier_lora_path", None)
-        self.enable_kv_cache_optimization = _as_bool(kwargs.pop("enable_kv_cache_optimization", True))
+        self.enable_kv_cache_optimization = _as_bool(
+            kwargs.pop("enable_kv_cache_optimization", True)
+        )
 
         sampling_kwargs = dict(
             n=1,
             logprobs=0,
             max_tokens=config.response_length,
         )
-        has_stop_params = config.get("stop", None) is not None or config.get("stop_token_ids", None) is not None
+        has_stop_params = (
+            config.get("stop", None) is not None
+            or config.get("stop_token_ids", None) is not None
+        )
         if vllm_version != "0.3.1":
             sampling_kwargs["detokenize"] = has_stop_params
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)):
                 sampling_kwargs[k] = config.get(k)
-        if "stop_token_ids" in sampling_kwargs and sampling_kwargs["stop_token_ids"] is not None and not isinstance(sampling_kwargs["stop_token_ids"], list):
+        if (
+            "stop_token_ids" in sampling_kwargs
+            and sampling_kwargs["stop_token_ids"] is not None
+            and not isinstance(sampling_kwargs["stop_token_ids"], list)
+        ):
             sampling_kwargs["stop_token_ids"] = list(sampling_kwargs["stop_token_ids"])
         self.sampling_params = SamplingParams(**sampling_kwargs)
 
@@ -3282,8 +4518,14 @@ class vLLMAsyncRollout(vLLMRollout):
         if verifier_lora_name is not None:
             self.verifier_lora_name = verifier_lora_name
         else:
-            self.verifier_lora_name = self.config.get("verifier_lora_name", "verifier_lora")
-        self.verifier_lora_path = verifier_lora_path if verifier_lora_path else self.config.get("verifier", {}).get("lora_path", None)
+            self.verifier_lora_name = self.config.get(
+                "verifier_lora_name", "verifier_lora"
+            )
+        self.verifier_lora_path = (
+            verifier_lora_path
+            if verifier_lora_path
+            else self.config.get("verifier", {}).get("lora_path", None)
+        )
         self.verifier_lora_int_id = None
 
         # Engine is deferred to be initialized in init_worker.
@@ -3335,22 +4577,22 @@ class vLLMAsyncRollout(vLLMRollout):
             return self.inference_engine.execute_method(method, *args, **kwargs)
 
     def _run_verifier_inference(
-        self, 
-        verifier_inputs: List[str], 
-        tokenizer, 
-        idx_device: torch.device, 
+        self,
+        verifier_inputs: List[str],
+        tokenizer,
+        idx_device: torch.device,
         exp_kwargs: Dict[str, Any],
         return_trajectories: bool = False,
     ) -> Union[List[Dict[str, Any]], tuple[List[Dict[str, Any]], Dict[str, Any]]]:
         """
         批量调用 Verifier 进行推理。
-        
+
         Args:
             verifier_inputs: List[str] - Verifier 输入文本列表
             tokenizer: Tokenizer instance
             idx_device: Device for tensors
             exp_kwargs: Sampling parameters
-        
+
         Returns:
             If return_trajectories is False:
                 List[dict]: 每个输入的决策结果，包含 'action', 'hint', 'critique'
@@ -3359,7 +4601,7 @@ class vLLMAsyncRollout(vLLMRollout):
         """
         if not verifier_inputs:
             return ([], {}) if return_trajectories else []
-        
+
         try:
             # Register Verifier LoRA if needed
             if self.verifier_lora_int_id is None:
@@ -3372,12 +4614,10 @@ class vLLMAsyncRollout(vLLMRollout):
             for verifier_prompt in verifier_inputs:
                 messages = [
                     {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
-                    {"role": "user", "content": verifier_prompt}
+                    {"role": "user", "content": verifier_prompt},
                 ]
                 chat_text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
+                    messages, tokenize=False, add_generation_prompt=True
                 )
                 verifier_chat_inputs.append(chat_text)
 
@@ -3390,12 +4630,14 @@ class vLLMAsyncRollout(vLLMRollout):
                 max_length=self.config.prompt_length + self.config.response_length,
             )
             verifier_input_ids = verifier_encoded["input_ids"].to(idx_device)
-            
+
             # 转换格式
             verifier_idx_list = []
             for i in range(len(verifier_inputs)):
-                verifier_idx_list.append(_pre_process_inputs(self.pad_token_id, verifier_input_ids[i]))
-            
+                verifier_idx_list.append(
+                    _pre_process_inputs(self.pad_token_id, verifier_input_ids[i])
+                )
+
             # 准备 LoRA requests
             verifier_lora_requests = None
             if self.verifier_lora_int_id is not None:
@@ -3428,19 +4670,24 @@ class vLLMAsyncRollout(vLLMRollout):
                     lora_request=verifier_lora_requests,
                     use_tqdm=False,
                 )
-            
+
             verifier_responses, verifier_log_probs = _extract_vllm_outputs(
-                verifier_output, self.pad_token_id, self.config.response_length, idx_device
+                verifier_output,
+                self.pad_token_id,
+                self.config.response_length,
+                idx_device,
             )
-            
+
             # 解析所有 Verifier 输出
             decisions = []
             for i in range(len(verifier_inputs)):
                 verifier_response = verifier_responses[i]
-                verifier_text = tokenizer.decode(verifier_response.tolist(), skip_special_tokens=True)
+                verifier_text = tokenizer.decode(
+                    verifier_response.tolist(), skip_special_tokens=True
+                )
                 decision = self._parse_verifier_decision(verifier_text)
                 decisions.append(decision)
-            
+
             if not return_trajectories:
                 return decisions
 
@@ -3449,35 +4696,43 @@ class vLLMAsyncRollout(vLLMRollout):
                 "responses": verifier_responses,
                 "old_log_probs": verifier_log_probs,
                 "temperature": verifier_temperature,
-                "max_new_tokens": int(getattr(self.sampling_params, "max_tokens", self.config.response_length)),
+                "max_new_tokens": int(
+                    getattr(
+                        self.sampling_params, "max_tokens", self.config.response_length
+                    )
+                ),
             }
             return decisions, trajectories
-            
+
         except Exception as e:
             logger.warning(f"Verifier inference failed: {e}")
             import traceback
+
             logger.warning(traceback.format_exc())
             # 返回默认决策（Pass）
-            fallback = [{'action': 'Pass', 'hint': None, 'critique': f'[Error: {str(e)}]'} for _ in verifier_inputs]
+            fallback = [
+                {"action": "Pass", "hint": None, "critique": f"[Error: {str(e)}]"}
+                for _ in verifier_inputs
+            ]
             return (fallback, {}) if return_trajectories else fallback
 
     @GPUMemoryLogger(role="vllm dual stream rollout spmd", logger=logger)
     @torch.no_grad()
     def dual_stream_rollout(
-        self, 
-        prompts: DataProto, 
+        self,
+        prompts: DataProto,
         intervention_mode: str = "by_response",
         stream_mode: str = "both",
         token_check_interval: int = 2048,
         entropy_threshold: float = 0.5,
         use_entropy_filter: bool = True,
-        **kwargs
+        **kwargs,
     ) -> DataProto:
         """
         Perform dual-stream rollout for Co-GRPO (SPMD version adapted for vLLM 0.10+):
         - Control Stream: Policy generates without Verifier guidance
         - Experimental Stream: Policy generates with Verifier intervention based on mode
-        
+
         Args:
             prompts: DataProto containing prompts
             intervention_mode: Verifier intervention mode. Options:
@@ -3486,15 +4741,15 @@ class vLLMAsyncRollout(vLLMRollout):
             token_check_interval: For by_token mode, check every N tokens (default: 5)
             entropy_threshold: For by_token mode, entropy threshold for filtering (default: 0.5)
             use_entropy_filter: For by_token mode, whether to use entropy filtering (default: True)
-            
+
         Returns:
             DataProto with control_responses, exp_responses, hints, critiques, and associated metadata
         """
         timing_info = {}
         start_time = time.time()
-        
+
         tokenizer = self.tokenizer  # Use stored tokenizer
-        
+
         # Wake up vllm model (new API)
         if self.config.free_cache_engine:
             try:
@@ -3512,15 +4767,17 @@ class vLLMAsyncRollout(vLLMRollout):
         position_ids = prompts.batch["position_ids"]
         eos_token_id = prompts.meta_info["eos_token_id"]
         batch_size = idx.size(0)
-        
+
         # Handle empty batch
         if batch_size == 0:
             empty_batch = TensorDict({}, batch_size=0)
             timing_info["total"] = time.time() - start_time
             meta_info = prompts.meta_info.copy()
             meta_info["timing"] = timing_info
-            return DataProto(batch=empty_batch, non_tensor_batch={}, meta_info=meta_info)
-        
+            return DataProto(
+                batch=empty_batch, non_tensor_batch={}, meta_info=meta_info
+            )
+
         # Route to appropriate intervention mode
         # TEMP: Disable by_response and by_token to focus on debugging by_step
         # if intervention_mode == "by_response":
@@ -3539,22 +4796,40 @@ class vLLMAsyncRollout(vLLMRollout):
             # CRITICAL FIX: Pass dual_stream_rollout's explicit parameters to _dual_stream_rollout_by_step via kwargs
             # Otherwise token_check_interval won't be passed because it's an explicit parameter of dual_stream_rollout,
             # not included in **kwargs automatically
-            kwargs['token_check_interval'] = token_check_interval
-            kwargs['entropy_threshold'] = entropy_threshold
-            kwargs['use_entropy_filter'] = use_entropy_filter
-            kwargs['stream_mode'] = stream_mode
+            kwargs["token_check_interval"] = token_check_interval
+            kwargs["entropy_threshold"] = entropy_threshold
+            kwargs["use_entropy_filter"] = use_entropy_filter
+            kwargs["stream_mode"] = stream_mode
             return self._dual_stream_rollout_by_step(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-                position_ids, eos_token_id, batch_size, **kwargs
+                prompts,
+                timing_info,
+                start_time,
+                tokenizer,
+                idx,
+                attention_mask,
+                position_ids,
+                eos_token_id,
+                batch_size,
+                **kwargs,
             )
         else:
             # Fallback: Force by_step mode for debugging
-            logger.warning(f"intervention_mode={intervention_mode} not supported yet, forcing by_step mode")
-            kwargs['token_check_interval'] = token_check_interval
-            kwargs['entropy_threshold'] = entropy_threshold
-            kwargs['use_entropy_filter'] = use_entropy_filter
-            kwargs['stream_mode'] = stream_mode
+            logger.warning(
+                f"intervention_mode={intervention_mode} not supported yet, forcing by_step mode"
+            )
+            kwargs["token_check_interval"] = token_check_interval
+            kwargs["entropy_threshold"] = entropy_threshold
+            kwargs["use_entropy_filter"] = use_entropy_filter
+            kwargs["stream_mode"] = stream_mode
             return self._dual_stream_rollout_by_step(
-                prompts, timing_info, start_time, tokenizer, idx, attention_mask,
-                position_ids, eos_token_id, batch_size, **kwargs
+                prompts,
+                timing_info,
+                start_time,
+                tokenizer,
+                idx,
+                attention_mask,
+                position_ids,
+                eos_token_id,
+                batch_size,
+                **kwargs,
             )

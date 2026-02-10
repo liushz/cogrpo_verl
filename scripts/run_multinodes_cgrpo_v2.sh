@@ -38,7 +38,7 @@ verifier_reward_mode="${28:-headroom}"
 verifier_reward_improve_coef="${29:-1.0}"
 verifier_reward_headroom_min="${30:-0.05}"
 
-trainer_rollout_dump_freq="${31:-5}"
+trainer_rollout_dump_freq="${31:-10}"
 trainer_dual_rollout_dump_freq="${32:-5}"
 use_dynamic_bsz="${33:-False}"
 micro_bsz_per_gpu="${34:-2}"
@@ -83,6 +83,11 @@ export VERL_NCCL_TIMEOUT_SEC="1800"
 export VERL_DEBUG="${verl_debug}"
 export REWARD_MODEL_URLS="${REWARD_MODEL_URLS:-http://100.101.166.1:22005/v1,http://100.101.166.1:22004/v1,http://100.101.166.1:22003/v1,http://100.101.166.1:22002/v1}"
 export REWARD_MODEL_KEY="${REWARD_MODEL_KEY:-EMPTY}"
+
+# Bypass any HTTP proxy for internal reward endpoints.
+reward_proxy_hosts="$(echo "${REWARD_MODEL_URLS}" | tr ',' '\n' | sed -E 's#^[a-zA-Z]+://##; s#/.*$##; s#:.*$##' | paste -sd',' -)"
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${reward_proxy_hosts},localhost,127.0.0.1"
+export no_proxy="${NO_PROXY}"
 
 # Ray config
 ray_port="${RAY_PORT:-8266}"
@@ -134,8 +139,26 @@ fi
 # Actor-generated tokens are still capped by max_response_length inside the rollout worker.
 hint_headroom="$((max_interventions * estimated_hint_tokens))"
 max_model_len="$((max_prompt_length + max_response_length + hint_headroom))"
+
+# Verifier uses the same vLLM engine. Ensure engine max_model_len is large enough
+# for (verifier prompt budget) + (verifier max_new_tokens), otherwise verifier output
+# gets truncated before reaching the final decision line.
+min_model_len_for_verifier="$((verifier_max_prompt_length + verifier_max_new_tokens))"
+if [ "${max_model_len}" -lt "${min_model_len_for_verifier}" ]; then
+  max_model_len="${min_model_len_for_verifier}"
+fi
+
 if [ "${max_model_len}" -gt "${model_max_len_cap}" ]; then
   max_model_len="${model_max_len_cap}"
+fi
+
+echo "[launcher] prompt=${max_prompt_length} response=${max_response_length} max_interventions=${max_interventions} estimated_hint_tokens=${estimated_hint_tokens}"
+echo "[launcher] verifier_max_prompt_length=${verifier_max_prompt_length} verifier_max_new_tokens=${verifier_max_new_tokens} verifier_max_hint_tokens=${verifier_max_hint_tokens}"
+echo "[launcher] max_model_len=${max_model_len} (cap=${model_max_len_cap})"
+
+# Sanity: verifier prompt budget must fit after reserving output tokens.
+if [ "$((max_model_len - verifier_max_new_tokens))" -lt "${verifier_max_prompt_length}" ]; then
+  echo "[launcher][WARN] verifier prompt budget may be clamped: max_model_len(${max_model_len}) - verifier_max_new_tokens(${verifier_max_new_tokens}) < verifier_max_prompt_length(${verifier_max_prompt_length})" >&2
 fi
 
 # rollout micro-batching knobs
@@ -207,13 +230,15 @@ if [ "${NODE_RANK}" = "0" ]; then
   TARGET_GPU="$((nnodes * n_gpus_per_node))"
   CHECK_INTERVAL=10
   get_ray_gpu() {
-    ray status 2>/dev/null | awk '
+    # With `set -o pipefail`, `ray status` may be non-zero while ray boots;
+    # avoid emitting duplicate lines like "0\n0".
+    { ray status 2>/dev/null || true; } | awk '
       /GPU[s]?[[:space:]]*$/ {
         split($1, a, "/");
         if (a[2] != "") { print int(a[2]); found=1; exit }
       }
       END { if (!found) print 0 }
-    ' || echo 0
+    ' | head -n 1 | tr -d "[:space:]"
   }
   while true; do
     GPU_COUNT="$(get_ray_gpu)"

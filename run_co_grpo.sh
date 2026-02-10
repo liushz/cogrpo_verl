@@ -20,6 +20,14 @@ gen_tp=1
 gpu_memory_utilization=0.8
 verl_debug=1
 
+# =========================
+# rjob resource requests
+# =========================
+# NOTE: Allow overriding via env/flags for quick scheduling experiments.
+# Default stays at the original value (128).
+rjob_cpu="${RJOB_CPU:-128}"
+rjob_memory="${RJOB_MEMORY:-1200000}"
+
 preset="full"
 co_grpo_mode="full"
 resume_dir=""
@@ -106,6 +114,8 @@ while [ "$#" -gt 0 ]; do
         --verifier-headroom-min) verifier_reward_headroom_min="$2"; shift 2 ;;
         --response-n) response_n="$2"; shift 2 ;;
         --train-batch-size) train_batch_size="$2"; shift 2 ;;
+        --rjob-cpu) rjob_cpu="$2"; shift 2 ;;
+        --rjob-memory) rjob_memory="$2"; shift 2 ;;
         -h|--help)
             echo "Usage: bash run_co_grpo.sh [options]"
             echo "  --ablation-tag <tag>"
@@ -125,6 +135,8 @@ while [ "$#" -gt 0 ]; do
             echo "  --verifier-headroom-min <float>"
             echo "  --response-n <int>"
             echo "  --train-batch-size <int>"
+            echo "  --rjob-cpu <int>"
+            echo "  --rjob-memory <int>"
             exit 0
             ;;
         *)
@@ -146,13 +158,14 @@ echo "[run_co_grpo] name=${rjob_name} nnodes=${nnodes} gpu_per_node=${n_gpus_per
 echo "[run_co_grpo] exp=${exp_name} mode=${co_grpo_mode} preset=${preset}"
 echo "[run_co_grpo] response_n=${response_n} train_batch_size=${train_batch_size}"
 echo "[run_co_grpo] token_check_interval=${token_check_interval} min_step_tokens=${min_step_tokens} max_interventions=${max_interventions}"
+echo "[run_co_grpo] rjob_cpu=${rjob_cpu} rjob_memory=${rjob_memory}"
 
 # rjob delete "${rjob_name}" || true
 rjob submit \
     --name="${rjob_name}" \
     --gpu="${n_gpus_per_node}" \
-    --memory=1200000 \
-    --cpu=128 \
+    --memory="${rjob_memory}" \
+    --cpu="${rjob_cpu}" \
     --charged-group="${cluster}" \
     --private-machine=group \
     --mount=gpfs://gpfs1/llmit:/mnt/shared-storage-user/llmit \
