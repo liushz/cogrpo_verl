@@ -45,29 +45,27 @@ micro_bsz_per_gpu="${34:-2}"
 verifier_reward_tie_no_intervention_weight="${35:-1.0}"
 
 verifier_intervention_mode="${36:-by_step}"
-confidence_threshold="${37:-0.7}"
-entropy_threshold="${38:-0.5}"
-use_entropy_filter="${39:-True}"
+confidence_threshold="${37:-0.0}"
 
-verifier_lora_rank="${40:-64}"
-verifier_lora_alpha="${41:-128}"
-verifier_lora_dropout="${42:-0.05}"
-verifier_lr="${43:-1e-5}"
-verifier_loss_weight="${44:-1.0}"
-verifier_max_new_tokens="${45:-4096}"
-verifier_logprobs="${46:-1}"
-verifier_temperature="${47:-1.0}"
+verifier_lora_rank="${38:-64}"
+verifier_lora_alpha="${39:-128}"
+verifier_lora_dropout="${40:-0.05}"
+verifier_lr="${41:-1e-5}"
+verifier_loss_weight="${42:-1.0}"
+verifier_max_new_tokens="${43:-4096}"
+verifier_logprobs="${44:-1}"
+verifier_temperature="${45:-1.0}"
 
-trainer_total_epochs="${48:-10}"
-trainer_total_training_steps="${49:-1000}"
-trainer_save_freq="${50:-20}"
-trainer_test_freq="${51:--1}"
-trainer_log_val_generations="${52:-False}"
-trainer_control_rollout_sync_freq="${53:-5}"
-trainer_verifier_lora_sync_freq="${54:-1}"
-trainer_verifier_lora_save_freq="${55:-20}"
+trainer_total_epochs="${46:-10}"
+trainer_total_training_steps="${47:-1000}"
+trainer_save_freq="${48:-20}"
+trainer_test_freq="${49:--1}"
+trainer_log_val_generations="${50:-False}"
+trainer_control_rollout_sync_freq="${51:-5}"
+trainer_verifier_lora_sync_freq="${52:-1}"
+trainer_verifier_lora_save_freq="${53:-20}"
 
-max_prompt_length="${56:-1024}"
+max_prompt_length="${54:-1024}"
 
 cd /mnt/shared-storage-user/liuhongwei/main_works/repos/repro
 
@@ -107,7 +105,16 @@ norm_adv_by_std_in_grpo=True
 verifier_max_prompt_length="$((1024 * 16))"
 
 # Trainer
-parallel_control_exp=True
+parallel_control_exp="${PARALLEL_CONTROL_EXP:-True}"
+parallel_control_exp_norm="$(echo "${parallel_control_exp}" | tr '[:upper:]' '[:lower:]')"
+case "${parallel_control_exp_norm}" in
+  1|true) parallel_control_exp=True ;;
+  0|false) parallel_control_exp=False ;;
+  *)
+    echo "[launcher][ERR] Invalid PARALLEL_CONTROL_EXP=${PARALLEL_CONTROL_EXP} (expected True/False/1/0)" >&2
+    exit 2
+    ;;
+esac
 
 if [ "${preset}" = "mini" ]; then
   if [ -z "${co_grpo_mode}" ]; then
@@ -130,9 +137,24 @@ fi
 max_response_length="$((1024 * response_n))"
 
 # by_step: disable kv cache optimization (it can hurt by-step scheduling behavior)
-rollout_enable_kv_cache_optimization=True
-if [ "${verifier_intervention_mode}" = "by_step" ]; then
-  rollout_enable_kv_cache_optimization=False
+# Allow explicit override for debugging:
+#   ROLLOUT_ENABLE_KV_CACHE_OPTIMIZATION=True|False|1|0
+rollout_enable_kv_cache_optimization="${ROLLOUT_ENABLE_KV_CACHE_OPTIMIZATION:-}"
+if [ -n "${rollout_enable_kv_cache_optimization}" ]; then
+  rollout_enable_kv_cache_optimization="$(echo "${rollout_enable_kv_cache_optimization}" | tr '[:upper:]' '[:lower:]')"
+  case "${rollout_enable_kv_cache_optimization}" in
+    1|true) rollout_enable_kv_cache_optimization=True ;;
+    0|false) rollout_enable_kv_cache_optimization=False ;;
+    *)
+      echo "[launcher][ERR] Invalid ROLLOUT_ENABLE_KV_CACHE_OPTIMIZATION=${ROLLOUT_ENABLE_KV_CACHE_OPTIMIZATION} (expected True/False/1/0)" >&2
+      exit 2
+      ;;
+  esac
+else
+  rollout_enable_kv_cache_optimization=True
+  if [ "${verifier_intervention_mode}" = "by_step" ]; then
+    rollout_enable_kv_cache_optimization=False
+  fi
 fi
 
 # Reserve headroom for hints so EXP isn't truncated at 33k just because of hints.
@@ -175,6 +197,27 @@ rollout_max_num_batched_tokens="$((2 * max_prompt_length + 2 * max_response_leng
 
 control_rollout_gpus_per_node="$((n_gpus_per_node / 2))"
 exp_rollout_gpus_per_node="$((n_gpus_per_node - control_rollout_gpus_per_node))"
+if [ "${parallel_control_exp}" = "True" ]; then
+  if [ -n "${CONTROL_ROLLOUT_GPUS_PER_NODE:-}" ] && [ -n "${EXP_ROLLOUT_GPUS_PER_NODE:-}" ]; then
+    control_rollout_gpus_per_node="${CONTROL_ROLLOUT_GPUS_PER_NODE}"
+    exp_rollout_gpus_per_node="${EXP_ROLLOUT_GPUS_PER_NODE}"
+  elif [ -n "${CONTROL_ROLLOUT_GPUS_PER_NODE:-}" ]; then
+    control_rollout_gpus_per_node="${CONTROL_ROLLOUT_GPUS_PER_NODE}"
+    exp_rollout_gpus_per_node="$((n_gpus_per_node - control_rollout_gpus_per_node))"
+  elif [ -n "${EXP_ROLLOUT_GPUS_PER_NODE:-}" ]; then
+    exp_rollout_gpus_per_node="${EXP_ROLLOUT_GPUS_PER_NODE}"
+    control_rollout_gpus_per_node="$((n_gpus_per_node - exp_rollout_gpus_per_node))"
+  fi
+
+  if [ "${control_rollout_gpus_per_node}" -lt 1 ] || [ "${exp_rollout_gpus_per_node}" -lt 1 ]; then
+    echo "[launcher][ERR] control/exp rollout GPUs must both be >=1 when PARALLEL_CONTROL_EXP=True (got control=${control_rollout_gpus_per_node}, exp=${exp_rollout_gpus_per_node})" >&2
+    exit 2
+  fi
+  if [ "$((control_rollout_gpus_per_node + exp_rollout_gpus_per_node))" -ne "${n_gpus_per_node}" ]; then
+    echo "[launcher][ERR] control_rollout_gpus_per_node + exp_rollout_gpus_per_node must equal n_gpus_per_node (${n_gpus_per_node}) when PARALLEL_CONTROL_EXP=True (got control=${control_rollout_gpus_per_node}, exp=${exp_rollout_gpus_per_node})" >&2
+    exit 2
+  fi
+fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
 if [ -z "${exp_name}" ]; then
@@ -314,8 +357,6 @@ if [ "${NODE_RANK}" = "0" ]; then
     +algorithm.curriculum_end_weight="${curriculum_end_weight}" \
     algorithm.verifier_intervention_mode="${verifier_intervention_mode}" \
     algorithm.token_check_interval="${token_check_interval}" \
-    algorithm.entropy_threshold="${entropy_threshold}" \
-    algorithm.use_entropy_filter="${use_entropy_filter}" \
     +algorithm.min_step_tokens="${min_step_tokens}" \
     +algorithm.max_interventions="${max_interventions}" \
     +algorithm.confidence_threshold="${confidence_threshold}" \

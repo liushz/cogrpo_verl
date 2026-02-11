@@ -51,9 +51,7 @@ verifier_intervention_mode="by_step"
 token_check_interval=2048
 min_step_tokens=2048
 max_interventions=5
-confidence_threshold=0.7
-entropy_threshold=0.5
-use_entropy_filter="True"
+confidence_threshold=0.0
 
 verifier_max_hint_tokens=512
 estimated_hint_tokens=512
@@ -102,6 +100,7 @@ while [ "$#" -gt 0 ]; do
         --token-check-interval) token_check_interval="$2"; shift 2 ;;
         --min-step-tokens) min_step_tokens="$2"; shift 2 ;;
         --max-interventions) max_interventions="$2"; shift 2 ;;
+        --confidence-threshold|--confidence_threshold) confidence_threshold="$2"; shift 2 ;;
         --verifier-max-hint-tokens) verifier_max_hint_tokens="$2"; shift 2 ;;
         --estimated-hint-tokens) estimated_hint_tokens="$2"; shift 2 ;;
         --control-group-weight) control_group_weight="$2"; shift 2 ;;
@@ -123,6 +122,7 @@ while [ "$#" -gt 0 ]; do
             echo "  --token-check-interval <int>"
             echo "  --min-step-tokens <int>"
             echo "  --max-interventions <int>"
+            echo "  --confidence-threshold <float>"
             echo "  --verifier-max-hint-tokens <int>"
             echo "  --estimated-hint-tokens <int>"
             echo "  --control-group-weight <float>"
@@ -158,6 +158,7 @@ echo "[run_co_grpo] name=${rjob_name} nnodes=${nnodes} gpu_per_node=${n_gpus_per
 echo "[run_co_grpo] exp=${exp_name} mode=${co_grpo_mode} preset=${preset}"
 echo "[run_co_grpo] response_n=${response_n} train_batch_size=${train_batch_size}"
 echo "[run_co_grpo] token_check_interval=${token_check_interval} min_step_tokens=${min_step_tokens} max_interventions=${max_interventions}"
+echo "[run_co_grpo] confidence_threshold=${confidence_threshold}"
 echo "[run_co_grpo] rjob_cpu=${rjob_cpu} rjob_memory=${rjob_memory}"
 
 # rjob delete "${rjob_name}" || true
@@ -224,8 +225,6 @@ rjob submit \
           '${verifier_reward_tie_no_intervention_weight}' \
           '${verifier_intervention_mode}' \
           '${confidence_threshold}' \
-          '${entropy_threshold}' \
-          '${use_entropy_filter}' \
           '${verifier_lora_rank}' \
           '${verifier_lora_alpha}' \
           '${verifier_lora_dropout}' \

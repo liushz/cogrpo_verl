@@ -1128,6 +1128,12 @@ class RayPPOTrainer:
                         control_config.verifier = deepcopy(self.config.verifier)
                     # Ensure vLLM does not internally repeat when trainer already repeats prompts.
                     control_config.rollout.n = 1
+                    # Co-GRPO control stream is one-shot generation; prefix caching brings little
+                    # benefit but can consume extra KV blocks proportional to sequence length.
+                    # Keep it disabled for control workers to reduce memory pressure and isolate
+                    # any prefix-cache instability to the exp/verifier side.
+                    if hasattr(control_config, "rollout"):
+                        control_config.rollout.enable_kv_cache_optimization = False
                 control_rollout_cls = RayClassWithInitArgs(
                     cls=self.role_worker_mapping[Role.ActorRolloutControl],
                     config=control_config,
@@ -1609,18 +1615,18 @@ class RayPPOTrainer:
                                 token_check_interval = self.config.algorithm.get(
                                     "token_check_interval", 5
                                 )
-                                entropy_threshold = self.config.algorithm.get(
-                                    "entropy_threshold", 0.5
-                                )
-                                use_entropy_filter = self.config.algorithm.get(
-                                    "use_entropy_filter", True
-                                )
                                 max_interventions = self.config.algorithm.get(
                                     "max_interventions", 3
                                 )
                                 confidence_threshold = self.config.algorithm.get(
-                                    "confidence_threshold", 0.7
+                                    "confidence_threshold", 0.0
                                 )
+                                try:
+                                    metrics["co_grpo/confidence_threshold"] = float(
+                                        confidence_threshold
+                                    )
+                                except Exception:
+                                    pass
 
                                 control_future = self.actor_rollout_control_wg.generate_sequences_async(
                                     gen_batch_repeated
@@ -1630,8 +1636,6 @@ class RayPPOTrainer:
                                         gen_batch_repeated,
                                         intervention_mode=intervention_mode,
                                         token_check_interval=token_check_interval,
-                                        entropy_threshold=entropy_threshold,
-                                        use_entropy_filter=use_entropy_filter,
                                         max_interventions=max_interventions,
                                         confidence_threshold=confidence_threshold,
                                         stream_mode="exp",
@@ -1658,14 +1662,30 @@ class RayPPOTrainer:
                                         verifier_batch
                                     )
 
+                                exp_rollout_metrics = exp_timing.pop(
+                                    "exp_metrics", None
+                                )
+                                if isinstance(exp_rollout_metrics, dict):
+                                    for key, value in exp_rollout_metrics.items():
+                                        if isinstance(
+                                            value,
+                                            (int, float, np.integer, np.floating),
+                                        ):
+                                            metrics[f"co_grpo/exp_{key}"] = float(value)
+
                                 timing_raw.update(
                                     {
                                         f"control_{k}": v
                                         for k, v in control_timing.items()
+                                        if isinstance(v, (int, float, np.integer, np.floating))
                                     }
                                 )
                                 timing_raw.update(
-                                    {f"exp_{k}": v for k, v in exp_timing.items()}
+                                    {
+                                        f"exp_{k}": v
+                                        for k, v in exp_timing.items()
+                                        if isinstance(v, (int, float, np.integer, np.floating))
+                                    }
                                 )
                             elif not self.async_rollout_mode:
                                 # Get intervention mode from config
@@ -1675,18 +1695,18 @@ class RayPPOTrainer:
                                 token_check_interval = self.config.algorithm.get(
                                     "token_check_interval", 5
                                 )
-                                entropy_threshold = self.config.algorithm.get(
-                                    "entropy_threshold", 0.5
-                                )
-                                use_entropy_filter = self.config.algorithm.get(
-                                    "use_entropy_filter", True
-                                )
                                 max_interventions = self.config.algorithm.get(
                                     "max_interventions", 3
                                 )
                                 confidence_threshold = self.config.algorithm.get(
-                                    "confidence_threshold", 0.7
+                                    "confidence_threshold", 0.0
                                 )
+                                try:
+                                    metrics["co_grpo/confidence_threshold"] = float(
+                                        confidence_threshold
+                                    )
+                                except Exception:
+                                    pass
 
                                 # Call dual_stream_rollout (tokenizer is stored in rollout worker)
                                 gen_batch_output = (
@@ -1694,8 +1714,6 @@ class RayPPOTrainer:
                                         gen_batch_repeated,
                                         intervention_mode=intervention_mode,
                                         token_check_interval=token_check_interval,
-                                        entropy_threshold=entropy_threshold,
-                                        use_entropy_filter=use_entropy_filter,
                                         max_interventions=max_interventions,
                                         confidence_threshold=confidence_threshold,
                                     )
@@ -1728,9 +1746,26 @@ class RayPPOTrainer:
                                 )
                                 self.async_rollout_manager.sleep()
                         if not use_parallel:
-                            timing_raw.update(
-                                gen_batch_output.meta_info.get("timing", {})
-                            )
+                            rollout_timing = gen_batch_output.meta_info.get("timing", {})
+                            if isinstance(rollout_timing, dict):
+                                rollout_timing = rollout_timing.copy()
+                                exp_rollout_metrics = rollout_timing.pop(
+                                    "exp_metrics", None
+                                )
+                                if isinstance(exp_rollout_metrics, dict):
+                                    for key, value in exp_rollout_metrics.items():
+                                        if isinstance(
+                                            value,
+                                            (int, float, np.integer, np.floating),
+                                        ):
+                                            metrics[f"co_grpo/exp_{key}"] = float(value)
+                                timing_raw.update(
+                                    {
+                                        k: v
+                                        for k, v in rollout_timing.items()
+                                        if isinstance(v, (int, float, np.integer, np.floating))
+                                    }
+                                )
                             gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
