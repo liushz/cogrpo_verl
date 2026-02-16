@@ -32,6 +32,8 @@ _debug_call_count = 0
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
+_MODEL_ID_CACHE: dict[str, str] = {}
+
 verify_prompt = """
 Please as a grading expert, judge whether the final answers given by the candidates below are consistent with the standard answers, that is, whether the candidates answered correctly. 
 Here are some evaluation criteria:
@@ -57,6 +59,61 @@ Here is your task. Simply reply with either CORRECT, INCORRECT, or INVALID. Don'
 <Candidate's Answer End>
 Judging the correctness of the candidate's answer:
 """
+
+def _get_env_model_name() -> str | None:
+    # Prefer explicit CompassVerifier model name override.
+    for key in ("COMPASSVERIFIER_MODEL", "REWARD_MODEL_NAME", "REWARD_MODEL_MODEL"):
+        value = os.environ.get(key)
+        if value:
+            return value.strip()
+    return None
+
+
+def _resolve_model_id_for_client(client) -> str:
+    """Resolve model id for a given OpenAI-compatible endpoint.
+
+    Priority:
+    1) env override: COMPASSVERIFIER_MODEL / REWARD_MODEL_NAME
+    2) auto-detect via /v1/models (OpenAI-compatible)
+    3) fallback: historical hard-coded id "cv-32b"
+    """
+    env_model = _get_env_model_name()
+    if env_model:
+        return env_model
+
+    base_url = getattr(getattr(client, "_client", None), "base_url", None)
+    base_url_str = str(base_url) if base_url else ""
+    if base_url_str and base_url_str in _MODEL_ID_CACHE:
+        return _MODEL_ID_CACHE[base_url_str]
+
+    detected: str | None = None
+    try:
+        models = client.models.list()
+        data = getattr(models, "data", None)
+        if data:
+            model_ids = []
+            for item in data:
+                model_id = getattr(item, "id", None)
+                if model_id:
+                    model_ids.append(str(model_id))
+            # Prefer CompassVerifier-like names if available.
+            preferred_substrings = ("cv", "compass", "verifier")
+            for sub in preferred_substrings:
+                for model_id in model_ids:
+                    if sub in model_id.lower():
+                        detected = model_id
+                        break
+                if detected:
+                    break
+            if not detected and model_ids:
+                detected = model_ids[0]
+    except Exception:
+        detected = None
+
+    resolved = detected or "cv-32b"
+    if base_url_str:
+        _MODEL_ID_CACHE[base_url_str] = resolved
+    return resolved
 
 
 def _postprocess_llm_response(llm_response):
@@ -149,8 +206,9 @@ def compute_score(question, gold_answer, llm_response, reward_model_clients):
                 if debug_enabled:
                     api_base_url = getattr(getattr(candidate_client, "_client", None), "base_url", None)
                     print(f"[CompassVerifier #{call_id}] Calling API via: {api_base_url}", file=sys.stderr)
+                model_id = _resolve_model_id_for_client(candidate_client)
                 response = candidate_client.chat.completions.create(
-                    model="cv-32b",
+                    model=model_id,
                     messages=[{"role": "user", "content": prompt_content}],
                     temperature=0.0,
                 )

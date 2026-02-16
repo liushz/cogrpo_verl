@@ -56,6 +56,25 @@ from verl.utils.torch_functional import (
 )
 from verl.workers.rollout.base import BaseRollout
 
+# Shared (online-canonical) Verifier hint injection helpers.
+from .verifier_hint_injection import (
+    compute_tail_rollback_keep_len as _compute_tail_rollback_keep_len,
+    find_last_eos_index as _find_last_eos_index,
+    find_last_marker_span as _find_last_marker_span,
+    find_last_subsequence_index as _find_last_subsequence_index,
+    find_last_think_close_span as _find_last_think_close_span,
+    find_last_trim_boundary as _find_last_trim_boundary,
+    find_prethink_rollback_keep_len as _find_prethink_rollback_keep_len,
+    find_think_close_pos as _find_think_close_pos,
+    hint_prefix_for_tail as _hint_prefix_for_tail,
+    insert_hint_tokens as _insert_hint_tokens,
+    is_post_think_finalized as _is_post_think_finalized,
+    last_hint_end as _last_hint_end,
+    rollback_prethink_once as _rollback_prethink_once,
+    rollback_state_to_keep_len as _rollback_state_to_keep_len,
+    rollback_tail_for_hint as _rollback_tail_for_hint,
+)
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -140,6 +159,29 @@ def _find_first_eos_index(tokens, eos_token_ids: set) -> Optional[int]:
     return None
 
 
+def _hash_token_sequence(tokens: List[int], tail_k: int = 512) -> int:
+    """Deterministic rolling hash for token ids (used for bucketing rollout states)."""
+    if not tokens:
+        return 0
+    try:
+        tail_k = int(tail_k)
+    except Exception:
+        tail_k = 512
+    if tail_k > 0 and len(tokens) > tail_k:
+        tokens = tokens[-tail_k:]
+
+    # 64-bit rolling hash (deterministic across processes).
+    h = 1469598103934665603  # FNV offset basis
+    for t in tokens:
+        try:
+            v = int(t)
+        except Exception:
+            v = 0
+        h ^= v & 0xFFFFFFFFFFFFFFFF
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return int(h)
+
+
 def _find_last_eos_index(tokens, eos_token_ids: set) -> Optional[int]:
     if not tokens or not eos_token_ids:
         return None
@@ -205,32 +247,6 @@ def _find_prethink_rollback_keep_len(tokens: List[int], tokenizer) -> Optional[i
     return start
 
 
-def _has_final_answer_marker(
-    tokens: List[int], tokenizer, decode_tail_tokens: int = 512
-) -> bool:
-    if not tokens:
-        return False
-    try:
-        tail_len = max(64, int(decode_tail_tokens))
-    except Exception:
-        tail_len = 512
-
-    try:
-        tail_text = tokenizer.decode(tokens[-tail_len:], skip_special_tokens=True)
-    except Exception:
-        tail_text = ""
-    if not tail_text:
-        return False
-
-    low_tail = tail_text.lower()
-    if "\\boxed" in tail_text:
-        return True
-    if "final answer" in low_tail:
-        return True
-    if ("最终答案" in tail_text) or ("答案：" in tail_text) or ("答案:" in tail_text):
-        return True
-    return False
-
 
 def _is_post_think_finalized(
     tokens: List[int], tokenizer, decode_tail_tokens: int = 512
@@ -283,6 +299,25 @@ def _rollback_state_to_keep_len(state: dict, keep_len: int) -> bool:
     state["response_tokens"] = response_tokens[:keep]
     state["loss_masks"] = loss_masks[:keep]
     return True
+
+
+def _last_hint_end(loss_masks: List[int]) -> int:
+    """Return the exclusive end index of the last inserted hint token span.
+
+    In by_step rollouts, we mark hint tokens with loss_mask==0 and policy tokens
+    with loss_mask==1 (no padding inside the response_tokens window). Rollbacks
+    used to find a "natural boundary" must never truncate already-inserted hints,
+    otherwise `state["hints"]` / cf_events / verifier trajectories become
+    inconsistent with the final response.
+    """
+    if not loss_masks:
+        return 0
+    last = -1
+    for i in range(len(loss_masks) - 1, -1, -1):
+        if int(loss_masks[i]) == 0:
+            last = i
+            break
+    return 0 if last < 0 else int(last + 1)
 
 
 def _compute_tail_rollback_keep_len(
@@ -855,6 +890,19 @@ class vLLMRollout(BaseRollout):
             config.max_model_len or config.prompt_length + config.response_length
         )
 
+        # Align tokenizer's declared max length with vLLM's max_model_len.
+        #
+        # Many Qwen/Qwen3 tokenizers ship with `model_max_length=32768` even when the
+        # underlying model supports a larger context window (e.g. 40960). In by_step
+        # rollouts we repeatedly re-encode a growing prefix; leaving model_max_length
+        # smaller produces noisy warnings and can trigger unintended truncation in
+        # downstream tokenization code.
+        try:
+            if hasattr(tokenizer, "model_max_length"):
+                tokenizer.model_max_length = max_model_len
+        except Exception:
+            pass
+
         if (
             max_num_batched_tokens < max_model_len
             and self.config.enable_chunked_prefill
@@ -992,6 +1040,22 @@ class vLLMRollout(BaseRollout):
             **lora_kwargs,
             **engine_kwargs,
         )
+
+        # vLLM maintains its own tokenizer instance; keep its model_max_length consistent
+        # as well to avoid "Token indices sequence length ..." warnings when running
+        # near the context limit.
+        try:
+            vllm_tokenizer = None
+            if hasattr(self.inference_engine, "get_tokenizer"):
+                vllm_tokenizer = self.inference_engine.get_tokenizer()
+            if vllm_tokenizer is None and hasattr(self.inference_engine, "tokenizer"):
+                vllm_tokenizer = getattr(self.inference_engine, "tokenizer", None)
+            if vllm_tokenizer is None and hasattr(self.inference_engine, "llm_engine"):
+                vllm_tokenizer = getattr(self.inference_engine.llm_engine, "tokenizer", None)
+            if vllm_tokenizer is not None and hasattr(vllm_tokenizer, "model_max_length"):
+                vllm_tokenizer.model_max_length = max_model_len
+        except Exception:
+            pass
 
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
@@ -1961,6 +2025,9 @@ class vLLMRollout(BaseRollout):
             malformed_like = 0
             tag_go = 0
             tag_wait = 0
+            parsed_go = 0
+            parsed_wait = 0
+            no_valid_decision = 0
             closed_think = 0
             for i in range(len(verifier_inputs)):
                 verifier_response = verifier_responses[i]
@@ -1975,6 +2042,13 @@ class vLLMRollout(BaseRollout):
                 if "</think>" in low_text or "<｜end of thought｜>" in low_text:
                     closed_think += 1
                 decision = self._parse_verifier_decision(verifier_text)
+                decision_tag = decision.get("decision_tag", None)
+                if decision_tag == "GO":
+                    parsed_go += 1
+                elif decision_tag == "WAIT":
+                    parsed_wait += 1
+                else:
+                    no_valid_decision += 1
                 if decision.get("action") == "Intervene":
                     wait_confidence, wait_avg_logprob = _compute_wait_confidence(
                         verifier_response,
@@ -1986,7 +2060,7 @@ class vLLMRollout(BaseRollout):
                         decision["wait_avg_logprob"] = wait_avg_logprob
                 decisions.append(decision)
 
-                if decision.get("action") == "Pass" and not decision.get("hint"):
+                if decision_tag not in ("GO", "WAIT"):
                     low = verifier_text.lower()
                     if ("final answer" in low) or ("\\boxed" in verifier_text):
                         malformed_like += 1
@@ -2005,22 +2079,27 @@ class vLLMRollout(BaseRollout):
             if not self._verifier_debug_once:
                 try:
                     logger.warning(
-                        "[VerifierDebug] output_tag_stats: go=%s wait=%s closed_think=%s none_tag=%s",
+                        "[VerifierDebug] output_tag_stats: raw_go=%s raw_wait=%s parsed_go=%s parsed_wait=%s no_valid_decision=%s closed_think=%s",
                         tag_go,
                         tag_wait,
+                        parsed_go,
+                        parsed_wait,
+                        no_valid_decision,
                         closed_think,
-                        max(0, len(verifier_inputs) - tag_go - tag_wait),
                     )
                 except Exception:
                     pass
 
             if (
                 len(verifier_inputs) > 0
-                and malformed_like / len(verifier_inputs) >= 0.5
+                and no_valid_decision / len(verifier_inputs) >= 0.5
             ):
                 if self._verifier_malformed_warn_count < 5:
                     logger.warning(
-                        "[VerifierDebug] malformed_like_outputs=%s/%s (final-answer-like with no valid decision)",
+                        "[VerifierDebug] verifier_no_valid_decision=%s/%s malformed_final_like=%s/%s "
+                        "(missing <GO>/<WAIT> decision tag; malformed_final_like is the subset that also looks like a final answer)",
+                        no_valid_decision,
+                        len(verifier_inputs),
                         malformed_like,
                         len(verifier_inputs),
                     )
@@ -2198,7 +2277,13 @@ class vLLMRollout(BaseRollout):
         verifier_text = verifier_text.strip()
 
         # Extract actual hint (removes think blocks, extracts <GO> or <WAIT> content)
-        hint = self._extract_verifier_hint(verifier_text)
+        raw_decision = self._extract_verifier_hint(verifier_text)
+        decision_tag = None
+        if re.match(r"^\s*<WAIT>(?:\s|$)", raw_decision, flags=re.IGNORECASE):
+            decision_tag = "WAIT"
+        elif re.match(r"^\s*<GO>(?:\s|$)", raw_decision, flags=re.IGNORECASE):
+            decision_tag = "GO"
+        hint = raw_decision
 
         # Determine action based on hint
         if re.match(r"^\s*<WAIT>(?:\s|$)", hint, flags=re.IGNORECASE):
@@ -2224,8 +2309,8 @@ class vLLMRollout(BaseRollout):
             "action": action,
             "hint": hint,
             "critique": verifier_text,  # Keep full output for logging
+            "decision_tag": decision_tag,  # "GO" | "WAIT" | None
         }
-
 
 
     def _dual_stream_rollout_by_step(
@@ -2254,6 +2339,36 @@ class vLLMRollout(BaseRollout):
         if stream_mode not in ("both", "control", "exp"):
             logger.warning(f"Unknown stream_mode={stream_mode}, falling back to 'both'")
             stream_mode = "both"
+
+        # Optional: seed sample states from an existing partial response (used by cf-branch rollouts).
+        initial_state_overrides = kwargs.pop("initial_state_overrides", None)
+        collect_verifier_trajectories = _as_bool(
+            kwargs.pop("collect_verifier_trajectories", True)
+        )
+
+        # Counterfactual branching (cf-branch) config: build additional "no-hint" rollouts
+        # for each applied intervention, to estimate marginal contribution Δ = R(with) - R(without).
+        cf_branching = _as_bool(kwargs.pop("cf_branching", False))
+        try:
+            cf_branch_prob = float(kwargs.pop("cf_branch_prob", 1.0))
+        except Exception:
+            cf_branch_prob = 1.0
+        try:
+            cf_branch_max_events_per_sample = int(
+                kwargs.pop("cf_branch_max_events_per_sample", 0)
+            )
+        except Exception:
+            cf_branch_max_events_per_sample = 0
+        try:
+            cf_branch_state_hash_mod = int(kwargs.pop("cf_branch_state_hash_mod", 1024))
+        except Exception:
+            cf_branch_state_hash_mod = 1024
+        try:
+            cf_branch_k = int(kwargs.pop("cf_branch_k", 1))
+        except Exception:
+            cf_branch_k = 1
+        if cf_branch_k < 1:
+            cf_branch_k = 1
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -2449,8 +2564,40 @@ class vLLMRollout(BaseRollout):
                     "first_step_tokens_len": None,  # record first step token length for debugging
                     "_prethink_rollback_used": False,  # allow at most one rollback-to-</think> per sample
                     "_hint_skipped_late_stage": False,
+                    "_cf_branch_event_count": 0,  # number of cf events already created for this sample
                 }
             )
+
+        if initial_state_overrides is not None:
+            try:
+                if len(initial_state_overrides) != batch_size:
+                    logger.warning(
+                        f"[BY_STEP] initial_state_overrides size mismatch: "
+                        f"len={len(initial_state_overrides)} vs batch_size={batch_size}; ignoring overrides."
+                    )
+                else:
+                    for b in range(batch_size):
+                        override = initial_state_overrides[b]
+                        if not isinstance(override, dict):
+                            continue
+                        for k, v in override.items():
+                            if k in ("response_tokens", "loss_masks", "hints", "critiques"):
+                                sample_states[b][k] = list(v) if v is not None else []
+                            else:
+                                sample_states[b][k] = v
+                        # Keep response_tokens/loss_masks aligned.
+                        rt = list(sample_states[b].get("response_tokens") or [])
+                        lm = list(sample_states[b].get("loss_masks") or [])
+                        if rt and not lm:
+                            lm = [1] * len(rt)
+                        if len(rt) != len(lm):
+                            keep = min(len(rt), len(lm))
+                            rt = rt[:keep]
+                            lm = lm[:keep]
+                        sample_states[b]["response_tokens"] = rt
+                        sample_states[b]["loss_masks"] = lm
+            except Exception as e:
+                logger.warning(f"[BY_STEP] Failed to apply initial_state_overrides: {e}")
 
         # 5. 监控指标
         metrics = {
@@ -2460,6 +2607,9 @@ class vLLMRollout(BaseRollout):
             "hint_skipped_late_stage": 0,
             "verifier_skipped_no_insert_anchor": 0,
             "errors": 0,
+            "verifier_outputs": 0,
+            "verifier_no_valid_decision": 0,
+            "verifier_no_valid_decision_final_like": 0,
             "verifier_wait_total": 0,
             "verifier_wait_conf_count": 0,
             "verifier_wait_conf_sum": 0.0,
@@ -2484,6 +2634,15 @@ class vLLMRollout(BaseRollout):
         verifier_train_parent_uids = []
         verifier_train_parent_sample_uids = []
         verifier_train_step_indices = []
+        verifier_train_event_uids = []
+        verifier_train_prefix_lens = []
+        verifier_train_wait_confidence = []
+        verifier_train_wait_avg_logprob = []
+        verifier_train_hint_token_counts = []
+        verifier_train_prethink_anchor = []
+        verifier_train_state_hash_bucket = []
+
+        cf_events = []  # [{event_uid, parent_idx, initial_state_overrides, ...}]
 
         exp_start = time.time()
         # Dynamic max_steps calculation based on response_budget and token_check_interval
@@ -2497,6 +2656,9 @@ class vLLMRollout(BaseRollout):
         # Reserve space for hints so that hint insertion doesn't cause context_exhausted.
         # Note: response_budget is for model-generated tokens only; hints are extra.
         max_interventions = int(kwargs.get("max_interventions", 5))
+        if cf_branch_max_events_per_sample <= 0:
+            cf_branch_max_events_per_sample = max_interventions
+        cf_branch_prob = max(0.0, min(1.0, float(cf_branch_prob)))
         pending_hint_tail_decode_tokens = int(
             kwargs.get("pending_hint_tail_decode_tokens", 128)
         )
@@ -2928,6 +3090,16 @@ class vLLMRollout(BaseRollout):
                     if tail_keep is not None:
                         hint_anchor_keep = int(tail_keep)
 
+                    # Never roll back past any already-inserted hints; otherwise we would
+                    # silently delete prior interventions and break the mapping between
+                    # (hints/critiques/event_uid) and the final response.
+                    try:
+                        last_hint_keep = _last_hint_end(state.get("loss_masks") or [])
+                        if last_hint_keep > int(hint_anchor_keep):
+                            hint_anchor_keep = int(last_hint_keep)
+                    except Exception:
+                        pass
+
                     use_prethink_anchor = False
                     anchor_tokens = state["response_tokens"][:hint_anchor_keep]
                     if pending_complete_reason is not None and (not state.get("_prethink_rollback_used", False)):
@@ -2957,6 +3129,17 @@ class vLLMRollout(BaseRollout):
                                 )
                                 if tail_keep is not None:
                                     hint_anchor_keep = int(tail_keep)
+                                # Re-clamp after the second tail-rollback: the new boundary search
+                                # may land *inside* an existing hint span (loss_mask==0) and would
+                                # silently truncate already-inserted hints.
+                                try:
+                                    last_hint_keep = _last_hint_end(
+                                        state.get("loss_masks") or []
+                                    )
+                                    if last_hint_keep > int(hint_anchor_keep):
+                                        hint_anchor_keep = int(last_hint_keep)
+                                except Exception:
+                                    pass
 
                     # Strong coupling: only request Verifier when a same-round insertion anchor exists.
                     anchor_tokens = state["response_tokens"][:hint_anchor_keep]
@@ -3022,6 +3205,21 @@ class vLLMRollout(BaseRollout):
                     return_trajectories=True,
                 )
 
+                # Track verifier output format quality. "Valid decision" means the output
+                # contains a parsed <GO>/<WAIT> decision tag (in the proper decision scope).
+                try:
+                    metrics["verifier_outputs"] += int(len(decisions))
+                    for d in decisions:
+                        if d.get("decision_tag") in ("GO", "WAIT"):
+                            continue
+                        metrics["verifier_no_valid_decision"] += 1
+                        crit = str(d.get("critique") or "")
+                        low = crit.lower()
+                        if ("final answer" in low) or ("\\boxed" in crit):
+                            metrics["verifier_no_valid_decision_final_like"] += 1
+                except Exception:
+                    pass
+
                 for i, (b, step_idx, hint_anchor_keep, use_prethink_anchor) in enumerate(
                     verifier_input_map
                 ):
@@ -3064,6 +3262,16 @@ class vLLMRollout(BaseRollout):
                     if intervention_policy.should_intervene(state, decision):
                         hint = decision["hint"]
                         hint_applied = False
+                        parent_uid = (
+                            str(prompt_uids[b]) if prompt_uids is not None else str(b)
+                        )
+                        parent_sample_uid = (
+                            str(prompt_sample_uids[b])
+                            if prompt_sample_uids is not None
+                            else str(b)
+                        )
+                        hint_idx = len(state.get("hints", []) or [])
+                        event_uid = f"{parent_sample_uid}:{hint_idx}"
 
                         # Restore to verifier anchor first, so generated hint context and
                         # insertion position are strictly aligned.
@@ -3083,6 +3291,23 @@ class vLLMRollout(BaseRollout):
                             )
                         ):
                             _rollback_prethink_once(state, tokenizer)
+
+                        # Snapshot the exact prefix state used for insertion. This is the counterfactual
+                        # branch start state (no-hint continuation).
+                        cf_prefix_response_tokens = list(state.get("response_tokens") or [])
+                        cf_prefix_loss_masks = list(state.get("loss_masks") or [])
+                        cf_prefix_hints = list(state.get("hints") or [])
+                        cf_prefix_prethink_used = bool(state.get("_prethink_rollback_used", False))
+                        prefix_len = len(cf_prefix_response_tokens)
+                        state_hash_bucket = 0
+                        if cf_branch_state_hash_mod > 0:
+                            try:
+                                state_hash_bucket = int(
+                                    _hash_token_sequence(cf_prefix_response_tokens)
+                                    % int(cf_branch_state_hash_mod)
+                                )
+                            except Exception:
+                                state_hash_bucket = 0
                         try:
                             tail = tokenizer.decode(
                                 state["response_tokens"][
@@ -3097,6 +3322,7 @@ class vLLMRollout(BaseRollout):
                         hint_tokens = tokenizer.encode(
                             hint_text, add_special_tokens=False
                         )
+                        hint_token_count = int(len(hint_tokens) if hint_tokens else 0)
                         if hint_tokens:
                             inserted = _insert_hint_tokens(
                                 state, hint_tokens, tokenizer, eos_token_ids
@@ -3118,19 +3344,51 @@ class vLLMRollout(BaseRollout):
                             # can affect the continuation.
                             state["_pending_complete_reason"] = None
 
+                            # Record counterfactual branch request (no-hint continuation) for this event.
+                            if cf_branching:
+                                try:
+                                    if (
+                                        state.get("_cf_branch_event_count", 0)
+                                        < cf_branch_max_events_per_sample
+                                    ) and (np.random.rand() < cf_branch_prob):
+                                        state["_cf_branch_event_count"] = int(
+                                            state.get("_cf_branch_event_count", 0)
+                                        ) + 1
+                                        cf_events.append(
+                                            {
+                                                "event_uid": str(event_uid),
+                                                "parent_idx": int(b),
+                                                "parent_uid": str(parent_uid),
+                                                "parent_sample_uid": str(parent_sample_uid),
+                                                "step_idx": int(step_idx),
+                                                "prefix_len": int(prefix_len),
+                                                "wait_confidence": decision.get(
+                                                    "wait_confidence", None
+                                                ),
+                                                "wait_avg_logprob": decision.get(
+                                                    "wait_avg_logprob", None
+                                                ),
+                                                "hint_token_count": int(hint_token_count),
+                                                "prethink_anchor": bool(use_prethink_anchor),
+                                                "state_hash_bucket": int(state_hash_bucket),
+                                                "initial_state": {
+                                                    "response_tokens": cf_prefix_response_tokens,
+                                                    "loss_masks": cf_prefix_loss_masks,
+                                                    "hints": cf_prefix_hints,
+                                                    "_prethink_rollback_used": bool(
+                                                        cf_prefix_prethink_used
+                                                    ),
+                                                },
+                                            }
+                                        )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"[CF_BRANCH] Failed to record cf event (b={b}, step_idx={step_idx}): {e}"
+                                    )
+
                         # Record verifier trajectories for training (prompt + full response + old logprobs).
                         try:
-                            if verifier_traj and hint_applied:
-                                parent_uid = (
-                                    str(prompt_uids[b])
-                                    if prompt_uids is not None
-                                    else str(b)
-                                )
-                                parent_sample_uid = (
-                                    str(prompt_sample_uids[b])
-                                    if prompt_sample_uids is not None
-                                    else str(b)
-                                )
+                            if verifier_traj and hint_applied and collect_verifier_trajectories:
                                 prompt_token_ids = verifier_traj["prompt_token_ids"][i]
                                 response_ids = (
                                     verifier_traj["responses"][i].detach().to("cpu")
@@ -3150,6 +3408,23 @@ class vLLMRollout(BaseRollout):
                                     parent_sample_uid
                                 )
                                 verifier_train_step_indices.append(int(step_idx))
+                                verifier_train_event_uids.append(str(event_uid))
+                                verifier_train_prefix_lens.append(int(prefix_len))
+                                verifier_train_wait_confidence.append(
+                                    decision.get("wait_confidence", None)
+                                )
+                                verifier_train_wait_avg_logprob.append(
+                                    decision.get("wait_avg_logprob", None)
+                                )
+                                verifier_train_hint_token_counts.append(
+                                    int(hint_token_count)
+                                )
+                                verifier_train_prethink_anchor.append(
+                                    bool(use_prethink_anchor)
+                                )
+                                verifier_train_state_hash_bucket.append(
+                                    int(state_hash_bucket)
+                                )
                         except Exception as e:
                             logger.warning(
                                 f"Failed to record verifier trajectory (b={b}, step_idx={step_idx}): {e}"
@@ -3191,6 +3466,10 @@ class vLLMRollout(BaseRollout):
             if batch_size > 0
             else 0,
             "intervention_count": metrics["total_interventions"],
+            "cf_branching": int(bool(cf_branching)),
+            "cf_event_count": int(len(cf_events)),
+            "cf_event_per_intervention": float(len(cf_events))
+            / float(max(1, metrics["total_interventions"])),
             "stop_sequence_hit_rate": metrics["stop_sequence_hits"]
             / metrics["total_steps"]
             if metrics["total_steps"] > 0
@@ -3202,6 +3481,21 @@ class vLLMRollout(BaseRollout):
                 "verifier_skipped_no_insert_anchor"
             ],
             "confidence_threshold": confidence_threshold_value,
+            "verifier_outputs": metrics["verifier_outputs"],
+            "verifier_no_valid_decision": metrics["verifier_no_valid_decision"],
+            "verifier_no_valid_decision_rate": metrics["verifier_no_valid_decision"]
+            / metrics["verifier_outputs"]
+            if metrics["verifier_outputs"] > 0
+            else 0,
+            "verifier_no_valid_decision_final_like": metrics[
+                "verifier_no_valid_decision_final_like"
+            ],
+            "verifier_no_valid_decision_final_like_rate": metrics[
+                "verifier_no_valid_decision_final_like"
+            ]
+            / metrics["verifier_outputs"]
+            if metrics["verifier_outputs"] > 0
+            else 0,
             "wait_total": wait_total,
             "wait_conf_coverage": wait_conf_count / wait_total if wait_total > 0 else 0,
             "wait_conf_mean": metrics["verifier_wait_conf_sum"] / wait_conf_count
@@ -3383,6 +3677,34 @@ class vLLMRollout(BaseRollout):
             exp_loss_mask_list.append(loss_mask)
             exp_position_ids_list.append(pos_ids)
             exp_responses_list.append(resp_seg_ids)
+
+            # Reconstruct hints directly from `loss_masks` (0-spans) to guarantee that
+            # dumped hints always match the final token sequence (no "hint lost").
+            try:
+                reconstructed_hints = []
+                in_span = False
+                span_start = 0
+                for j, m in enumerate(response_loss_masks):
+                    if int(m) == 0:
+                        if not in_span:
+                            span_start = j
+                            in_span = True
+                    elif in_span:
+                        hint_text = tokenizer.decode(
+                            response_tokens[span_start:j], skip_special_tokens=True
+                        ).strip()
+                        if hint_text:
+                            reconstructed_hints.append(hint_text)
+                        in_span = False
+                if in_span:
+                    hint_text = tokenizer.decode(
+                        response_tokens[span_start:], skip_special_tokens=True
+                    ).strip()
+                    if hint_text:
+                        reconstructed_hints.append(hint_text)
+                state["hints"] = reconstructed_hints
+            except Exception:
+                pass
 
             all_hints.append("\n".join(state["hints"]))
             all_critiques.append(
@@ -3604,6 +3926,66 @@ class vLLMRollout(BaseRollout):
                 # normalize to numpy array for consistency
                 non_tensor_batch[key] = np.array(val, dtype=object)
 
+        cf_control_batch = None
+        if cf_branching and cf_events:
+            try:
+                t0 = time.time()
+                # Expand each event K times to reduce baseline variance:
+                #   R0(event) = mean_k R0_k
+                expanded_events = cf_events
+                if cf_branch_k > 1:
+                    expanded_events = []
+                    for e in cf_events:
+                        expanded_events.extend([e] * int(cf_branch_k))
+
+                cf_parent_indices = [int(e.get("parent_idx", 0)) for e in expanded_events]
+                cf_prompts = prompts.select_idxs(cf_parent_indices)
+                # Keep the original (repeated) batch index for joining reward metadata in trainer.
+                # NOTE: Generation prompts passed into rollout do not carry reward metadata
+                # (data_source/reward_model/extra_info). Trainer must re-attach them using this index.
+                cf_prompts.non_tensor_batch["cf_parent_idx"] = np.array(
+                    cf_parent_indices, dtype=np.int32
+                )
+                cf_prompts.non_tensor_batch["cf_event_uid"] = np.array(
+                    [str(e.get("event_uid", "")) for e in expanded_events], dtype=object
+                )
+                cf_prompts.non_tensor_batch["cf_parent_uid"] = np.array(
+                    [str(e.get("parent_uid", "")) for e in expanded_events], dtype=object
+                )
+                cf_prompts.non_tensor_batch["cf_parent_sample_uid"] = np.array(
+                    [str(e.get("parent_sample_uid", "")) for e in expanded_events], dtype=object
+                )
+                cf_prompts.non_tensor_batch["cf_step_idx"] = np.array(
+                    [int(e.get("step_idx", 0)) for e in expanded_events], dtype=np.int32
+                )
+
+                initial_overrides = [
+                    dict(e.get("initial_state") or {}) for e in expanded_events
+                ]
+
+                # Counterfactual control rollouts: start from the exact insertion prefix,
+                # do NOT apply the current hint, and continue with the same verifier policy.
+                cf_control_batch = self.dual_stream_rollout(
+                    cf_prompts,
+                    intervention_mode="by_step",
+                    stream_mode="exp",
+                    token_check_interval=token_check_interval,
+                    min_step_tokens=min_step_tokens,
+                    max_interventions=max_interventions,
+                    confidence_threshold=confidence_threshold_value,
+                    pending_hint_tail_decode_tokens=pending_hint_tail_decode_tokens,
+                    hint_rollback_window_tokens=hint_rollback_window_tokens,
+                    initial_state_overrides=initial_overrides,
+                    cf_branching=False,
+                    collect_verifier_trajectories=False,
+                )
+                timing_info.setdefault("exp_metrics", {})[
+                    "cf_control_gen_s"
+                ] = float(time.time() - t0)
+            except Exception as e:
+                logger.warning(f"[CF_BRANCH] Failed to generate cf_control_batch: {e}")
+                cf_control_batch = None
+
         # 13. 释放 KV Cache
         if hasattr(self.inference_engine, "sleep_mode"):
             try:
@@ -3618,6 +4000,8 @@ class vLLMRollout(BaseRollout):
         timing_info["total"] = time.time() - start_time
         meta_info = prompts.meta_info.copy()
         meta_info["timing"] = timing_info
+        if cf_control_batch is not None and len(cf_control_batch) > 0:
+            meta_info["cf_control_batch"] = cf_control_batch
 
         # Build verifier training batch (separate DataProto) to avoid mixing batch sizes.
         if verifier_train_prompt_token_ids:
@@ -3676,6 +4060,31 @@ class vLLMRollout(BaseRollout):
                     verifier_train_parent_sample_uids, dtype=object
                 ),
                 "step_idx": np.array(verifier_train_step_indices, dtype=np.int32),
+                "event_uid": np.array(verifier_train_event_uids, dtype=object),
+                "prefix_len": np.array(verifier_train_prefix_lens, dtype=np.int32),
+                "wait_confidence": np.array(
+                    [
+                        float(x) if x is not None else float("nan")
+                        for x in verifier_train_wait_confidence
+                    ],
+                    dtype=np.float32,
+                ),
+                "wait_avg_logprob": np.array(
+                    [
+                        float(x) if x is not None else float("nan")
+                        for x in verifier_train_wait_avg_logprob
+                    ],
+                    dtype=np.float32,
+                ),
+                "hint_token_count": np.array(
+                    verifier_train_hint_token_counts, dtype=np.int32
+                ),
+                "prethink_anchor": np.array(
+                    verifier_train_prethink_anchor, dtype=np.bool_
+                ),
+                "state_hash_bucket": np.array(
+                    verifier_train_state_hash_bucket, dtype=np.int32
+                ),
             }
             verifier_meta_info = {
                 "temperature": verifier_temperature,

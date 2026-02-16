@@ -1520,7 +1520,22 @@ class RayPPOTrainer:
                             self.config.algorithm.adv_estimator
                             == AdvantageEstimator.CO_GRPO
                         )
-                        use_parallel = use_co_grpo and self.parallel_control_exp
+                        verifier_credit_assignment = "global_gap"
+                        try:
+                            verifier_credit_assignment = str(
+                                self.config.algorithm.get(
+                                    "verifier_credit_assignment", "global_gap"
+                                )
+                            )
+                        except Exception:
+                            verifier_credit_assignment = "global_gap"
+                        use_cf_branch = (
+                            use_co_grpo
+                            and verifier_credit_assignment.lower() in ("cf_branch", "cf")
+                        )
+                        use_parallel = (
+                            use_co_grpo and self.parallel_control_exp and (not use_cf_branch)
+                        )
                         sample_uids = None
 
                         if use_co_grpo:
@@ -1528,7 +1543,11 @@ class RayPPOTrainer:
                             # e.g., rollout.n=8 → each prompt repeated 8 times → generates 8 pairs (16 samples)
                             gen_batch_repeated = gen_batch.repeat(
                                 repeat_times=self.config.actor_rollout_ref.rollout.n,
-                                interleave=True,
+                                # IMPORTANT: avoid repeat_interleave here. Interleaving groups all repeats of a
+                                # prompt together, causing severe per-rank length imbalance during rollout
+                                # dispatch (and can trigger NCCL watchdog timeouts while straggler ranks
+                                # are still generating). Use tiling instead so each rank sees a mix.
+                                interleave=False,
                             )
                             # Unique per-repeated-sample id (needed to map verifier steps back to per-sample rewards).
                             sample_uids = np.array(
@@ -1542,6 +1561,29 @@ class RayPPOTrainer:
                                 sample_uids
                             )
                             # Use dual-stream rollout for Co-GRPO
+                            # Read intervention knobs once to avoid branch-local
+                            # UnboundLocalError and keep control/exp/cf paths consistent.
+                            intervention_mode = self.config.algorithm.get(
+                                "verifier_intervention_mode", "by_response"
+                            )
+                            token_check_interval = self.config.algorithm.get(
+                                "token_check_interval", 5
+                            )
+                            min_step_tokens = self.config.algorithm.get(
+                                "min_step_tokens", token_check_interval
+                            )
+                            max_interventions = self.config.algorithm.get(
+                                "max_interventions", 3
+                            )
+                            confidence_threshold = self.config.algorithm.get(
+                                "confidence_threshold", 0.0
+                            )
+                            try:
+                                metrics["co_grpo/confidence_threshold"] = float(
+                                    confidence_threshold
+                                )
+                            except Exception:
+                                pass
                             if use_parallel:
                                 if self.actor_rollout_control_wg is None:
                                     raise RuntimeError(
@@ -1608,26 +1650,6 @@ class RayPPOTrainer:
                                     )
                                     metrics["control_rollout/sync_s"] = float(t1 - t0)
 
-                                # Get intervention mode from config
-                                intervention_mode = self.config.algorithm.get(
-                                    "verifier_intervention_mode", "by_response"
-                                )
-                                token_check_interval = self.config.algorithm.get(
-                                    "token_check_interval", 5
-                                )
-                                max_interventions = self.config.algorithm.get(
-                                    "max_interventions", 3
-                                )
-                                confidence_threshold = self.config.algorithm.get(
-                                    "confidence_threshold", 0.0
-                                )
-                                try:
-                                    metrics["co_grpo/confidence_threshold"] = float(
-                                        confidence_threshold
-                                    )
-                                except Exception:
-                                    pass
-
                                 control_future = self.actor_rollout_control_wg.generate_sequences_async(
                                     gen_batch_repeated
                                 )
@@ -1688,34 +1710,53 @@ class RayPPOTrainer:
                                     }
                                 )
                             elif not self.async_rollout_mode:
-                                # Get intervention mode from config
-                                intervention_mode = self.config.algorithm.get(
-                                    "verifier_intervention_mode", "by_response"
-                                )
-                                token_check_interval = self.config.algorithm.get(
-                                    "token_check_interval", 5
-                                )
-                                max_interventions = self.config.algorithm.get(
-                                    "max_interventions", 3
-                                )
-                                confidence_threshold = self.config.algorithm.get(
-                                    "confidence_threshold", 0.0
-                                )
-                                try:
-                                    metrics["co_grpo/confidence_threshold"] = float(
-                                        confidence_threshold
-                                    )
-                                except Exception:
-                                    pass
+                                if use_cf_branch:
+                                    metrics["co_grpo/verifier_credit_assignment"] = 1.0
 
                                 # Call dual_stream_rollout (tokenizer is stored in rollout worker)
+                                cf_branch_prob = self.config.algorithm.get(
+                                    "cf_branch_prob", 1.0
+                                )
+                                cf_branch_max_events_per_sample = (
+                                    self.config.algorithm.get(
+                                        "cf_branch_max_events_per_sample", 0
+                                    )
+                                )
+                                cf_branch_k = self.config.algorithm.get("cf_branch_k", 1)
+                                try:
+                                    cf_branch_k = int(cf_branch_k)
+                                except Exception:
+                                    cf_branch_k = 1
+                                if cf_branch_k < 1:
+                                    cf_branch_k = 1
+                                # In cf-branch mode, default to "all interventions" unless explicitly set.
+                                try:
+                                    if use_cf_branch and int(cf_branch_max_events_per_sample) <= 0:
+                                        cf_branch_max_events_per_sample = int(
+                                            max_interventions
+                                        )
+                                except Exception:
+                                    if use_cf_branch:
+                                        cf_branch_max_events_per_sample = int(
+                                            max_interventions
+                                        )
+                                cf_branch_state_hash_mod = self.config.algorithm.get(
+                                    "cf_branch_state_hash_mod", 1024
+                                )
                                 gen_batch_output = (
                                     self.actor_rollout_wg.dual_stream_rollout(
                                         gen_batch_repeated,
                                         intervention_mode=intervention_mode,
+                                        stream_mode="exp" if use_cf_branch else "both",
                                         token_check_interval=token_check_interval,
+                                        min_step_tokens=min_step_tokens,
                                         max_interventions=max_interventions,
                                         confidence_threshold=confidence_threshold,
+                                        cf_branching=use_cf_branch,
+                                        cf_branch_prob=cf_branch_prob,
+                                        cf_branch_max_events_per_sample=cf_branch_max_events_per_sample,
+                                        cf_branch_state_hash_mod=cf_branch_state_hash_mod,
+                                        cf_branch_k=cf_branch_k,
                                     )
                                 )
                             else:
@@ -1795,7 +1836,11 @@ class RayPPOTrainer:
                     # - Co-GRPO: repeat n times, each generates 1 pair (control+exp) → n pairs (2n samples) per prompt
                     batch = batch.repeat(
                         repeat_times=self.config.actor_rollout_ref.rollout.n,
-                        interleave=True,
+                        # Must match the rollout's row order:
+                        # - Regular rollout uses vLLM's internal `n`, which returns repeat_interleave-like ordering.
+                        # - Co-GRPO repeats prompts on the driver (`gen_batch_repeated`), and we intentionally
+                        #   use non-interleaved tiling to reduce per-rank length imbalance.
+                        interleave=(not use_co_grpo),
                     )
                     if use_co_grpo and sample_uids is not None:
                         batch.non_tensor_batch["sample_uid"] = sample_uids
@@ -1803,15 +1848,34 @@ class RayPPOTrainer:
 
                     # For Co-GRPO, handle response masks for both streams
                     if use_co_grpo:
-                        # Check if masks already exist from rollout (to avoid recomputation)
-                        if (
-                            "control_response_mask" not in batch.batch
-                            or "exp_response_mask" not in batch.batch
-                        ):
-                            # Compute response masks for both streams
-                            from verl.utils.torch_functional import get_response_mask
+                        # Compute response masks per stream if missing. When using cf-branch
+                        # credit assignment we may only have EXP stream (no global control).
+                        from verl.utils.torch_functional import get_response_mask
 
-                            eos_token_id = batch.meta_info["eos_token_id"]
+                        eos_token_id = batch.meta_info["eos_token_id"]
+                        if (
+                            "exp_response_mask" not in batch.batch
+                            and "exp_responses" in batch.batch
+                        ):
+                            batch.batch["exp_response_mask"] = get_response_mask(
+                                response_id=batch.batch["exp_responses"],
+                                eos_token=eos_token_id,
+                                dtype=batch.batch["exp_attention_mask"].dtype,
+                            )
+                            try:
+                                pad_id = int(self.tokenizer.pad_token_id)
+                                batch.batch["exp_response_mask"] = batch.batch[
+                                    "exp_response_mask"
+                                ] * (batch.batch["exp_responses"] != pad_id).to(
+                                    batch.batch["exp_attention_mask"].dtype
+                                )
+                            except Exception:
+                                pass
+
+                        if (
+                            "control_responses" in batch.batch
+                            and "control_response_mask" not in batch.batch
+                        ):
                             batch.batch["control_response_mask"] = get_response_mask(
                                 response_id=batch.batch["control_responses"],
                                 eos_token=eos_token_id,
@@ -1824,20 +1888,6 @@ class RayPPOTrainer:
                                     "control_response_mask"
                                 ] * (batch.batch["control_responses"] != pad_id).to(
                                     batch.batch["control_attention_mask"].dtype
-                                )
-                            except Exception:
-                                pass
-                            batch.batch["exp_response_mask"] = get_response_mask(
-                                response_id=batch.batch["exp_responses"],
-                                eos_token=eos_token_id,
-                                dtype=batch.batch["exp_attention_mask"].dtype,
-                            )
-                            try:
-                                pad_id = int(self.tokenizer.pad_token_id)
-                                batch.batch["exp_response_mask"] = batch.batch[
-                                    "exp_response_mask"
-                                ] * (batch.batch["exp_responses"] != pad_id).to(
-                                    batch.batch["exp_attention_mask"].dtype
                                 )
                             except Exception:
                                 pass
@@ -1859,11 +1909,13 @@ class RayPPOTrainer:
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     if use_co_grpo:
                         try:
-                            control_resp_lens = (
-                                batch.batch["control_response_mask"]
-                                .to(torch.float32)
-                                .sum(dim=1)
-                            )
+                            control_resp_lens = None
+                            if "control_response_mask" in batch.batch:
+                                control_resp_lens = (
+                                    batch.batch["control_response_mask"]
+                                    .to(torch.float32)
+                                    .sum(dim=1)
+                                )
                             if "exp_last_valid_pos" in batch.batch:
                                 exp_resp_lens = batch.batch["exp_last_valid_pos"].to(
                                     torch.float32
@@ -1875,21 +1927,24 @@ class RayPPOTrainer:
                                     .sum(dim=1)
                                 )
 
-                            metrics["co_grpo/control_response_len_mean"] = (
-                                control_resp_lens.mean().item()
-                            )
-                            metrics["co_grpo/control_response_len_std"] = (
-                                control_resp_lens.std(unbiased=False).item()
-                            )
+                            if control_resp_lens is not None:
+                                metrics["co_grpo/control_response_len_mean"] = (
+                                    control_resp_lens.mean().item()
+                                )
+                                metrics["co_grpo/control_response_len_std"] = (
+                                    control_resp_lens.std(unbiased=False).item()
+                                )
                             metrics["co_grpo/exp_response_len_mean"] = (
                                 exp_resp_lens.mean().item()
                             )
                             metrics["co_grpo/exp_response_len_std"] = exp_resp_lens.std(
                                 unbiased=False
                             ).item()
-                            metrics["co_grpo/exp_control_response_len_ratio"] = (
-                                exp_resp_lens.mean() / (control_resp_lens.mean() + 1e-6)
-                            ).item()
+                            if control_resp_lens is not None:
+                                metrics["co_grpo/exp_control_response_len_ratio"] = (
+                                    exp_resp_lens.mean()
+                                    / (control_resp_lens.mean() + 1e-6)
+                                ).item()
 
                             if "exp_loss_mask" in batch.batch:
                                 exp_policy_lens = (
@@ -1928,7 +1983,447 @@ class RayPPOTrainer:
 
                     with _timer("reward", timing_raw):
                         # For Co-GRPO, compute rewards for both control and experimental streams
-                        if use_co_grpo:
+                        verifier_credit_assignment = "global_gap"
+                        try:
+                            verifier_credit_assignment = str(
+                                self.config.algorithm.get(
+                                    "verifier_credit_assignment", "global_gap"
+                                )
+                            )
+                        except Exception:
+                            verifier_credit_assignment = "global_gap"
+                        use_cf_branch = bool(
+                            use_co_grpo
+                            and verifier_credit_assignment.lower() in ("cf_branch", "cf")
+                        )
+
+                        if use_cf_branch:
+                            # CF-Branch mode: no global control stream.
+                            # - Policy uses EXP rewards.
+                            # - Verifier step credit uses per-event counterfactual baseline:
+                            #     Δ_j = R_main(sample) - R0(event_uid) - cost_j
+                            exp_batch = batch.select(
+                                batch_keys=[
+                                    "exp_input_ids",
+                                    "exp_attention_mask",
+                                    "exp_position_ids",
+                                    "exp_loss_mask",
+                                ],
+                                non_tensor_batch_keys=list(batch.non_tensor_batch.keys()),
+                            )
+                            exp_batch.batch["input_ids"] = exp_batch.batch.pop(
+                                "exp_input_ids"
+                            )
+                            exp_batch.batch["attention_mask"] = exp_batch.batch.pop(
+                                "exp_attention_mask"
+                            )
+                            exp_batch.batch["position_ids"] = exp_batch.batch.pop(
+                                "exp_position_ids"
+                            )
+                            exp_batch.batch["responses"] = batch.batch["exp_responses"]
+                            if "exp_prompts" in batch.batch.keys():
+                                exp_batch.batch["prompts"] = batch.batch["exp_prompts"]
+                            else:
+                                exp_prompt_len = exp_batch.batch["input_ids"].size(
+                                    1
+                                ) - batch.batch["exp_responses"].size(1)
+                                exp_batch.batch["prompts"] = exp_batch.batch["input_ids"][
+                                    ..., :exp_prompt_len
+                                ]
+                            exp_batch.non_tensor_batch["stream_type"] = ["exp"] * int(
+                                exp_batch.batch.size(0)
+                            )
+                            exp_batch.non_tensor_batch["global_step"] = np.full(
+                                (len(exp_batch),), self.global_steps, dtype=np.int64
+                            )
+
+                            cf_control_batch = batch.meta_info.get("cf_control_batch", None)
+                            cf_eval_batch = None
+                            if cf_control_batch is not None and len(cf_control_batch) > 0:
+                                cf_eval_batch = cf_control_batch.select(
+                                    batch_keys=[
+                                        "exp_input_ids",
+                                        "exp_attention_mask",
+                                        "exp_position_ids",
+                                        "exp_loss_mask",
+                                    ],
+                                    non_tensor_batch_keys=list(
+                                        cf_control_batch.non_tensor_batch.keys()
+                                    ),
+                                )
+                                cf_eval_batch.batch["input_ids"] = cf_eval_batch.batch.pop(
+                                    "exp_input_ids"
+                                )
+                                cf_eval_batch.batch["attention_mask"] = cf_eval_batch.batch.pop(
+                                    "exp_attention_mask"
+                                )
+                                cf_eval_batch.batch["position_ids"] = cf_eval_batch.batch.pop(
+                                    "exp_position_ids"
+                                )
+                                cf_eval_batch.batch["responses"] = cf_control_batch.batch[
+                                    "exp_responses"
+                                ]
+                                exp_prompt_len = cf_eval_batch.batch["input_ids"].size(
+                                    1
+                                ) - cf_control_batch.batch["exp_responses"].size(1)
+                                cf_eval_batch.batch["prompts"] = cf_eval_batch.batch[
+                                    "input_ids"
+                                ][..., :exp_prompt_len]
+                                cf_eval_batch.non_tensor_batch["stream_type"] = [
+                                    "control"
+                                ] * int(cf_eval_batch.batch.size(0))
+                                cf_eval_batch.non_tensor_batch["global_step"] = np.full(
+                                    (len(cf_eval_batch),),
+                                    self.global_steps,
+                                    dtype=np.int64,
+                                )
+
+                                # NOTE: The rollout worker only receives a generation-only DataProto
+                                # (input_ids/attention_mask/position_ids + a few debug keys). Reward metadata
+                                # like `data_source` / `reward_model` / `extra_info` lives in the training batch
+                                # (kept on driver) and is NOT present in cf_control_batch. Re-attach it here.
+                                # Prefer joining by (sample_uid -> current batch index).
+                                # This is robust to `batch.reorder(...)` from `trainer.balance_batch=True`.
+                                cf_parent_idx = None
+                                cf_parent_sample_uid = cf_eval_batch.non_tensor_batch.get(
+                                    "cf_parent_sample_uid", None
+                                )
+                                batch_sample_uid = batch.non_tensor_batch.get(
+                                    "sample_uid", None
+                                )
+                                if (
+                                    cf_parent_sample_uid is not None
+                                    and batch_sample_uid is not None
+                                ):
+                                    try:
+                                        uid_to_idx = {
+                                            str(u): i
+                                            for i, u in enumerate(batch_sample_uid)
+                                        }
+                                        mapped = [
+                                            int(uid_to_idx.get(str(u), 0))
+                                            for u in cf_parent_sample_uid
+                                        ]
+                                        cf_parent_idx = np.asarray(mapped, dtype=np.int64)
+                                    except Exception:
+                                        cf_parent_idx = None
+
+                                if cf_parent_idx is None:
+                                    # Fallback: pre-rollout index (only correct if batch was not reordered).
+                                    cf_parent_idx = cf_eval_batch.non_tensor_batch.get(
+                                        "cf_parent_idx", None
+                                    )
+
+                                if cf_parent_idx is not None:
+                                    try:
+                                        cf_parent_idx = np.asarray(
+                                            cf_parent_idx, dtype=np.int64
+                                        )
+                                    except Exception:
+                                        cf_parent_idx = None
+
+                                if cf_parent_idx is not None:
+                                    for meta_key in ("data_source", "reward_model", "extra_info"):
+                                        if (
+                                            meta_key not in cf_eval_batch.non_tensor_batch
+                                            and meta_key in batch.non_tensor_batch
+                                        ):
+                                            try:
+                                                cf_eval_batch.non_tensor_batch[meta_key] = (
+                                                    batch.non_tensor_batch[meta_key][
+                                                        cf_parent_idx
+                                                    ]
+                                                )
+                                            except Exception as e:
+                                                logger.warning(
+                                                    f"[CF_BRANCH] Failed to attach {meta_key} to cf_eval_batch: {e}"
+                                                )
+
+                            cf_reward_tensor = None
+                            if self.config.reward_model.launch_reward_fn_async:
+                                tokenizer_name_or_path = self.tokenizer.name_or_path
+                                future_exp_reward = compute_reward_async.remote(
+                                    exp_batch, self.config, tokenizer_name_or_path
+                                )
+                                if cf_eval_batch is not None:
+                                    future_cf_reward = compute_reward_async.remote(
+                                        cf_eval_batch, self.config, tokenizer_name_or_path
+                                    )
+                                    exp_reward_tensor, _ = ray.get(future_exp_reward)
+                                    cf_reward_tensor, _ = ray.get(future_cf_reward)
+                                else:
+                                    exp_reward_tensor, _ = ray.get(future_exp_reward)
+                            else:
+                                exp_reward_tensor, _ = compute_reward(
+                                    exp_batch, self.reward_fn
+                                )
+                                if cf_eval_batch is not None:
+                                    cf_reward_tensor, _ = compute_reward(
+                                        cf_eval_batch, self.reward_fn
+                                    )
+
+                            # Ensure rewards are token-level (expand to match response length).
+                            exp_resp_len = batch.batch["exp_responses"].size(1)
+                            if exp_reward_tensor.dim() == 1:
+                                exp_token_rewards = exp_reward_tensor.unsqueeze(-1).expand(
+                                    -1, exp_resp_len
+                                )
+                            else:
+                                exp_token_rewards = exp_reward_tensor
+
+                            batch.batch["exp_token_level_rewards"] = exp_token_rewards
+                            batch.batch["token_level_rewards"] = exp_token_rewards
+                            reward_tensor = exp_token_rewards
+                            reward_extra_infos_dict = {}
+
+                            # Prepare verifier training batch (by_step intervention trajectories).
+                            verifier_batch = batch.meta_info.get("verifier_batch", None)
+                            if (
+                                verifier_batch is not None
+                                and len(verifier_batch) > 0
+                                and cf_control_batch is not None
+                                and len(cf_control_batch) > 0
+                                and cf_reward_tensor is not None
+                            ):
+                                try:
+                                    from verl.trainer.ppo.core_algos import (
+                                        compute_grpo_outcome_advantage,
+                                    )
+
+                                    verifier_batch = verifier_batch.to("cpu")
+                                    parent_sample_uids = (
+                                        verifier_batch.non_tensor_batch.get(
+                                            "parent_sample_uid", None
+                                        )
+                                    )
+                                    parent_group_uids = (
+                                        verifier_batch.non_tensor_batch.get(
+                                            "parent_uid", None
+                                        )
+                                    )
+                                    step_indices = verifier_batch.non_tensor_batch.get(
+                                        "step_idx", None
+                                    )
+                                    event_uids = verifier_batch.non_tensor_batch.get(
+                                        "event_uid", None
+                                    )
+                                    hint_token_counts = verifier_batch.non_tensor_batch.get(
+                                        "hint_token_count", None
+                                    )
+                                    prefix_lens = verifier_batch.non_tensor_batch.get(
+                                        "prefix_len", None
+                                    )
+                                    wait_conf = verifier_batch.non_tensor_batch.get(
+                                        "wait_confidence", None
+                                    )
+                                    state_hash_bucket = verifier_batch.non_tensor_batch.get(
+                                        "state_hash_bucket", None
+                                    )
+
+                                    if (
+                                        parent_sample_uids is None
+                                        or parent_group_uids is None
+                                        or step_indices is None
+                                        or event_uids is None
+                                    ):
+                                        raise ValueError(
+                                            "verifier_batch missing required non_tensor fields: "
+                                            "parent_uid/parent_sample_uid/step_idx/event_uid"
+                                        )
+
+                                    batch_sample_uids = batch.non_tensor_batch.get(
+                                        "sample_uid", None
+                                    )
+                                    if batch_sample_uids is None:
+                                        raise ValueError(
+                                            "batch missing non_tensor_batch['sample_uid']"
+                                        )
+
+                                    def _to_outcome_reward(reward_tensor):
+                                        if reward_tensor.dim() == 1:
+                                            return reward_tensor
+                                        if reward_tensor.size(-1) == 1:
+                                            return reward_tensor.squeeze(-1)
+                                        return reward_tensor.sum(dim=-1)
+
+                                    exp_outcome = _to_outcome_reward(exp_reward_tensor).detach().to(
+                                        "cpu"
+                                    )
+                                    reward_by_sample_uid = {
+                                        str(batch_sample_uids[i]): float(
+                                            exp_outcome[i].item()
+                                        )
+                                        for i in range(len(batch_sample_uids))
+                                    }
+
+                                    cf_event_uids = cf_control_batch.non_tensor_batch.get(
+                                        "cf_event_uid", None
+                                    )
+                                    if cf_event_uids is None:
+                                        raise ValueError(
+                                            "cf_control_batch missing non_tensor_batch['cf_event_uid']"
+                                        )
+                                    cf_outcome = _to_outcome_reward(cf_reward_tensor).detach().to(
+                                        "cpu"
+                                    )
+                                    # When cf_branch_k>1, the same event_uid appears multiple times.
+                                    # Aggregate by mean to reduce reward variance.
+                                    reward_sum = {}
+                                    reward_count = {}
+                                    for i in range(len(cf_event_uids)):
+                                        ev = str(cf_event_uids[i])
+                                        reward_sum[ev] = float(reward_sum.get(ev, 0.0)) + float(
+                                            cf_outcome[i].item()
+                                        )
+                                        reward_count[ev] = int(reward_count.get(ev, 0)) + 1
+                                    reward_by_event_uid = {
+                                        ev: float(reward_sum[ev]) / float(max(1, reward_count[ev]))
+                                        for ev in reward_sum.keys()
+                                    }
+
+                                    lambda_freq = 0.0
+                                    lambda_len = 0.0
+                                    if hasattr(self.config.algorithm, "intervention_penalty"):
+                                        penalty_config = (
+                                            self.config.algorithm.intervention_penalty
+                                        )
+                                        lambda_freq = float(
+                                            penalty_config.get("freq_coef", 0.0)
+                                        )
+                                        lambda_len = float(
+                                            penalty_config.get("len_coef", 0.0)
+                                        )
+
+                                    keep_idxs = []
+                                    step_rewards = []
+                                    costs = []
+                                    group_index = []
+                                    missing_cf = 0
+                                    for j in range(len(verifier_batch)):
+                                        ev = str(event_uids[j])
+                                        r0 = reward_by_event_uid.get(ev, None)
+                                        if r0 is None:
+                                            missing_cf += 1
+                                            continue
+
+                                        su = str(parent_sample_uids[j])
+                                        gu = str(parent_group_uids[j])
+                                        step_idx = int(step_indices[j])
+                                        r_main = float(reward_by_sample_uid.get(su, 0.0))
+
+                                        hint_len = 0
+                                        if hint_token_counts is not None:
+                                            try:
+                                                hint_len = int(hint_token_counts[j])
+                                            except Exception:
+                                                hint_len = 0
+                                        cost = lambda_freq + (lambda_len * hint_len / 100.0)
+                                        delta = (r_main - float(r0)) - float(cost)
+
+                                        keep_idxs.append(j)
+                                        step_rewards.append(float(delta))
+                                        costs.append(float(cost))
+
+                                        prefix_bucket = -1
+                                        conf_bucket = -1
+                                        hash_bucket = -1
+                                        if prefix_lens is not None:
+                                            try:
+                                                prefix_bucket = int(prefix_lens[j]) // 2048
+                                            except Exception:
+                                                prefix_bucket = -1
+                                        if wait_conf is not None:
+                                            try:
+                                                wc = float(wait_conf[j])
+                                                if not math.isnan(wc):
+                                                    conf_bucket = int(wc * 20)
+                                            except Exception:
+                                                conf_bucket = -1
+                                        if state_hash_bucket is not None:
+                                            try:
+                                                hash_bucket = int(state_hash_bucket[j])
+                                            except Exception:
+                                                hash_bucket = -1
+
+                                        group_index.append(
+                                            f"{gu}:{step_idx}:{prefix_bucket}:{conf_bucket}:{hash_bucket}"
+                                        )
+
+                                    if not keep_idxs:
+                                        raise ValueError(
+                                            "No verifier interventions have counterfactual baselines."
+                                        )
+
+                                    verifier_batch = verifier_batch.select_idxs(keep_idxs)
+                                    step_rewards_t = torch.tensor(
+                                        step_rewards, dtype=torch.float32
+                                    )
+                                    response_len = int(
+                                        verifier_batch.batch["responses"].size(1)
+                                    )
+                                    verifier_response_mask = verifier_batch.batch[
+                                        "attention_mask"
+                                    ][:, -response_len:].to(torch.float32)
+                                    token_counts = verifier_response_mask.sum(
+                                        dim=-1, keepdim=True
+                                    ).clamp_min(1.0)
+                                    token_level_rewards = (
+                                        step_rewards_t.unsqueeze(-1) / token_counts
+                                    ) * verifier_response_mask
+
+                                    advantages, _ = compute_grpo_outcome_advantage(
+                                        token_level_rewards=token_level_rewards,
+                                        response_mask=verifier_response_mask,
+                                        index=np.array(group_index, dtype=object),
+                                        norm_adv_by_std_in_grpo=True,
+                                    )
+
+                                    verifier_loss_weight = float(
+                                        getattr(self.config, "verifier", {}).get(
+                                            "loss_weight", 1.0
+                                        )
+                                    )
+                                    verifier_batch.batch["advantages"] = (
+                                        advantages * verifier_loss_weight
+                                    )
+                                    verifier_batch.non_tensor_batch["step_reward"] = np.array(
+                                        step_rewards, dtype=np.float32
+                                    )
+                                    verifier_batch.non_tensor_batch["step_cost"] = np.array(
+                                        costs, dtype=np.float32
+                                    )
+                                    verifier_batch.non_tensor_batch["group_index"] = np.array(
+                                        group_index, dtype=object
+                                    )
+                                    batch.meta_info["verifier_train_batch"] = verifier_batch
+
+                                    step_rewards_t_cpu = step_rewards_t.detach()
+                                    metrics["co_grpo/cf_delta_mean"] = float(
+                                        step_rewards_t_cpu.mean().item()
+                                    )
+                                    metrics["co_grpo/cf_delta_std"] = float(
+                                        step_rewards_t_cpu.std(unbiased=False).item()
+                                    )
+                                    metrics["co_grpo/cf_delta_pos_ratio"] = float(
+                                        (step_rewards_t_cpu > 0).float().mean().item()
+                                    )
+                                    metrics["co_grpo/cf_missing_ratio"] = float(
+                                        missing_cf / max(1, len(event_uids))
+                                    )
+                                    if costs:
+                                        metrics["co_grpo/cf_cost_mean"] = float(
+                                            np.mean(costs)
+                                        )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Failed to build verifier_train_batch (cf-branch): {e}"
+                                    )
+
+                            # Drop large cf-control rollouts after reward mapping to
+                            # avoid bloating the training batch/meta_info.
+                            batch.meta_info.pop("cf_control_batch", None)
+
+                        elif use_co_grpo:
                             # Compute rewards for control stream
                             # [CORRECT FIX] Exclude exp-specific metadata to avoid logging confusion
                             exp_specific_fields = {
@@ -3256,12 +3751,18 @@ class RayPPOTrainer:
                             # For Co-GRPO, also dump control/exp streams separately to compare intervention effect
                             extra_infos = dict(reward_extra_infos_dict)
                             if use_co_grpo:
-                                control_prompt_len = batch.batch[
-                                    "control_input_ids"
-                                ].size(1) - batch.batch["control_responses"].size(1)
-                                control_prompts = batch.batch["control_input_ids"][
-                                    ..., :control_prompt_len
-                                ]
+                                has_control_stream = (
+                                    "control_input_ids" in batch.batch
+                                    and "control_responses" in batch.batch
+                                )
+
+                                if has_control_stream:
+                                    control_prompt_len = batch.batch[
+                                        "control_input_ids"
+                                    ].size(1) - batch.batch["control_responses"].size(1)
+                                    control_prompts = batch.batch["control_input_ids"][
+                                        ..., :control_prompt_len
+                                    ]
                                 exp_prompt_len = batch.batch["exp_input_ids"].size(
                                     1
                                 ) - batch.batch["exp_responses"].size(1)
@@ -3269,20 +3770,22 @@ class RayPPOTrainer:
                                     ..., :exp_prompt_len
                                 ]
 
-                                extra_infos["control_prompt"] = (
-                                    self.tokenizer.batch_decode(
-                                        control_prompts, skip_special_tokens=True
+                                if has_control_stream:
+                                    extra_infos["control_prompt"] = (
+                                        self.tokenizer.batch_decode(
+                                            control_prompts, skip_special_tokens=True
+                                        )
                                     )
-                                )
                                 extra_infos["exp_prompt"] = self.tokenizer.batch_decode(
                                     exp_prompts, skip_special_tokens=True
                                 )
-                                extra_infos["control_output"] = (
-                                    self.tokenizer.batch_decode(
-                                        batch.batch["control_responses"],
-                                        skip_special_tokens=True,
+                                if has_control_stream:
+                                    extra_infos["control_output"] = (
+                                        self.tokenizer.batch_decode(
+                                            batch.batch["control_responses"],
+                                            skip_special_tokens=True,
+                                        )
                                     )
-                                )
                                 extra_infos["exp_output"] = self.tokenizer.batch_decode(
                                     batch.batch["exp_responses"],
                                     skip_special_tokens=True,

@@ -464,10 +464,23 @@ class NaiveRewardManager:
                         file=sys.stderr,
                     )
                 dump_record["stream_type"] = "exp"
-                dump_record["hints"] = data_item.non_tensor_batch.get("hints", "")
+                hints_text = data_item.non_tensor_batch.get("hints", "") or ""
+                dump_record["hints"] = hints_text
                 dump_record["critiques"] = data_item.non_tensor_batch.get(
                     "critiques", ""
                 )
+                # Debug aid: detect "hint lost" (hints exist but not found in final response).
+                # This should not happen except when response is truncated by max length.
+                try:
+                    missing = 0
+                    if isinstance(hints_text, str) and hints_text.strip():
+                        for line in (l.strip() for l in hints_text.splitlines()):
+                            if line and line not in full_response_with_hints:
+                                missing += 1
+                    if missing > 0:
+                        dump_record["missing_hint_lines"] = int(missing)
+                except Exception:
+                    pass
                 # NOTE: Do not dump `policy_only_response` (redundant with `full_response`).
                 # Rollout-side diagnostics (best-effort; may be absent depending on rollout implementation)
                 for k in (

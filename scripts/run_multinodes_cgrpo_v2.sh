@@ -66,6 +66,19 @@ trainer_verifier_lora_sync_freq="${52:-1}"
 trainer_verifier_lora_save_freq="${53:-20}"
 
 max_prompt_length="${54:-1024}"
+verifier_credit_assignment="${55:-global_gap}"
+cf_branch_prob="${56:-1.0}"
+cf_branch_max_events_per_sample="${57:-0}"
+cf_branch_state_hash_mod="${58:-1024}"
+cf_branch_k="${CF_BRANCH_K:-1}"
+if ! [[ "${cf_branch_k}" =~ ^[0-9]+$ ]]; then
+  echo "[launcher][ERR] CF_BRANCH_K must be an integer (got ${cf_branch_k})." >&2
+  exit 2
+fi
+if [ "${cf_branch_k}" -lt 1 ]; then
+  echo "[launcher][ERR] CF_BRANCH_K must be >=1 (got ${cf_branch_k})." >&2
+  exit 2
+fi
 
 cd /mnt/shared-storage-user/liuhongwei/main_works/repos/repro
 
@@ -79,7 +92,7 @@ export VERL_AUTO_PADDING="1"
 export RAY_record_ref_creation_sites="1"
 export VERL_NCCL_TIMEOUT_SEC="1800"
 export VERL_DEBUG="${verl_debug}"
-export REWARD_MODEL_URLS="${REWARD_MODEL_URLS:-http://100.101.166.1:22005/v1,http://100.101.166.1:22004/v1,http://100.101.166.1:22003/v1,http://100.101.166.1:22002/v1}"
+export REWARD_MODEL_URLS="${REWARD_MODEL_URLS:-http://100.96.129.1:21000/v1,http://100.96.129.1:21001/v1,http://100.99.155.1:21002/v1,http://100.99.155.1:21003/v1}"
 export REWARD_MODEL_KEY="${REWARD_MODEL_KEY:-EMPTY}"
 
 # Bypass any HTTP proxy for internal reward endpoints.
@@ -115,6 +128,12 @@ case "${parallel_control_exp_norm}" in
     exit 2
     ;;
 esac
+
+# cf-branch credit assignment runs EXP-only (no global control stream).
+verifier_credit_assignment_norm="$(echo "${verifier_credit_assignment}" | tr '[:upper:]' '[:lower:]')"
+if [ "${verifier_credit_assignment_norm}" = "cf_branch" ] || [ "${verifier_credit_assignment_norm}" = "cf" ]; then
+  parallel_control_exp=False
+fi
 
 if [ "${preset}" = "mini" ]; then
   if [ -z "${co_grpo_mode}" ]; then
@@ -183,6 +202,18 @@ if [ "$((max_model_len - verifier_max_new_tokens))" -lt "${verifier_max_prompt_l
   echo "[launcher][WARN] verifier prompt budget may be clamped: max_model_len(${max_model_len}) - verifier_max_new_tokens(${verifier_max_new_tokens}) < verifier_max_prompt_length(${verifier_max_prompt_length})" >&2
 fi
 
+# Parallelism knobs (must be defined before FSDP batch-size sanity checks).
+sp=1
+num_generation_per_prompt="${ROLLOUT_N:-8}"
+if ! [[ "${num_generation_per_prompt}" =~ ^[0-9]+$ ]]; then
+  echo "[launcher][ERR] ROLLOUT_N must be an integer (got ${num_generation_per_prompt})." >&2
+  exit 2
+fi
+if [ "${num_generation_per_prompt}" -lt 1 ]; then
+  echo "[launcher][ERR] ROLLOUT_N must be >=1 (got ${num_generation_per_prompt})." >&2
+  exit 2
+fi
+
 # rollout micro-batching knobs
 use_dynamic_bsz="${use_dynamic_bsz:-False}"
 use_dynamic_bsz_norm="$(echo "${use_dynamic_bsz}" | tr '[:upper:]' '[:lower:]')"
@@ -191,9 +222,71 @@ ppo_micro_batch_size_per_gpu="${micro_bsz_per_gpu}"
 ref_log_prob_micro_batch_size_per_gpu="${micro_bsz_per_gpu}"
 rollout_log_prob_micro_batch_size_per_gpu="${micro_bsz_per_gpu}"
 
+if ! [[ "${train_batch_size}" =~ ^[0-9]+$ ]] || ! [[ "${ppo_micro_batch_size_per_gpu}" =~ ^[0-9]+$ ]]; then
+  echo "[launcher][ERR] train_batch_size and micro_bsz_per_gpu must be integers (got train_batch_size=${train_batch_size}, micro_bsz_per_gpu=${ppo_micro_batch_size_per_gpu})" >&2
+  exit 2
+fi
+if [ "${ppo_micro_batch_size_per_gpu}" -lt 1 ]; then
+  echo "[launcher][ERR] micro_bsz_per_gpu must be >=1 (got ${ppo_micro_batch_size_per_gpu})" >&2
+  exit 2
+fi
+# Match FSDP normalization in `verl/workers/fsdp_workers.py`:
+#   normalized_ppo_mini_batch_size = ppo_mini_batch_size * rollout.n // dp_size
+# This normalized value must be divisible by `ppo_micro_batch_size_per_gpu`.
+world_size="$((nnodes * n_gpus_per_node))"
+if [ "${sp}" -lt 1 ]; then
+  echo "[launcher][ERR] ulysses_sequence_parallel_size (sp) must be >=1 (got ${sp})" >&2
+  exit 2
+fi
+if [ "$((world_size % sp))" -ne 0 ]; then
+  echo "[launcher][ERR] world_size(${world_size}) must be divisible by sp(${sp}) for FSDP normalization." >&2
+  exit 2
+fi
+dp_size="$((world_size / sp))"
+mini_times_n="$((train_batch_size * num_generation_per_prompt))"
+if [ "$((mini_times_n % dp_size))" -ne 0 ]; then
+  echo "[launcher][ERR] ppo_mini_batch_size(${train_batch_size}) * rollout.n(${num_generation_per_prompt}) must be divisible by dp_size(${dp_size})." >&2
+  echo "[launcher][HINT] Adjust --train-bsz so that train_batch_size * num_generation_per_prompt / dp_size is an integer." >&2
+  exit 2
+fi
+normalized_mini="$((mini_times_n / dp_size))"
+if [ "${normalized_mini}" -lt 1 ]; then
+  echo "[launcher][ERR] normalized ppo_mini_batch_size is < 1 (got ${normalized_mini}). Increase train_batch_size." >&2
+  exit 2
+fi
+if [ "$((normalized_mini % ppo_micro_batch_size_per_gpu))" -ne 0 ]; then
+  echo "[launcher][ERR] normalized ppo_mini_batch_size(${normalized_mini}) must be divisible by micro_bsz_per_gpu(${ppo_micro_batch_size_per_gpu})." >&2
+  echo "[launcher][INFO] normalized_mini = train_batch_size(${train_batch_size}) * rollout.n(${num_generation_per_prompt}) / dp_size(${dp_size})" >&2
+  exit 2
+fi
+
 actor_ppo_max_token_len="$((2 * max_prompt_length + 2 * max_response_length))"
 ref_ppo_max_token_len="$((2 * max_prompt_length + 2 * max_response_length))"
-rollout_max_num_batched_tokens="$((2 * max_prompt_length + 2 * max_response_length))"
+rollout_max_num_batched_tokens_default="$((2 * max_prompt_length + 2 * max_response_length))"
+# vLLM scheduler limits concurrency by total tokens across active sequences. In by_step mode
+# sequences can quickly grow to many thousands of tokens; the default (2*(prompt+response))
+# may underutilize GPUs by forcing micro-batching. Allow explicit override.
+rollout_max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${rollout_max_num_batched_tokens_default}}"
+if ! [[ "${rollout_max_num_batched_tokens}" =~ ^[0-9]+$ ]]; then
+  echo "[launcher][ERR] ROLLOUT_MAX_NUM_BATCHED_TOKENS must be an integer (got ${rollout_max_num_batched_tokens})." >&2
+  exit 2
+fi
+if [ "${rollout_max_num_batched_tokens}" -lt 1 ]; then
+  echo "[launcher][ERR] ROLLOUT_MAX_NUM_BATCHED_TOKENS must be >=1 (got ${rollout_max_num_batched_tokens})." >&2
+  exit 2
+fi
+
+# vLLM scheduler limits concurrency by both tokens and sequences.
+# Keep the default aligned with ppo_trainer.yaml (512) but allow override.
+rollout_max_num_seqs="${ROLLOUT_MAX_NUM_SEQS:-512}"
+if ! [[ "${rollout_max_num_seqs}" =~ ^[0-9]+$ ]]; then
+  echo "[launcher][ERR] ROLLOUT_MAX_NUM_SEQS must be an integer (got ${rollout_max_num_seqs})." >&2
+  exit 2
+fi
+if [ "${rollout_max_num_seqs}" -lt 1 ]; then
+  echo "[launcher][ERR] ROLLOUT_MAX_NUM_SEQS must be >=1 (got ${rollout_max_num_seqs})." >&2
+  exit 2
+fi
 
 control_rollout_gpus_per_node="$((n_gpus_per_node / 2))"
 exp_rollout_gpus_per_node="$((n_gpus_per_node - control_rollout_gpus_per_node))"
@@ -217,6 +310,10 @@ if [ "${parallel_control_exp}" = "True" ]; then
     echo "[launcher][ERR] control_rollout_gpus_per_node + exp_rollout_gpus_per_node must equal n_gpus_per_node (${n_gpus_per_node}) when PARALLEL_CONTROL_EXP=True (got control=${control_rollout_gpus_per_node}, exp=${exp_rollout_gpus_per_node})" >&2
     exit 2
   fi
+else
+  # Not used when PARALLEL_CONTROL_EXP=False; keep config readable.
+  control_rollout_gpus_per_node="null"
+  exp_rollout_gpus_per_node="null"
 fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
@@ -243,13 +340,11 @@ reward_async=True
 temperature=1.0
 top_p=1.0
 top_k=-1
-sp=1
 offload=False
 use_kl_loss=True
 kl_loss_coef=0.001
 clip_ratio_low=0.2
 clip_ratio_high=0.28
-num_generation_per_prompt=8
 
 if [ -z "${NODE_RANK:-}" ]; then NODE_RANK=0; fi
 if [ -z "${MASTER_ADDR:-}" ]; then MASTER_ADDR="127.0.0.1"; fi
@@ -341,6 +436,7 @@ if [ "${NODE_RANK}" = "0" ]; then
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${ref_ppo_max_token_len}" \
     actor_rollout_ref.rollout.n="${num_generation_per_prompt}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${rollout_max_num_batched_tokens}" \
+    actor_rollout_ref.rollout.max_num_seqs="${rollout_max_num_seqs}" \
     actor_rollout_ref.rollout.load_format=safetensors \
     +actor_rollout_ref.rollout.stop_token_ids=[151645] \
     reward_model.enable=False \
@@ -360,6 +456,11 @@ if [ "${NODE_RANK}" = "0" ]; then
     +algorithm.min_step_tokens="${min_step_tokens}" \
     +algorithm.max_interventions="${max_interventions}" \
     +algorithm.confidence_threshold="${confidence_threshold}" \
+    +algorithm.verifier_credit_assignment="${verifier_credit_assignment}" \
+    +algorithm.cf_branch_prob="${cf_branch_prob}" \
+    +algorithm.cf_branch_max_events_per_sample="${cf_branch_max_events_per_sample}" \
+    +algorithm.cf_branch_state_hash_mod="${cf_branch_state_hash_mod}" \
+    +algorithm.cf_branch_k="${cf_branch_k}" \
     +algorithm.intervention_penalty.freq_coef="${intervention_penalty_freq_coef}" \
     +algorithm.intervention_penalty.len_coef="${intervention_penalty_len_coef}" \
     +algorithm.verifier_reward_weighting.improve_coef="${verifier_reward_improve_coef}" \

@@ -18,9 +18,16 @@
 ```bash
 cd /mnt/shared-storage-user/liuhongwei/main_works/repos/repro
 
+# Step 0 (可选): 将旧版 pretty trajectory rollout 转成 rollout_w_answer 格式
+# 适用数据源: rollout_idx_*_trajectory.jsonl (多行 JSON 对象拼接)
+bash scripts/verifier_data_gen/run_step0_convert_trajectory_rollouts.sh \
+    /path/to/trajectory_root \
+    ./outputs/verifier_coldstart_from_trajectory \
+    math
+
 # 运行完整pipeline
 bash scripts/verifier_data_gen/run_verifier_data_pipeline_v2.sh \
-    /path/to/rollout_data \
+    ./outputs/verifier_coldstart_from_trajectory/rollout_w_answer \
     ./verifier_data_output
 ```
 
@@ -225,4 +232,3 @@ Pipeline完成后会输出：
 2. 确保有足够的磁盘空间存储中间文件
 3. 建议先用测试模式验证pipeline是否正常工作
 4. 最终数据需要验证格式是否符合训练要求
-

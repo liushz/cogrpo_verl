@@ -694,6 +694,12 @@ class DataProto:
         """Concat a list of DataProto. The batch is concatenated among dim=0.
         The meta_info is assumed to be identical and will use the first one.
 
+        NOTE: Some advanced rollouts (e.g. Co-GRPO by_step) attach additional
+        side-batches (also as DataProto) into meta_info (e.g. cf-control rollouts,
+        verifier trajectories). For DP_COMPUTE_PROTO collection, those meta_info
+        fields must be merged across ranks, otherwise only rank0's side-batch
+        survives after concat, silently dropping most training signals.
+
         Args:
             data (List[DataProto]): list of DataProto
 
@@ -710,7 +716,35 @@ class DataProto:
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
         cls = type(data[0]) if len(data) > 0 else DataProto
-        return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
+
+        # Merge meta_info: default to the first rank, but concat DataProto side-batches if present.
+        merged_meta_info = {}
+        if getattr(data[0], "meta_info", None):
+            try:
+                merged_meta_info = dict(data[0].meta_info)
+            except Exception:
+                merged_meta_info = data[0].meta_info
+
+        try:
+            all_meta_keys = set()
+            for d in data:
+                if getattr(d, "meta_info", None):
+                    all_meta_keys.update(d.meta_info.keys())
+
+            for key in all_meta_keys:
+                dp_vals = []
+                for d in data:
+                    mi = getattr(d, "meta_info", None) or {}
+                    v = mi.get(key, None)
+                    if isinstance(v, DataProto) and len(v) > 0:
+                        dp_vals.append(v)
+                if dp_vals:
+                    merged_meta_info[key] = DataProto.concat(dp_vals)
+        except Exception:
+            # Keep backward-compatible behavior on any unexpected meta_info types.
+            pass
+
+        return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=merged_meta_info)
 
     def reorder(self, indices):
         """

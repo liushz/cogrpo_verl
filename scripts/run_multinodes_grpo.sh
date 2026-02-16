@@ -12,8 +12,13 @@ export SWANLAB_LOG_DIR=/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit/v
 export VERL_AUTO_PADDING=1
 export MLFLOW_TRACKING_URI=sqlite:///mlruns.db
 
-export REWARD_MODEL_URLS="http://100.99.37.1:21002/v1,http://100.99.37.1:21000/v1,http://100.99.37.1:21003/v1,http://100.99.37.1:21001/v1"
-export REWARD_MODEL_KEY="EMPTY"
+export REWARD_MODEL_URLS="${REWARD_MODEL_URLS:-http://100.96.129.1:21000/v1,http://100.96.129.1:21001/v1,http://100.99.155.1:21002/v1,http://100.99.155.1:21003/v1}"
+export REWARD_MODEL_KEY="${REWARD_MODEL_KEY:-EMPTY}"
+
+# Bypass any HTTP proxy for internal reward endpoints.
+reward_proxy_hosts="$(echo "${REWARD_MODEL_URLS}" | tr ',' '\n' | sed -E 's#^[a-zA-Z]+://##; s#/.*$##; s#:.*$##' | paste -sd',' -)"
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}${reward_proxy_hosts},localhost,127.0.0.1"
+export no_proxy="${NO_PROXY}"
 
 model=$1
 
