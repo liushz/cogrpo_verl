@@ -192,7 +192,7 @@ rjob submit \
         dataset_info_json='/mnt/shared-storage-user/liuhongwei/main_works/repos/LLaMA-Factory/data/dataset_info.json' &&
         dataset_name='${dataset_name}' &&
         dataset_path='${dataset_path}' &&
-        python -c 'import json,sys,fcntl; p,name,file_path=sys.argv[1:4]; cfg={\"file_name\": file_path, \"formatting\": \"sharegpt\", \"columns\": {\"messages\": \"messages\"}, \"tags\": {\"role_tag\": \"role\", \"content_tag\": \"content\", \"user_tag\": \"user\", \"assistant_tag\": \"assistant\"}}; f=open(p, \"r+\", encoding=\"utf-8\"); fcntl.flock(f.fileno(), fcntl.LOCK_EX); d=json.load(f); existed=(name in d); d[name]=cfg; f.seek(0); f.truncate(); json.dump(d, f, ensure_ascii=False, indent=2); f.flush(); fcntl.flock(f.fileno(), fcntl.LOCK_UN); f.close(); print(\"dataset_info:\", (\"exists\" if existed else \"add\"), name)' \"$dataset_info_json\" \"$dataset_name\" \"$dataset_path\" &&
+        python -c 'import json,sys,fcntl; p,name,file_path=sys.argv[1:4]; cfg={\"file_name\": file_path, \"formatting\": \"sharegpt\", \"columns\": {\"messages\": \"messages\"}, \"tags\": {\"role_tag\": \"role\", \"content_tag\": \"content\", \"user_tag\": \"user\", \"assistant_tag\": \"assistant\"}}; f=open(p, \"r+\", encoding=\"utf-8\"); fcntl.flock(f.fileno(), fcntl.LOCK_EX); d=json.load(f); existed=(name in d); d[name]=cfg; f.seek(0); f.truncate(); json.dump(d, f, ensure_ascii=False, indent=2); f.flush(); fcntl.flock(f.fileno(), fcntl.LOCK_UN); f.close(); print(\"dataset_info:\", (\"exists\" if existed else \"add\"), name)' \"\$dataset_info_json\" \"\$dataset_name\" \"\$dataset_path\" &&
 
         # 创建输出目录
         mkdir -p $WORK_DIR &&
