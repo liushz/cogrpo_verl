@@ -18,7 +18,9 @@ Notes / tradeoffs:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import math
 import os
 import shlex
 import socket
@@ -203,6 +205,78 @@ def _format_hint_text(*, hint: str, response_text: str) -> str:
     else:
         prefix = "\n\n"
     return f"{prefix}{hint}\n\n"
+
+
+def _load_online_hint_injection_module() -> Any:
+    """
+    Load the online-canonical hint injection helpers (natural insertion, rollback guards).
+
+    Preferred: import from an installed `verl` package.
+    Fallback: dynamic import from a repo checkout path (set via $REPRO_ROOT or $ONLINE_HINT_INJECTION_PY).
+    """
+    # 1) Try normal import first (works if repro is installed / in PYTHONPATH).
+    try:
+        from verl.workers.rollout.vllm_rollout import verifier_hint_injection as inj  # type: ignore
+
+        return inj
+    except Exception:
+        pass
+
+    # 2) Dynamic import from file path.
+    candidates: List[Path] = []
+    p_env = (os.environ.get("ONLINE_HINT_INJECTION_PY") or "").strip()
+    if p_env:
+        candidates.append(Path(p_env))
+    repro_root = (os.environ.get("REPRO_ROOT") or "").strip()
+    if repro_root:
+        candidates.append(
+            Path(repro_root)
+            / "verl"
+            / "workers"
+            / "rollout"
+            / "vllm_rollout"
+            / "verifier_hint_injection.py"
+        )
+    # Default: repo-relative.
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        candidates.append(
+            repo_root
+            / "verl"
+            / "workers"
+            / "rollout"
+            / "vllm_rollout"
+            / "verifier_hint_injection.py"
+        )
+    except Exception:
+        pass
+
+    for p in candidates:
+        try:
+            if not p or not p.exists():
+                continue
+            spec = importlib.util.spec_from_file_location("_online_hint_injection", str(p))
+            if spec is None or spec.loader is None:
+                continue
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)  # type: ignore[attr-defined]
+            return m
+        except Exception:
+            continue
+
+    raise FileNotFoundError(
+        "Failed to load online hint injection helpers. Set $REPRO_ROOT to the repro checkout root "
+        "or $ONLINE_HINT_INJECTION_PY to verifier_hint_injection.py."
+    )
+
+
+# Prefer online-canonical verifier prompts from the shared hint injection module.
+try:
+    _inj_prompts0 = _load_online_hint_injection_module()
+    VERIFIER_SYSTEM_PROMPT = str(getattr(_inj_prompts0, "VERIFIER_SYSTEM_PROMPT", VERIFIER_SYSTEM_PROMPT))
+    VERIFIER_INTERVENE_PROMPT = str(getattr(_inj_prompts0, "VERIFIER_INTERVENE_PROMPT", VERIFIER_INTERVENE_PROMPT))
+except Exception:
+    pass
 
 
 def _load_tokenizer(model_dir: str):
@@ -645,19 +719,32 @@ def _build_verifier_prompt_ids(
     return prompt_ids
 
 
-def _load_verifier_model(base_model_dir: str, verifier_lora_dir: str, dtype: torch.dtype, device_map: Optional[str]):
-    from peft import PeftModel
+def _load_verifier_model(
+    verifier_model_dir: str,
+    verifier_lora_dir: Optional[str],
+    dtype: torch.dtype,
+    device_map: Optional[str],
+):
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
-        base_model_dir,
+        verifier_model_dir,
         torch_dtype=dtype,
         trust_remote_code=True,
         device_map=device_map,
     )
     model.eval()
-    model = PeftModel.from_pretrained(model, verifier_lora_dir, is_trainable=False)
-    model.eval()
+
+    lora_dir = str(verifier_lora_dir or "").strip()
+    if lora_dir:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, lora_dir, is_trainable=False)
+        model.eval()
+        print(f"[verifier] loaded LoRA: {lora_dir}", flush=True)
+    else:
+        print(f"[verifier] using full model (no LoRA): {verifier_model_dir}", flush=True)
+
     return model
 
 
@@ -670,7 +757,9 @@ def _verifier_generate(
     verifier_max_prompt_length: int,
     verifier_max_new_tokens: int,
     max_model_len: int,
-) -> str:
+    compute_wait_confidence: bool,
+    wait_conf_tail_tokens: int,
+) -> Tuple[str, Optional[float], Optional[float]]:
     device = _get_model_device(model)
     prompt_ids = _build_verifier_prompt_ids(
         tokenizer,
@@ -681,28 +770,85 @@ def _verifier_generate(
         max_model_len=max_model_len,
     )
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    if not compute_wait_confidence:
+        with torch.no_grad():
+            out = model.generate(
+                input_ids=input_ids,
+                max_new_tokens=int(verifier_max_new_tokens),
+                do_sample=True,
+                temperature=1.0,
+                top_p=1.0,
+                top_k=1,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=True,
+            )
+        gen_ids = out[0, input_ids.size(1) :].tolist()
+        return tokenizer.decode(gen_ids, skip_special_tokens=True), None, None
+
+    # IMPORTANT: do NOT use `output_scores=True` here; it stores full vocab logits
+    # for every generated token and can easily blow up memory when max_new_tokens is large.
+    # Instead, run a greedy cached decode loop and only keep logprobs for the tail window.
+    from collections import deque
+
+    eos_id = tokenizer.eos_token_id
+    try:
+        tail = int(wait_conf_tail_tokens)
+    except Exception:
+        tail = 64
+    if tail <= 0:
+        tail = 64
+    logprob_tail = deque(maxlen=tail)
+    generated: List[int] = []
+
     with torch.no_grad():
-        t0 = time.time()
-        out = model.generate(
-            input_ids=input_ids,
-            max_new_tokens=int(verifier_max_new_tokens),
-            do_sample=True,
-            temperature=1.0,
-            top_p=1.0,
-            top_k=1,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=True,
-        )
-        _ = time.time() - t0
-    gen_ids = out[0, input_ids.size(1) :].tolist()
-    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+        outputs = model(input_ids=input_ids, use_cache=True)
+        past = getattr(outputs, "past_key_values", None)
+        next_logits = outputs.logits[:, -1, :]
+
+        for _ in range(int(verifier_max_new_tokens)):
+            token_id = int(torch.argmax(next_logits, dim=-1).item())
+
+            try:
+                logits_vec = next_logits[0].to(torch.float32)
+                lp = float((logits_vec[token_id] - torch.logsumexp(logits_vec, dim=-1)).item())
+                if math.isfinite(lp):
+                    logprob_tail.append(lp)
+            except Exception:
+                pass
+
+            generated.append(token_id)
+
+            if eos_id is not None and int(token_id) == int(eos_id):
+                break
+
+            token_in = torch.tensor([[token_id]], dtype=torch.long, device=device)
+            outputs = model(input_ids=token_in, use_cache=True, past_key_values=past)
+            past = getattr(outputs, "past_key_values", None)
+            next_logits = outputs.logits[:, -1, :]
+
+    text = tokenizer.decode(generated, skip_special_tokens=True)
+    if not logprob_tail:
+        return text, None, None
+
+    avg = float(sum(logprob_tail) / max(1, len(logprob_tail)))
+    avg = float(min(0.0, max(-20.0, avg)))
+    return text, float(math.exp(avg)), avg
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Eval Co-GRPO with verifier interventions (actor=LMDeploy, 64k).")
     ap.add_argument("--base-model", required=True)
-    ap.add_argument("--verifier-lora", required=True)
+    ap.add_argument(
+        "--verifier-model",
+        default="",
+        help="Optional: full HF verifier model dir. If set, overrides --base-model for verifier loading.",
+    )
+    ap.add_argument(
+        "--verifier-lora",
+        default="",
+        help="Optional: PEFT adapter dir for verifier. If omitted, verifier runs as a full model (no adapter).",
+    )
     ap.add_argument("--prompts-file", required=True)
     ap.add_argument("--prompt-key", default="question")
     ap.add_argument("--out-jsonl", required=True)
@@ -749,10 +895,35 @@ def main() -> int:
     ap.add_argument("--token-check-interval", type=int, default=4096)
     ap.add_argument("--min-step-tokens", type=int, default=4096)
     ap.add_argument("--max-interventions", type=int, default=5)
+    ap.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.0,
+        help="Only apply <WAIT> hints when wait_confidence>=threshold. "
+        "wait_confidence is computed from verifier token logprobs (exp(mean tail logprob)); 0 disables the gate.",
+    )
+    ap.add_argument(
+        "--wait-conf-tail-tokens",
+        type=int,
+        default=64,
+        help="Tail tokens used to estimate wait_confidence (match online default=64).",
+    )
 
     ap.add_argument("--verifier-max-prompt-length", type=int, default=16384)
     ap.add_argument("--verifier-max-new-tokens", type=int, default=2048)
     ap.add_argument("--verifier-max-hint-tokens", type=int, default=512)
+    ap.add_argument(
+        "--hint-rollback-window-tokens",
+        type=int,
+        default=512,
+        help="Align with online by_step: trim a trailing fragment to a natural boundary for hint anchor.",
+    )
+    ap.add_argument(
+        "--pending-hint-tail-decode-tokens",
+        type=int,
+        default=128,
+        help="Align with online by_step: decode this many tail tokens for post-</think> guard + hint prefix.",
+    )
 
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-p", type=float, default=1.0)
@@ -772,8 +943,20 @@ def main() -> int:
     ap.add_argument("--progress", action="store_true")
     args = ap.parse_args()
 
+    run_control = args.mode in ("control", "both")
+    run_exp = args.mode in ("exp", "both")
+
     base_model_dir = str(Path(args.base_model).resolve())
-    verifier_lora_dir = str(Path(args.verifier_lora).resolve())
+    verifier_model_dir = str(Path(args.verifier_model).resolve()) if str(args.verifier_model or "").strip() else ""
+    verifier_lora_dir = str(Path(args.verifier_lora).resolve()) if str(args.verifier_lora or "").strip() else ""
+    if run_exp:
+        if not verifier_lora_dir and not verifier_model_dir:
+            raise SystemExit(
+                "Need at least one of: --verifier-model (full model) or --verifier-lora (adapter) "
+                "when --mode includes exp."
+            )
+        if not verifier_model_dir:
+            verifier_model_dir = base_model_dir
     prompts_file = Path(args.prompts_file).resolve()
     out_path = Path(args.out_jsonl).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -782,13 +965,18 @@ def main() -> int:
     device_map = None if str(args.device_map).lower() in ("none", "null", "") else str(args.device_map)
 
     tokenizer = _load_tokenizer(base_model_dir)
-    # If verifier adapter carries a training chat_template, use it for prompt formatting.
-    tmpl = Path(verifier_lora_dir) / "chat_template.jinja"
-    if tmpl.exists():
-        try:
-            tokenizer.chat_template = tmpl.read_text(encoding="utf-8")
-        except Exception:
-            pass
+    verifier_tokenizer = None
+    if run_exp:
+        verifier_tokenizer = tokenizer if verifier_model_dir == base_model_dir else _load_tokenizer(verifier_model_dir)
+
+    # If verifier adapter carries a training chat_template, use it for verifier prompt formatting.
+    if run_exp and verifier_lora_dir and verifier_tokenizer is not None:
+        tmpl = Path(verifier_lora_dir) / "chat_template.jinja"
+        if tmpl.exists():
+            try:
+                verifier_tokenizer.chat_template = tmpl.read_text(encoding="utf-8")
+            except Exception:
+                pass
 
     system_prompt = VERIFIER_SYSTEM_PROMPT if args.use_verifier_system_prompt else None
 
@@ -809,6 +997,33 @@ def main() -> int:
     if args.stop_at_think_end:
         user_stop_words.append("</think>")
     stop_words = list(dict.fromkeys(base_stop_words + user_stop_words))
+
+    # Online-canonical hint injection/rollback helpers (single source of truth).
+    inj = None
+    hint_rollback_window_tokens = 512
+    pending_hint_tail_decode_tokens = 128
+    if run_exp:
+        inj = _load_online_hint_injection_module()
+        try:
+            hint_rollback_window_tokens = int(args.hint_rollback_window_tokens)
+        except Exception:
+            hint_rollback_window_tokens = 512
+        try:
+            pending_hint_tail_decode_tokens = int(args.pending_hint_tail_decode_tokens)
+        except Exception:
+            pending_hint_tail_decode_tokens = 128
+
+    eos_token_ids: set[int] = {int(x) for x in (stop_token_ids or []) if isinstance(x, int)}
+    try:
+        if tokenizer.eos_token_id is not None:
+            eos_token_ids.add(int(tokenizer.eos_token_id))
+    except Exception:
+        pass
+    try:
+        if tokenizer.pad_token_id is not None:
+            eos_token_ids.add(int(tokenizer.pad_token_id))
+    except Exception:
+        pass
 
     actor_transport = str(args.actor_transport)
     actor_api_base = str(args.actor_api_base or "").strip()
@@ -900,14 +1115,18 @@ def main() -> int:
         actor_extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
 
     # Verifier model (Transformers + PEFT).
-    verifier_model = _load_verifier_model(base_model_dir, verifier_lora_dir, dtype=dtype, device_map=device_map)
+    print(f"[config] actor_base_model={base_model_dir}", flush=True)
+    verifier_model = None
+    if run_exp:
+        print(f"[config] verifier_model={verifier_model_dir}", flush=True)
+        print(f"[config] verifier_lora={(verifier_lora_dir or '(none)')}", flush=True)
+        verifier_model = _load_verifier_model(
+            verifier_model_dir, verifier_lora_dir or None, dtype=dtype, device_map=device_map
+        )
 
     prompt_items = _iter_prompt_items_from_file(prompts_file, args.prompt_key)
     if not prompt_items:
         raise SystemExit(f"No prompts found in: {prompts_file}")
-
-    run_control = args.mode in ("control", "both")
-    run_exp = args.mode in ("exp", "both")
 
     idxs = list(range(len(prompt_items)))
     if args.progress and tqdm is not None:
@@ -932,7 +1151,8 @@ def main() -> int:
                 "prompt_text": base_prompt_raw,
                 "origin_info": origin_info,
                 "base_model_dir": base_model_dir,
-                "verifier_lora_dir": verifier_lora_dir,
+                "verifier_model_dir": verifier_model_dir if run_exp else None,
+                "verifier_lora_dir": verifier_lora_dir if run_exp else None,
                 "backend": "lmdeploy",
                 "mode": args.mode,
                 "system_prompt": "VERIFIER_SYSTEM_PROMPT" if args.use_verifier_system_prompt else None,
@@ -1021,14 +1241,26 @@ def main() -> int:
                 }
 
             if run_exp:
+                if verifier_model is None or verifier_tokenizer is None or inj is None:
+                    raise SystemExit("Internal error: verifier not initialized for exp mode.")
+
                 response_text = ""
                 interventions: List[Dict[str, Any]] = []
                 previous_hints: List[str] = []
-                model_gen_tokens = 0
+                model_gen_tokens = 0  # model-generated tokens only (hints excluded)
+                hint_token_total = 0
+                prethink_rollback_used = False
+                last_hint_end_keep = 0
+                last_hint_tokens: Optional[List[int]] = None
                 error: Optional[str] = None
 
                 t0 = time.time()
                 while True:
+                    try:
+                        tok_total = len(tokenizer.encode(response_text, add_special_tokens=False)) if response_text else 0
+                    except Exception:
+                        tok_total = 0
+                    model_gen_tokens = max(0, int(tok_total) - int(hint_token_total))
                     if model_gen_tokens >= int(args.max_response_tokens):
                         break
                     if len(interventions) >= int(args.max_interventions):
@@ -1051,6 +1283,7 @@ def main() -> int:
                         step_tokens = min(int(step_tokens), int(ctx_remaining))
                     step_tokens = max(1, int(step_tokens))
 
+                    pending_complete_reason: Optional[str] = None
                     try:
                         if actor_transport == "openai":
                             msgs = actor_base_messages
@@ -1085,29 +1318,112 @@ def main() -> int:
                         error = f"actor_generate_error: {e}"
                         break
                     new_text, hit_stop = _apply_stop_words(new_text, stop_words)
-                    if not new_text:
-                        break
-                    response_text += new_text
-                    # Use tokenizer-based token length for consistency with any post-cut by stop_words.
-                    model_gen_tokens += len(tokenizer.encode(new_text, add_special_tokens=False))
+                    if new_text:
+                        response_text += new_text
+                    else:
+                        pending_complete_reason = "empty_output"
                     if hit_stop:
-                        break
+                        pending_complete_reason = "eos"
                     if args.degeneration_guard and _too_repetitive_suffix(response_text):
-                        break
+                        pending_complete_reason = pending_complete_reason or "degeneration"
 
                     if len(interventions) >= int(args.max_interventions):
+                        if pending_complete_reason is not None:
+                            break
                         continue
 
-                    # Always call verifier after each chunk (training-consistent).
+                    # Always call verifier after each chunk; on EOS/degeneration, allow ONE final verifier.
                     try:
-                        verifier_text = _verifier_generate(
+                        response_tokens = (
+                            tokenizer.encode(response_text, add_special_tokens=False) if response_text else []
+                        )
+                    except Exception:
+                        response_tokens = []
+
+                    hint_anchor_keep = len(response_tokens)
+                    tail_keep = inj.compute_tail_rollback_keep_len(
+                        response_tokens, tokenizer, hint_rollback_window_tokens
+                    )
+                    if tail_keep is not None:
+                        hint_anchor_keep = int(tail_keep)
+
+                    # Never roll back past an already-inserted hint span.
+                    if last_hint_tokens:
+                        try:
+                            pos = inj.find_last_subsequence_index(response_tokens, last_hint_tokens)
+                        except Exception:
+                            pos = None
+                        if pos is not None:
+                            last_hint_end_keep = int(pos) + int(len(last_hint_tokens))
+                    if int(last_hint_end_keep) > int(hint_anchor_keep):
+                        hint_anchor_keep = int(last_hint_end_keep)
+
+                    use_prethink_anchor = False
+                    anchor_tokens = response_tokens[:hint_anchor_keep]
+                    if pending_complete_reason is not None and (not prethink_rollback_used):
+                        try:
+                            has_safe_think_anchor = inj.find_think_close_pos(anchor_tokens, tokenizer) is not None
+                        except Exception:
+                            has_safe_think_anchor = False
+                        try:
+                            post_final = inj.is_post_think_finalized(
+                                anchor_tokens,
+                                tokenizer,
+                                decode_tail_tokens=pending_hint_tail_decode_tokens,
+                            )
+                        except Exception:
+                            post_final = False
+                        if (not has_safe_think_anchor) and post_final:
+                            prethink_keep = inj.find_prethink_rollback_keep_len(anchor_tokens, tokenizer)
+                            if prethink_keep is not None and int(prethink_keep) < int(hint_anchor_keep):
+                                hint_anchor_keep = int(prethink_keep)
+                                use_prethink_anchor = True
+                                # After rolling back to prethink, re-apply tail rollback within the new anchor.
+                                tail_keep = inj.compute_tail_rollback_keep_len(
+                                    response_tokens[:hint_anchor_keep],
+                                    tokenizer,
+                                    hint_rollback_window_tokens,
+                                )
+                                if tail_keep is not None:
+                                    hint_anchor_keep = int(tail_keep)
+                                if int(last_hint_end_keep) > int(hint_anchor_keep):
+                                    hint_anchor_keep = int(last_hint_end_keep)
+
+                    anchor_tokens = response_tokens[:hint_anchor_keep]
+                    try:
+                        has_safe_think_anchor = inj.find_think_close_pos(anchor_tokens, tokenizer) is not None
+                    except Exception:
+                        has_safe_think_anchor = False
+                    try:
+                        post_final = inj.is_post_think_finalized(
+                            anchor_tokens,
+                            tokenizer,
+                            decode_tail_tokens=pending_hint_tail_decode_tokens,
+                        )
+                    except Exception:
+                        post_final = False
+                    anchor_insertable = has_safe_think_anchor or (not post_final)
+                    if not anchor_insertable:
+                        if pending_complete_reason is not None:
+                            break
+                        continue
+
+                    try:
+                        reasoning_for_verifier = tokenizer.decode(anchor_tokens, skip_special_tokens=True)
+                    except Exception:
+                        reasoning_for_verifier = ""
+
+                    try:
+                        verifier_text, wait_confidence, wait_avg_logprob = _verifier_generate(
                             model=verifier_model,
-                            tokenizer=tokenizer,
+                            tokenizer=verifier_tokenizer,
                             question=str(question),
-                            current_reasoning=response_text,
+                            current_reasoning=reasoning_for_verifier,
                             verifier_max_prompt_length=int(args.verifier_max_prompt_length),
                             verifier_max_new_tokens=int(args.verifier_max_new_tokens),
                             max_model_len=int(args.verifier_max_prompt_length) + int(args.verifier_max_new_tokens),
+                            compute_wait_confidence=float(args.confidence_threshold) > 0,
+                            wait_conf_tail_tokens=int(args.wait_conf_tail_tokens),
                         )
                     except Exception as e:
                         error = f"verifier_generate_error: {e}"
@@ -1116,28 +1432,115 @@ def main() -> int:
 
                     hint = (decision.hint or "").strip()
                     if not hint or decision.action != "Intervene":
+                        if pending_complete_reason is not None:
+                            break
                         continue
+                    if float(args.confidence_threshold) > 0:
+                        if wait_confidence is None or float(wait_confidence) < float(args.confidence_threshold):
+                            if pending_complete_reason is not None:
+                                break
+                            continue
                     # Truncate hint tokens.
                     if int(args.verifier_max_hint_tokens) > 0:
                         hint_ids = tokenizer.encode(hint, add_special_tokens=False)
                         if len(hint_ids) > int(args.verifier_max_hint_tokens):
                             hint = tokenizer.decode(hint_ids[: int(args.verifier_max_hint_tokens)], skip_special_tokens=True).strip()
                     if not _hint_allowed(hint, previous_hints):
+                        if pending_complete_reason is not None:
+                            break
                         continue
-                    hint_text = _format_hint_text(hint=hint, response_text=response_text)
-                    if hint_text:
-                        response_text += hint_text
-                        previous_hints.append(hint)
-                    interventions.append(
-                        {
-                            "hint": hint,
-                            "hint_text": hint_text,
-                            "verifier_action": decision.action,
-                            "verifier_critique": verifier_text,
-                            "response_tokens_after": len(tokenizer.encode(response_text, add_special_tokens=False)),
-                        }
-                    )
 
+                    # Apply hint at the same anchor used for verifier context (online-aligned).
+                    state: Dict[str, Any] = {
+                        "response_tokens": list(anchor_tokens),
+                        "loss_masks": [1] * len(anchor_tokens),
+                        "_prethink_rollback_used": bool(prethink_rollback_used),
+                    }
+                    if use_prethink_anchor:
+                        state["_prethink_rollback_used"] = True
+                        prethink_rollback_used = True
+
+                    # If anchor is still post-final and not a safe think-close insertion, allow one
+                    # best-effort rollback to prethink boundary (once per sample).
+                    if pending_complete_reason is not None:
+                        try:
+                            still_safe_think = inj.find_think_close_pos(state["response_tokens"], tokenizer) is not None
+                        except Exception:
+                            still_safe_think = False
+                        try:
+                            still_post_final = inj.is_post_think_finalized(
+                                state["response_tokens"],
+                                tokenizer,
+                                decode_tail_tokens=pending_hint_tail_decode_tokens,
+                            )
+                        except Exception:
+                            still_post_final = False
+                        if (not still_safe_think) and still_post_final:
+                            try:
+                                rolled = bool(inj.rollback_prethink_once(state, tokenizer))
+                            except Exception:
+                                rolled = False
+                            if rolled:
+                                prethink_rollback_used = True
+
+                    try:
+                        tail = tokenizer.decode(
+                            state["response_tokens"][-int(pending_hint_tail_decode_tokens) :],
+                            skip_special_tokens=True,
+                        )
+                    except Exception:
+                        tail = ""
+                    hint_text = inj.format_hint_text(hint=hint, tail_text=tail)
+                    hint_tokens: List[int] = []
+                    try:
+                        hint_tokens = tokenizer.encode(hint_text, add_special_tokens=False) if hint_text else []
+                    except Exception:
+                        hint_tokens = []
+
+                    hint_applied = False
+                    if hint_tokens:
+                        inserted = inj.insert_hint_tokens(state, hint_tokens, tokenizer, eos_token_ids)
+                        hint_applied = bool(inserted)
+
+                    if hint_applied:
+                        try:
+                            response_text = tokenizer.decode(state["response_tokens"], skip_special_tokens=True)
+                        except Exception:
+                            response_text = response_text + hint_text
+                        hint_token_total += int(len(hint_tokens) if hint_tokens else 0)
+                        last_hint_tokens = list(hint_tokens)
+                        try:
+                            pos = inj.find_last_subsequence_index(state["response_tokens"], hint_tokens)
+                        except Exception:
+                            pos = None
+                        if pos is not None:
+                            last_hint_end_keep = int(pos) + int(len(hint_tokens))
+                        previous_hints.append(hint)
+                        interventions.append(
+                            {
+                                "hint": hint,
+                                "hint_text": hint_text,
+                                "verifier_action": decision.action,
+                                "verifier_critique": verifier_text,
+                                "wait_confidence": wait_confidence,
+                                "wait_avg_logprob": wait_avg_logprob,
+                                "hint_token_count": int(len(hint_tokens) if hint_tokens else 0),
+                                "anchor_keep": int(hint_anchor_keep),
+                                "prethink_anchor": bool(use_prethink_anchor),
+                                "response_tokens_after": len(tokenizer.encode(response_text, add_special_tokens=False)),
+                            }
+                        )
+                        # If we were about to finish, keep it running so the hint can affect continuation.
+                        pending_complete_reason = None
+
+                    if pending_complete_reason is not None:
+                        break
+
+                try:
+                    tok_total = len(tokenizer.encode(response_text, add_special_tokens=False)) if response_text else 0
+                except Exception:
+                    tok_total = 0
+                model_gen_tokens = max(0, int(tok_total) - int(hint_token_total))
                 dt = float(time.time() - t0)
                 rec["exp"] = {
                     "response_text": response_text,
