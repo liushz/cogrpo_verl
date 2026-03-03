@@ -394,6 +394,27 @@ def _too_repetitive_suffix(text: str) -> bool:
         if long_lines >= 12:
             return True
 
+    # Fallback for single-line repetition (no '\n'): split by punctuation and
+    # detect repeated "sentences" near the tail.
+    try:
+        import re
+        from collections import Counter
+
+        parts = [p.strip() for p in re.split(r"[\\.!?]+", tail) if p.strip()]
+        if len(parts) >= 40:
+            win = parts[-80:]
+            cnt = Counter(win)
+            most, n = cnt.most_common(1)[0]
+            if len(most) >= 20 and n >= 10:
+                return True
+            last = win[-1]
+            if len(last) >= 20:
+                same = sum(1 for p in win if p == last)
+                if same >= 10:
+                    return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -424,6 +445,9 @@ def _decode_stop_token_ids(tokenizer, token_ids: List[int]) -> List[str]:
 def _http_json(method: str, url: str, payload: Optional[dict], timeout_s: int) -> dict:
     body = None
     headers = {"content-type": "application/json"}
+    api_key = (os.environ.get("OPENAI_API_KEY") or os.environ.get("ACTOR_API_KEY") or "").strip()
+    if api_key:
+        headers["authorization"] = f"Bearer {api_key}"
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
     req = Request(url=url, data=body, headers=headers, method=method.upper())
@@ -627,6 +651,56 @@ def _prompt_obj_to_chat_messages(prompt_obj: Any, system_prompt: Optional[str]) 
         messages.append({"role": "system", "content": str(system_prompt)})
     messages.append({"role": "user", "content": str(prompt_obj)})
     return messages
+
+
+ONLINE_MATH_BOXED_REMINDER = "\nRemember to put your final answer within \\boxed{}."
+
+
+def _append_user_prompt_suffix(prompt_obj: Any, suffix: str) -> Any:
+    """
+    Append a suffix to the last user message (or scalar prompt).
+
+    This is used to align local eval prompts with online OpenCompass templates, e.g.:
+      {question}\\nRemember to put your final answer within \\boxed{}.
+    """
+    suffix = str(suffix or "")
+    if not suffix:
+        return prompt_obj
+
+    # Scalar prompt (common for math jsonl: {"question": "..."}).
+    if isinstance(prompt_obj, str):
+        # Avoid duplicating common online reminder.
+        if "Remember to put your final answer within" in prompt_obj:
+            return prompt_obj
+        return prompt_obj.rstrip() + suffix
+
+    # Chat messages: append to the last user message.
+    if isinstance(prompt_obj, list):
+        messages: List[Any] = []
+        last_user_idx: Optional[int] = None
+        for m in prompt_obj:
+            if isinstance(m, dict):
+                mm = dict(m)
+                role = mm.get("role")
+                if isinstance(role, str) and role.lower() in ("user", "human"):
+                    last_user_idx = len(messages)
+                messages.append(mm)
+            else:
+                messages.append(m)
+
+        if last_user_idx is not None and isinstance(messages[last_user_idx], dict):
+            content = messages[last_user_idx].get("content", "") or ""
+            content = str(content)
+            if "Remember to put your final answer within" in content:
+                return messages
+            messages[last_user_idx]["content"] = content.rstrip() + suffix
+            return messages
+
+        # Fallback: append a new user message (avoid leading newline).
+        messages.append({"role": "user", "content": suffix.lstrip("\n")})
+        return messages
+
+    return prompt_obj
 
 
 def _tail_truncate_to_tokens(tokenizer, text: str, max_tokens: int) -> str:
@@ -855,6 +929,12 @@ def main() -> int:
 
     ap.add_argument("--mode", default="both", choices=["control", "exp", "both"])
     ap.add_argument("--use-verifier-system-prompt", action="store_true")
+    ap.add_argument(
+        "--online-math-prompt",
+        action="store_true",
+        help="Align actor user prompt with OpenCompass math template by appending: "
+        "'Remember to put your final answer within \\\\boxed{}.'",
+    )
 
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--device-map", default="auto")
@@ -1141,13 +1221,19 @@ def main() -> int:
             if question is None:
                 question = prompt_obj if isinstance(prompt_obj, str) else ""
 
-            base_prompt_raw = _prompt_obj_to_raw_prompt(tokenizer, prompt_obj, system_prompt=system_prompt)
+            prompt_obj_eval = prompt_obj
+            if args.online_math_prompt:
+                prompt_obj_eval = _append_user_prompt_suffix(prompt_obj_eval, ONLINE_MATH_BOXED_REMINDER)
+
+            base_prompt_raw = _prompt_obj_to_raw_prompt(tokenizer, prompt_obj_eval, system_prompt=system_prompt)
             base_prompt_raw = _tail_truncate_to_tokens(tokenizer, base_prompt_raw, int(args.max_prompt_tokens))
-            actor_base_messages = _prompt_obj_to_chat_messages(prompt_obj, system_prompt=system_prompt)
+            actor_base_messages = _prompt_obj_to_chat_messages(prompt_obj_eval, system_prompt=system_prompt)
 
             rec: Dict[str, Any] = {
                 "idx": int(i),
                 "prompt": prompt_obj,
+                "prompt_eval": prompt_obj_eval if prompt_obj_eval != prompt_obj else None,
+                "prompt_style": "online_math" if args.online_math_prompt else "raw",
                 "prompt_text": base_prompt_raw,
                 "origin_info": origin_info,
                 "base_model_dir": base_model_dir,
@@ -1164,6 +1250,12 @@ def main() -> int:
                 response_text = ""
                 model_gen_tokens = 0
                 error: Optional[str] = None
+                control_steps = 0
+                # If token_check_interval covers the entire requested generation budget, treat control
+                # as a single-shot generation (matches typical OpenCompass behavior and avoids
+                # re-sending a prompt after the model internally hit EOS, which would otherwise
+                # cause runaway continuation).
+                control_single_shot = int(args.token_check_interval) >= int(args.max_response_tokens)
 
                 t0 = time.time()
                 while True:
@@ -1224,9 +1316,12 @@ def main() -> int:
                         break
                     response_text += new_text
                     model_gen_tokens += len(tokenizer.encode(new_text, add_special_tokens=False))
+                    control_steps += 1
                     if hit_stop:
                         break
                     if args.degeneration_guard and _too_repetitive_suffix(response_text):
+                        break
+                    if control_single_shot and control_steps >= 1:
                         break
 
                 dt = float(time.time() - t0)
