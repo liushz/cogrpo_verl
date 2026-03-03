@@ -412,10 +412,42 @@ def _too_repetitive_suffix(text: str) -> bool:
                 same = sum(1 for p in win if p == last)
                 if same >= 10:
                     return True
+
+        # Token-level n-gram repetition (robust to minor punctuation/whitespace diffs).
+        words = [w for w in re.split(r"\s+", tail.lower()) if w]
+        if len(words) >= 200:
+            seq = words[-500:]
+            ngram_n = 4
+            grams = [
+                (seq[i], seq[i + 1], seq[i + 2], seq[i + 3])
+                for i in range(0, max(0, len(seq) - ngram_n + 1))
+            ]
+            if grams:
+                uniq_ratio = float(len(set(grams)) / max(1, len(grams)))
+                # Empirically, pathological loops collapse uniq_ratio << 0.2.
+                if uniq_ratio < 0.15 and len(seq) >= 300:
+                    return True
     except Exception:
         pass
 
     return False
+
+
+def _has_complete_boxed_answer(text: str) -> bool:
+    """
+    Heuristic early-stop for math eval: if '\\boxed{...}' appears with a closing brace,
+    consider the sample "finished" to avoid tail degeneration filling the remaining budget.
+    """
+    if not text:
+        return False
+    j = text.rfind("\\boxed{")
+    if j < 0:
+        return False
+    k = text.find("}", j + len("\\boxed{"))
+    if k < 0:
+        return False
+    # Avoid triggering on extremely early/accidental occurrences (shouldn't happen in prompts).
+    return (k - j) <= 512
 
 
 def _decode_stop_token_ids(tokenizer, token_ids: List[int]) -> List[str]:
@@ -518,6 +550,8 @@ def _openai_completions(
     max_tokens: int,
     temperature: float,
     top_p: float,
+    top_k: Optional[int],
+    seed: Optional[int],
     stop: Optional[List[str]],
     timeout_s: int,
 ) -> str:
@@ -530,6 +564,10 @@ def _openai_completions(
         "top_p": float(top_p),
         "n": 1,
     }
+    if top_k is not None:
+        payload["top_k"] = int(top_k)
+    if seed is not None:
+        payload["seed"] = int(seed)
     if stop:
         payload["stop"] = list(stop)
     resp = _http_json("POST", f"{api_base}/completions", payload, timeout_s)
@@ -943,7 +981,7 @@ def main() -> int:
         "--actor-transport",
         default="pipeline",
         choices=["pipeline", "openai"],
-        help="Actor transport: lmdeploy pipeline (default) or OpenAI-compatible /v1/chat/completions.",
+        help="Actor transport: lmdeploy pipeline (default) or OpenAI-compatible /v1/completions (raw prompt continuation).",
     )
     ap.add_argument(
         "--actor-api-base",
@@ -1007,7 +1045,8 @@ def main() -> int:
 
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-p", type=float, default=1.0)
-    ap.add_argument("--top-k", type=int, default=-1)
+    # Align with LMDeploy OpenAI server default (top_k=40) when using temperature sampling.
+    ap.add_argument("--top-k", type=int, default=40)
     ap.add_argument("--seed", type=int, default=0)
 
     ap.add_argument("--stop-token-id", action="append", default=[])
@@ -1021,6 +1060,12 @@ def main() -> int:
     ap.add_argument("--lmdeploy-log-level", default="WARNING")
 
     ap.add_argument("--progress", action="store_true")
+    ap.add_argument(
+        "--max-sample-seconds",
+        type=int,
+        default=0,
+        help="Hard wall-clock budget per sample (0 disables). Useful to avoid 64k tail loops hanging a shard.",
+    )
     args = ap.parse_args()
 
     run_control = args.mode in ("control", "both")
@@ -1259,6 +1304,9 @@ def main() -> int:
 
                 t0 = time.time()
                 while True:
+                    if int(args.max_sample_seconds) > 0 and (time.time() - float(t0)) > float(args.max_sample_seconds):
+                        error = f"timeout>{int(args.max_sample_seconds)}s"
+                        break
                     if model_gen_tokens >= int(args.max_response_tokens):
                         break
 
@@ -1280,29 +1328,40 @@ def main() -> int:
 
                     try:
                         if actor_transport == "openai":
-                            msgs = actor_base_messages
-                            if response_text:
-                                msgs = msgs + [{"role": "assistant", "content": response_text}]
-                            new_text = _openai_chat_completions(
+                            # NOTE: use /v1/completions with raw prompt for true continuation.
+                            # /v1/chat/completions would treat each chunk as a new assistant turn
+                            # (because we have to send response_text as an assistant message),
+                            # which can cause the model to re-answer/repeat and never hit EOS.
+                            new_text = _openai_completions(
                                 api_base=actor_api_base,
                                 model=actor_api_model,
-                                messages=msgs,
+                                prompt=base_prompt_raw + response_text,
                                 max_tokens=int(step_tokens),
                                 temperature=float(args.temperature),
                                 top_p=float(args.top_p) if args.top_p is not None else 1.0,
+                                top_k=int(args.top_k) if int(args.top_k) > 0 else None,
+                                seed=int(args.seed) if int(args.seed) != 0 else None,
                                 stop=stop_words,
                                 timeout_s=int(args.actor_api_timeout),
-                                extra_body=actor_extra_body,
                             )
                         else:
                             assert actor_pipe is not None and GenerationConfig is not None
                             gen_kwargs = dict(
                                 max_new_tokens=int(step_tokens),
                                 min_new_tokens=1,
+                                do_sample=True,
                                 temperature=float(args.temperature),
                                 top_p=float(args.top_p) if args.top_p is not None else 1.0,
                                 top_k=int(args.top_k) if int(args.top_k) > 0 else 0,
                             )
+                            # Make pipeline stop behavior match OpenAI server (and online vLLM) as much as possible.
+                            if eos_token_ids:
+                                gen_kwargs["stop_token_ids"] = sorted({int(x) for x in eos_token_ids})
+                            try:
+                                if int(args.seed) != 0:
+                                    gen_kwargs["random_seed"] = int(args.seed)
+                            except Exception:
+                                pass
                             if supports_stop_words and stop_words:
                                 gen_kwargs["stop_words"] = stop_words
                             gen_cfg = GenerationConfig(**gen_kwargs)
@@ -1317,6 +1376,8 @@ def main() -> int:
                     response_text += new_text
                     model_gen_tokens += len(tokenizer.encode(new_text, add_special_tokens=False))
                     control_steps += 1
+                    if _has_complete_boxed_answer(response_text):
+                        break
                     if hit_stop:
                         break
                     if args.degeneration_guard and _too_repetitive_suffix(response_text):
@@ -1351,6 +1412,9 @@ def main() -> int:
 
                 t0 = time.time()
                 while True:
+                    if int(args.max_sample_seconds) > 0 and (time.time() - float(t0)) > float(args.max_sample_seconds):
+                        error = f"timeout>{int(args.max_sample_seconds)}s"
+                        break
                     try:
                         tok_total = len(tokenizer.encode(response_text, add_special_tokens=False)) if response_text else 0
                     except Exception:
@@ -1381,29 +1445,36 @@ def main() -> int:
                     pending_complete_reason: Optional[str] = None
                     try:
                         if actor_transport == "openai":
-                            msgs = actor_base_messages
-                            if response_text:
-                                msgs = msgs + [{"role": "assistant", "content": response_text}]
-                            new_text = _openai_chat_completions(
+                            # True continuation: use /v1/completions with the raw chat_template prompt.
+                            new_text = _openai_completions(
                                 api_base=actor_api_base,
                                 model=actor_api_model,
-                                messages=msgs,
+                                prompt=base_prompt_raw + response_text,
                                 max_tokens=int(step_tokens),
                                 temperature=float(args.temperature),
                                 top_p=float(args.top_p) if args.top_p is not None else 1.0,
+                                top_k=int(args.top_k) if int(args.top_k) > 0 else None,
+                                seed=int(args.seed) if int(args.seed) != 0 else None,
                                 stop=stop_words,
                                 timeout_s=int(args.actor_api_timeout),
-                                extra_body=actor_extra_body,
                             )
                         else:
                             assert actor_pipe is not None and GenerationConfig is not None
                             gen_kwargs = dict(
                                 max_new_tokens=int(step_tokens),
                                 min_new_tokens=1,
+                                do_sample=True,
                                 temperature=float(args.temperature),
                                 top_p=float(args.top_p) if args.top_p is not None else 1.0,
                                 top_k=int(args.top_k) if int(args.top_k) > 0 else 0,
                             )
+                            if eos_token_ids:
+                                gen_kwargs["stop_token_ids"] = sorted({int(x) for x in eos_token_ids})
+                            try:
+                                if int(args.seed) != 0:
+                                    gen_kwargs["random_seed"] = int(args.seed)
+                            except Exception:
+                                pass
                             if supports_stop_words and stop_words:
                                 gen_kwargs["stop_words"] = stop_words
                             gen_cfg = GenerationConfig(**gen_kwargs)
@@ -1419,6 +1490,8 @@ def main() -> int:
                         pending_complete_reason = "empty_output"
                     if hit_stop:
                         pending_complete_reason = "eos"
+                    if _has_complete_boxed_answer(response_text):
+                        pending_complete_reason = pending_complete_reason or "final_answer"
                     if args.degeneration_guard and _too_repetitive_suffix(response_text):
                         pending_complete_reason = pending_complete_reason or "degeneration"
 

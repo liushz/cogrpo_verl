@@ -176,7 +176,12 @@ else
   TEMPERATURE="${TEMPERATURE:-1.0}"
 fi
 TOP_P="${TOP_P:-1.0}"
-TOP_K="${TOP_K:--1}"
+if [[ "${BACKEND}" == "lmdeploy" ]]; then
+  # Align with LMDeploy OpenAI server default.
+  TOP_K="${TOP_K:-40}"
+else
+  TOP_K="${TOP_K:--1}"
+fi
 SEED="${SEED:-0}"
 
 if [[ "${BACKEND}" == "lmdeploy" ]]; then
@@ -222,10 +227,11 @@ LMDEPLOY_SESSION_LEN="${LMDEPLOY_SESSION_LEN:-${MAX_SEQ_LEN}}"
 LMDEPLOY_MAX_BATCH_SIZE="${LMDEPLOY_MAX_BATCH_SIZE:-128}"
 LMDEPLOY_LOG_LEVEL="${LMDEPLOY_LOG_LEVEL:-WARNING}"
 DEGENERATION_GUARD="${DEGENERATION_GUARD:-1}"
+MAX_SAMPLE_SECONDS="${MAX_SAMPLE_SECONDS:-0}"
 
 # LMDeploy actor transport (optional, for OpenCompass-style OpenAISDK alignment).
 # - pipeline (default): run lmdeploy pipeline() in-process
-# - openai: call an OpenAI-compatible /v1/chat/completions endpoint
+# - openai: call an OpenAI-compatible /v1/completions endpoint (raw prompt continuation)
 ACTOR_TRANSPORT="${ACTOR_TRANSPORT:-pipeline}"  # pipeline|openai
 ACTOR_API_BASE="${ACTOR_API_BASE:-}"
 ACTOR_API_TIMEOUT="${ACTOR_API_TIMEOUT:-600}"
@@ -413,6 +419,7 @@ for ((i=0; i<SHARDS; i++)); do
         --lmdeploy-session-len "${LMDEPLOY_SESSION_LEN}" \
         --lmdeploy-max-batch-size "${LMDEPLOY_MAX_BATCH_SIZE}" \
         --lmdeploy-log-level "${LMDEPLOY_LOG_LEVEL}" \
+        --max-sample-seconds "${MAX_SAMPLE_SECONDS}" \
         --progress
     else
       # vLLM eval (fastest; interventions via vLLM LoRA).
