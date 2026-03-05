@@ -28,6 +28,16 @@ from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 
 
+def _safe_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
+
 def _parse_reward_urls(urls_val) -> list[str]:
     if urls_val is None:
         return []
@@ -274,7 +284,9 @@ class NaiveRewardManager:
                     # Return dummy dump_record to match return signature
                     dummy_dump_record = {
                         "sample_idx": i,
-                        "full_response": "",
+                        "question": "",
+                        "student_response_policy": "",
+                        "student_response_full": "",
                         "ground_truth": "",
                         "data_source": "",
                         "experiment_id": "",
@@ -371,9 +383,32 @@ class NaiveRewardManager:
                 valid_response_ids, skip_special_tokens=True
             )
 
-            # [CORRECT FIX] Always use the full response string.
-            # The Verifier (Compass) handles hints and extracts the final answer.
-            response_str = full_response_with_hints
+            # Policy-only response for reward scoring / verifier prompting.
+            #
+            # In by_step Co-GRPO, the response segment may include inserted hint tokens.
+            # Trainer passes `exp_loss_mask` (0=hint, 1=policy) so we can strip hint tokens here.
+            policy_response_ids = valid_response_ids
+            try:
+                loss_mask = None
+                if "exp_loss_mask" in data_item.batch:
+                    loss_mask = data_item.batch["exp_loss_mask"]
+                elif "loss_mask" in data_item.batch:
+                    loss_mask = data_item.batch["loss_mask"]
+                if loss_mask is not None:
+                    # `loss_mask` is aligned with full sequence: [prompt_budget + response_total_budget]
+                    # Slice response segment and clamp to valid_response_length.
+                    response_loss_mask = loss_mask[prompt_length : prompt_length + valid_response_length]
+                    if hasattr(response_loss_mask, "numel") and int(response_loss_mask.numel()) == int(
+                        valid_response_length
+                    ):
+                        policy_mask = response_loss_mask.to(torch.bool)
+                        policy_response_ids = valid_response_ids[policy_mask]
+            except Exception:
+                policy_response_ids = valid_response_ids
+
+            response_str = self.tokenizer.decode(
+                policy_response_ids, skip_special_tokens=True
+            )
 
             # ========== Co-GRPO: Stream Type Detection ==========
             # Trainer passes stream_type via non_tensor_batch (see ray_trainer.py:1311, 1328)
@@ -384,6 +419,10 @@ class NaiveRewardManager:
 
             if stream_type_from_trainer:
                 # Trainer explicitly marked stream type (CoGRPO case)
+                try:
+                    stream_type_from_trainer = str(stream_type_from_trainer)
+                except Exception:
+                    stream_type_from_trainer = "unknown"
                 is_exp_stream = stream_type_from_trainer == "exp"
             else:
                 # Fallback: Heuristic detection (for non-CoGRPO or old code)
@@ -421,6 +460,14 @@ class NaiveRewardManager:
 
                 is_exp_stream = has_exp_metadata
 
+            # Keep trainer-provided stream type if present (e.g. "cf_control"),
+            # otherwise fall back to exp/control inference.
+            dump_stream_type = (
+                stream_type_from_trainer
+                if stream_type_from_trainer
+                else ("exp" if is_exp_stream else "control")
+            )
+
             if debug_enabled and (debug_limit <= 0 or i < debug_limit):
                 print(
                     f"[DEBUG Row {i}] stream_type_from_trainer: {stream_type_from_trainer}",
@@ -436,12 +483,37 @@ class NaiveRewardManager:
             )
             data_source = data_item.non_tensor_batch.get(self.reward_fn_key, "")
 
+            # Provide a canonical "question" field for offline analysis scripts.
+            # Prefer dataset-provided raw_problem when available; otherwise fall back to decoded prompt text.
+            question = ""
+            try:
+                extra_info = data_item.non_tensor_batch.get("extra_info", None)
+                if isinstance(extra_info, dict):
+                    question = (
+                        extra_info.get("raw_problem")
+                        or extra_info.get("question")
+                        or extra_info.get("problem")
+                        or ""
+                    )
+            except Exception:
+                question = ""
+            if not question:
+                question = prompt_str
+
             # Build dump record; batch-level write happens after processing all rows
             dump_record = {
                 "sample_idx": i,
-                "full_response": full_response_with_hints
+                "question": question,
+                # Full student-visible response:
+                # - exp: includes inserted hints
+                # - control: normal actor response
+                "student_response_full": full_response_with_hints
                 if is_exp_stream
-                else response_str,  # Use full response with hints for exp stream
+                else response_str,
+                # Policy-only response (what the reward model scores) for both streams.
+                # - exp: actor-generated tokens excluding inserted hints
+                # - control: actor-generated tokens (no interventions)
+                "student_response_policy": response_str,
                 "ground_truth": ground_truth,
                 "data_source": data_source,
                 "experiment_id": final_experiment_id,  # Use final_experiment_id from config
@@ -450,6 +522,38 @@ class NaiveRewardManager:
                 "valid_prompt_length": int(valid_prompt_length),
                 "valid_response_length": int(valid_response_length),
             }
+
+            # Stable IDs for joining exp/control/cf records in offline analysis.
+            for meta_key in (
+                "uid",
+                "sample_uid",
+                "cf_event_uid",
+                "cf_parent_uid",
+                "cf_parent_sample_uid",
+                "cf_parent_idx",
+                "cf_step_idx",
+            ):
+                if meta_key in data_item.non_tensor_batch:
+                    dump_record[meta_key] = _to_jsonable_scalar(
+                        data_item.non_tensor_batch.get(meta_key)
+                    )
+            # Backward compat: optionally also dump legacy `full_response` key (duplicates data).
+            if _safe_bool(os.environ.get("VERL_DUAL_DUMP_DUPLICATE_FULL_RESPONSE", "0")):
+                dump_record["full_response"] = dump_record["student_response_full"]
+
+            # Optional: dump the fully formatted verifier user prompt (can be very large).
+            dump_record["verifier_prompt_user"] = ""
+            if _safe_bool(os.environ.get("VERL_DUAL_DUMP_INCLUDE_VERIFIER_PROMPT", "0")):
+                try:
+                    from verl.workers.rollout.vllm_rollout.verifier_hint_injection import (
+                        build_verifier_user_prompt,
+                    )
+
+                    dump_record["verifier_prompt_user"] = build_verifier_user_prompt(
+                        question, response_str
+                    )
+                except Exception:
+                    dump_record["verifier_prompt_user"] = ""
             if is_exp_stream:
                 if debug_enabled and (debug_limit <= 0 or i < debug_limit):
                     print(f"\n{'=' * 70}", file=sys.stderr)
@@ -463,7 +567,7 @@ class NaiveRewardManager:
                         f"[Policy-only Response (for reward)]:\n{response_str}\n",
                         file=sys.stderr,
                     )
-                dump_record["stream_type"] = "exp"
+                dump_record["stream_type"] = dump_stream_type
                 hints_text = data_item.non_tensor_batch.get("hints", "") or ""
                 dump_record["hints"] = hints_text
                 dump_record["critiques"] = data_item.non_tensor_batch.get(
@@ -501,15 +605,44 @@ class NaiveRewardManager:
                 if debug_enabled and (debug_limit <= 0 or i < debug_limit):
                     print(f"\n[CONTROL_STREAM] Sample {i}", file=sys.stderr)
                     print(f"[Response]:\n{response_str}\n", file=sys.stderr)
-                dump_record["stream_type"] = "control"
+                dump_record["stream_type"] = dump_stream_type
                 dump_record["response"] = response_str
-                for k in ("error",):
+                for k in (
+                    "prompt_len",
+                    "response_len",
+                    "gen_len",
+                    "hint_len",
+                    "last_finish_reason",
+                    "context_exhausted",
+                    "first_step_tokens_len",
+                    "error",
+                ):
                     if k in data_item.non_tensor_batch:
                         dump_record[k] = _to_jsonable_scalar(
                             data_item.non_tensor_batch.get(k)
                         )
 
             extra_info = data_item.non_tensor_batch.get("extra_info", None)
+            # Provide `question` to reward scorers (CompassVerifier) even when the
+            # dataset `extra_info` does not include it (e.g. dapo parquet).
+            extra_info_for_score = extra_info
+            try:
+                if isinstance(extra_info, dict):
+                    extra_info_for_score = dict(extra_info)
+                elif extra_info is None:
+                    extra_info_for_score = {}
+                else:
+                    extra_info_for_score = {"extra_info": extra_info}
+
+                if "question" not in extra_info_for_score:
+                    # Prefer raw_problem when available (val parquet), otherwise
+                    # fall back to decoded prompt text.
+                    raw_problem = None
+                    if isinstance(extra_info_for_score, dict):
+                        raw_problem = extra_info_for_score.get("raw_problem")
+                    extra_info_for_score["question"] = raw_problem or prompt_str
+            except Exception:
+                extra_info_for_score = extra_info
 
             # ========== DEBUG: Print compute_score inputs ==========
             if debug_enabled and (debug_limit <= 0 or i < debug_limit):
@@ -529,7 +662,7 @@ class NaiveRewardManager:
                     data_source=data_source,
                     solution_str=response_str,
                     ground_truth=ground_truth,
-                    extra_info=extra_info,
+                    extra_info=extra_info_for_score,
                     reward_model_clients=self.reward_model_clients,
                 )
             except Exception as exc:
@@ -582,8 +715,7 @@ class NaiveRewardManager:
 
         # Fill reward tensor with results
         reward_extra_info = {}
-        exp_dump_records = []
-        control_dump_records = []
+        dump_records_by_stream = defaultdict(list)
         for (
             i,
             score,
@@ -609,10 +741,13 @@ class NaiveRewardManager:
                 reward_extra_info[key][i] = value
 
             # Collect dump records for batch-level write
-            if dump_record.get("stream_type") == "exp":
-                exp_dump_records.append(dump_record)
-            elif dump_record.get("stream_type") == "control":
-                control_dump_records.append(dump_record)
+            stream_type = dump_record.get("stream_type", None)
+            if stream_type:
+                try:
+                    stream_type = str(stream_type)
+                except Exception:
+                    stream_type = "unknown"
+                dump_records_by_stream[stream_type].append(dump_record)
 
         # Check if we should dump based on dual_rollout_dump_freq
         # Get dual_rollout_dump_freq from config (default to rollout_dump_freq for backward compatibility)
@@ -666,9 +801,8 @@ class NaiveRewardManager:
         # Write dump files with organized directory structure:
         # work_dir/dual_rollout_data/
         #   ├── control/
-        #   │   └── batch_YYYYMMDD_HHMMSS.json (filename now uses batch_tag)
-        #   └── exp/
-        #       └── batch_YYYYMMDD_HHMMSS.json
+        #   ├── exp/
+        #   └── cf_control/ (etc.)
         import json, os
 
         # Get dump directory from config or environment
@@ -688,44 +822,32 @@ class NaiveRewardManager:
             dump_base_dir, "dual_rollout_data", final_experiment_id
         )
 
-        # Write control stream batch
-        if control_dump_records:
-            control_subdir = os.path.join(experiment_dir, "control")
-            os.makedirs(control_subdir, exist_ok=True)
-            control_file = os.path.join(control_subdir, f"batch_{batch_tag}.json")
+        def _stream_sort_key(name: str):
+            if name == "control":
+                return (0, name)
+            if name == "exp":
+                return (1, name)
+            return (2, name)
 
-            # Add batch metadata
-            control_batch_metadata = {
-                "experiment_id": final_experiment_id,  # ✅ 使用 final_experiment_id
-                "stream_type": "control",
+        for stream_type in sorted(dump_records_by_stream.keys(), key=_stream_sort_key):
+            records = dump_records_by_stream.get(stream_type) or []
+            if not records:
+                continue
+            subdir = os.path.join(experiment_dir, stream_type)
+            os.makedirs(subdir, exist_ok=True)
+            out_file = os.path.join(subdir, f"batch_{batch_tag}.json")
+
+            batch_metadata = {
+                "experiment_id": final_experiment_id,
+                "stream_type": stream_type,
                 "batch_timestamp": batch_timestamp,
                 "batch_tag": batch_tag,
-                "total_samples": len(control_dump_records),
-                "samples": control_dump_records,
+                "total_samples": len(records),
+                "samples": records,
             }
 
-            with open(control_file, "w", encoding="utf-8") as f:
-                json.dump(control_batch_metadata, f, ensure_ascii=False, indent=2)
-            # NOTE: Disabled per-batch dump logging (the files are still written).
-
-        # Write exp stream batch
-        if exp_dump_records:
-            exp_subdir = os.path.join(experiment_dir, "exp")
-            os.makedirs(exp_subdir, exist_ok=True)
-            exp_file = os.path.join(exp_subdir, f"batch_{batch_tag}.json")
-
-            # Add batch metadata
-            exp_batch_metadata = {
-                "experiment_id": final_experiment_id,  # ✅ 使用 final_experiment_id
-                "stream_type": "exp",
-                "batch_timestamp": batch_timestamp,
-                "batch_tag": batch_tag,
-                "total_samples": len(exp_dump_records),
-                "samples": exp_dump_records,
-            }
-
-            with open(exp_file, "w", encoding="utf-8") as f:
-                json.dump(exp_batch_metadata, f, ensure_ascii=False, indent=2)
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump(batch_metadata, f, ensure_ascii=False, indent=2)
             # NOTE: Disabled per-batch dump logging (the files are still written).
 
         if return_dict:

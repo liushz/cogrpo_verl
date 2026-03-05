@@ -282,7 +282,15 @@ class vLLMRollout(BaseRollout):
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
             if len(lora_int_ids) > 0:
                 lora_int_id = lora_int_ids[0]
-                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path=getattr(self, "verifier_lora_path", None)  # Use actual Verifier LoRA path)] * batch_size
+                # Use actual Verifier LoRA path when available.
+                lora_path = getattr(self, "verifier_lora_path", None)
+                lora_requests = [
+                    LoRARequest(
+                        lora_name=f"{lora_int_id}",
+                        lora_int_id=lora_int_id,
+                        lora_path=lora_path,
+                    )
+                ] * batch_size
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):

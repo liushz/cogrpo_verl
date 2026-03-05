@@ -18,6 +18,7 @@ Notes / tradeoffs:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
@@ -513,9 +514,24 @@ def _pick_free_local_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _openai_pick_model_id(api_base: str, timeout_s: int) -> str:
+def _openai_pick_model_id(api_base: str, timeout_s: int, preferred_model: str = "") -> str:
     api_base = _normalize_api_base(api_base)
     resp = _http_json("GET", f"{api_base}/models", None, timeout_s)
+    preferred_model = str(preferred_model or "").strip()
+    if preferred_model:
+        data = resp.get("data")
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and str(item.get("id") or "").strip() == preferred_model:
+                    return preferred_model
+        models = resp.get("models")
+        if isinstance(models, list):
+            for item in models:
+                if isinstance(item, dict) and str(item.get("id") or "").strip() == preferred_model:
+                    return preferred_model
+        raise RuntimeError(
+            f"Preferred model not found on {api_base}/models: preferred={preferred_model}"
+        )
     data = resp.get("data")
     if isinstance(data, list) and data:
         mid = data[0].get("id")
@@ -529,13 +545,13 @@ def _openai_pick_model_id(api_base: str, timeout_s: int) -> str:
     raise RuntimeError(f"Failed to pick model id from {api_base}/models: keys={list(resp.keys())}")
 
 
-def _wait_openai_ready(api_base: str, timeout_s: int) -> str:
+def _wait_openai_ready(api_base: str, timeout_s: int, preferred_model: str = "") -> str:
     api_base = _normalize_api_base(api_base)
     deadline = time.time() + float(timeout_s)
     last_err: Optional[Exception] = None
     while time.time() < deadline:
         try:
-            return _openai_pick_model_id(api_base, timeout_s=30)
+            return _openai_pick_model_id(api_base, timeout_s=30, preferred_model=preferred_model)
         except Exception as e:
             last_err = e
             time.sleep(2)
@@ -554,7 +570,7 @@ def _openai_completions(
     seed: Optional[int],
     stop: Optional[List[str]],
     timeout_s: int,
-) -> str:
+) -> Tuple[str, str]:
     api_base = _normalize_api_base(api_base)
     payload: Dict[str, Any] = {
         "model": model,
@@ -575,12 +591,15 @@ def _openai_completions(
     if not isinstance(choices, list) or not choices:
         raise RuntimeError(f"Bad /completions response: keys={list(resp.keys())}")
     c0 = choices[0]
+    finish_reason = ""
+    if isinstance(c0, dict):
+        finish_reason = str(c0.get("finish_reason") or "")
     if isinstance(c0, dict):
         txt = c0.get("text", "")
         if txt is None:
             txt = ""
-        return str(txt)
-    return str(c0)
+        return str(txt), finish_reason
+    return str(c0), finish_reason
 
 
 def _openai_chat_completions(
@@ -591,10 +610,12 @@ def _openai_chat_completions(
     max_tokens: int,
     temperature: float,
     top_p: float,
+    top_k: Optional[int],
+    seed: Optional[int],
     stop: Optional[List[str]],
     timeout_s: int,
     extra_body: Optional[Dict[str, Any]] = None,
-) -> str:
+) -> Tuple[str, str]:
     """
     OpenAI-compatible /v1/chat/completions.
     If response contains `reasoning_content`, we emulate OpenCompass behavior by
@@ -610,22 +631,106 @@ def _openai_chat_completions(
         "n": 1,
         "stop": stop,
     }
+    if top_k is not None:
+        payload["top_k"] = int(top_k)
+    if seed is not None:
+        payload["seed"] = int(seed)
     if extra_body:
         payload.update(extra_body)
     resp = _http_json("POST", f"{api_base}/chat/completions", payload, timeout_s)
     choices = resp.get("choices")
     if not isinstance(choices, list) or not choices:
         raise RuntimeError(f"Bad /chat/completions response: keys={list(resp.keys())}")
-    msg = (choices[0] or {}).get("message") if isinstance(choices[0], dict) else None
+    c0 = choices[0] if isinstance(choices[0], dict) else {}
+    finish_reason = str(c0.get("finish_reason") or "")
+    msg = (c0 or {}).get("message") if isinstance(c0, dict) else None
     if not isinstance(msg, dict):
         raise RuntimeError("Bad /chat/completions response: missing choices[0].message")
     content = msg.get("content", "") or ""
     reasoning_content = msg.get("reasoning_content", "") or ""
     if reasoning_content:
         if content:
-            return str(reasoning_content) + "</think>" + str(content)
-        return str(reasoning_content)
-    return str(content)
+            return str(reasoning_content) + "</think>" + str(content), finish_reason
+        return str(reasoning_content), finish_reason
+    return str(content), finish_reason
+
+
+def _is_404_on_completions(err: Exception) -> bool:
+    msg = str(err)
+    return "HTTP 404" in msg and "/completions" in msg
+
+
+def _openai_generate_chunk_auto(
+    *,
+    api_mode_state: Dict[str, str],
+    api_base: str,
+    model: str,
+    base_prompt_raw: str,
+    base_messages: List[Dict[str, Any]],
+    response_so_far: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: Optional[int],
+    seed: Optional[int],
+    stop: Optional[List[str]],
+    timeout_s: int,
+    extra_body: Optional[Dict[str, Any]],
+) -> Tuple[str, str]:
+    mode = str(api_mode_state.get("mode", "auto") or "auto").lower()
+    if mode not in ("auto", "completions", "chat"):
+        mode = "auto"
+
+    first_err: Optional[Exception] = None
+    if mode in ("auto", "completions"):
+        try:
+            text, finish_reason = _openai_completions(
+                api_base=api_base,
+                model=model,
+                prompt=base_prompt_raw + response_so_far,
+                max_tokens=int(max_tokens),
+                temperature=float(temperature),
+                top_p=float(top_p),
+                top_k=top_k,
+                seed=seed,
+                stop=stop,
+                timeout_s=int(timeout_s),
+            )
+            api_mode_state["mode"] = "completions"
+            return text, finish_reason
+        except Exception as e:
+            first_err = e
+            if mode == "completions" or not _is_404_on_completions(e):
+                raise
+            api_mode_state["mode"] = "chat"
+            print(
+                "[warn] /v1/completions unavailable (404); falling back to /v1/chat/completions.",
+                flush=True,
+            )
+
+    messages = list(base_messages)
+    if response_so_far:
+        messages.append({"role": "assistant", "content": response_so_far})
+    try:
+        text, finish_reason = _openai_chat_completions(
+            api_base=api_base,
+            model=model,
+            messages=messages,
+            max_tokens=int(max_tokens),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=top_k,
+            seed=seed,
+            stop=stop,
+            timeout_s=int(timeout_s),
+            extra_body=extra_body,
+        )
+        api_mode_state["mode"] = "chat"
+        return text, finish_reason
+    except Exception as e:
+        if first_err is None:
+            raise
+        raise RuntimeError(f"{first_err}; chat_fallback_failed: {e}") from e
 
 
 def _prompt_obj_to_raw_prompt(tokenizer, prompt_obj: Any, system_prompt: Optional[str]) -> str:
@@ -981,12 +1086,23 @@ def main() -> int:
         "--actor-transport",
         default="pipeline",
         choices=["pipeline", "openai"],
-        help="Actor transport: lmdeploy pipeline (default) or OpenAI-compatible /v1/completions (raw prompt continuation).",
+        help="Actor transport: lmdeploy pipeline (default) or OpenAI-compatible API (auto uses /v1/completions, falls back to /v1/chat/completions on 404).",
     )
     ap.add_argument(
         "--actor-api-base",
         default="",
         help="OpenAI-compatible API base for actor (e.g. http://127.0.0.1:23333/v1). Required when --actor-transport=openai.",
+    )
+    ap.add_argument(
+        "--actor-api-model",
+        default="",
+        help="OpenAI model id for actor API calls. When set, enforce this model id from /v1/models.",
+    )
+    ap.add_argument(
+        "--actor-api-mode",
+        default="auto",
+        choices=["auto", "completions", "chat"],
+        help="OpenAI API mode for actor calls: auto (default), completions, or chat.",
     )
     ap.add_argument("--actor-api-timeout", type=int, default=600, help="HTTP timeout seconds for OpenAI API calls.")
     ap.add_argument(
@@ -1152,7 +1268,10 @@ def main() -> int:
 
     actor_transport = str(args.actor_transport)
     actor_api_base = str(args.actor_api_base or "").strip()
-    actor_api_model = ""
+    actor_api_model = str(args.actor_api_model or "").strip()
+    actor_api_mode = str(args.actor_api_mode or "auto").strip().lower()
+    if actor_api_mode not in ("auto", "completions", "chat"):
+        actor_api_mode = "auto"
     actor_proc: Optional[subprocess.Popen] = None
 
     actor_pipe = None
@@ -1198,11 +1317,19 @@ def main() -> int:
 
         actor_transport = "openai"
         actor_api_base = f"http://127.0.0.1:{int(port)}/v1"
-        actor_api_model = _wait_openai_ready(actor_api_base, timeout_s=int(args.actor_api_timeout))
+        actor_api_model = _wait_openai_ready(
+            actor_api_base,
+            timeout_s=int(args.actor_api_timeout),
+            preferred_model=actor_api_model,
+        )
     elif actor_transport == "openai":
         if not actor_api_base:
             raise SystemExit("--actor-transport=openai requires --actor-api-base (or --start-actor-api-server).")
-        actor_api_model = _wait_openai_ready(actor_api_base, timeout_s=int(args.actor_api_timeout))
+        actor_api_model = _wait_openai_ready(
+            actor_api_base,
+            timeout_s=int(args.actor_api_timeout),
+            preferred_model=actor_api_model,
+        )
 
     if actor_transport == "pipeline":
         # LMDeploy actor pipeline.
@@ -1238,6 +1365,38 @@ def main() -> int:
     if actor_transport == "openai" and not args.actor_disable_thinking:
         # Match OpenCompass' OpenAISDK usage for InternS1.
         actor_extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
+    actor_api_mode_state: Dict[str, str] = {"mode": actor_api_mode if actor_transport == "openai" else "pipeline"}
+
+    run_param_fingerprint = {
+        "base_model": base_model_dir,
+        "verifier_model": verifier_model_dir if run_exp else "",
+        "verifier_lora": verifier_lora_dir if run_exp else "",
+        "mode": args.mode,
+        "actor_transport": actor_transport,
+        "actor_api_base": actor_api_base if actor_transport == "openai" else "",
+        "actor_api_model": actor_api_model if actor_transport == "openai" else "",
+        "actor_api_mode": actor_api_mode if actor_transport == "openai" else "",
+        "temperature": float(args.temperature),
+        "top_p": float(args.top_p),
+        "top_k": int(args.top_k),
+        "seed": int(args.seed),
+        "max_prompt_tokens": int(args.max_prompt_tokens),
+        "max_response_tokens": int(args.max_response_tokens),
+        "token_check_interval": int(args.token_check_interval),
+        "min_step_tokens": int(args.min_step_tokens),
+        "max_interventions": int(args.max_interventions),
+        "lmdeploy_backend": str(args.lmdeploy_backend),
+        "lmdeploy_session_len": int(args.lmdeploy_session_len),
+        "lmdeploy_max_batch_size": int(args.lmdeploy_max_batch_size),
+        "use_verifier_system_prompt": bool(args.use_verifier_system_prompt),
+        "online_math_prompt": bool(args.online_math_prompt),
+        "degeneration_guard": bool(args.degeneration_guard),
+        "stop_token_ids": [int(x) for x in stop_token_ids],
+        "stop_words": list(stop_words),
+    }
+    run_param_hash = hashlib.sha1(
+        json.dumps(run_param_fingerprint, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
     # Verifier model (Transformers + PEFT).
     print(f"[config] actor_base_model={base_model_dir}", flush=True)
@@ -1288,6 +1447,9 @@ def main() -> int:
                 "mode": args.mode,
                 "system_prompt": "VERIFIER_SYSTEM_PROMPT" if args.use_verifier_system_prompt else None,
                 "max_model_len": int(args.lmdeploy_session_len),
+                "actor_transport": actor_transport,
+                "actor_api_mode": actor_api_mode_state.get("mode", "") if actor_transport == "openai" else "",
+                "run_param_hash": run_param_hash,
             }
 
             if run_control:
@@ -1295,6 +1457,7 @@ def main() -> int:
                 response_text = ""
                 model_gen_tokens = 0
                 error: Optional[str] = None
+                complete_reason = "unknown"
                 control_steps = 0
                 # If token_check_interval covers the entire requested generation budget, treat control
                 # as a single-shot generation (matches typical OpenCompass behavior and avoids
@@ -1304,10 +1467,13 @@ def main() -> int:
 
                 t0 = time.time()
                 while True:
+                    openai_finish_reason = ""
                     if int(args.max_sample_seconds) > 0 and (time.time() - float(t0)) > float(args.max_sample_seconds):
                         error = f"timeout>{int(args.max_sample_seconds)}s"
+                        complete_reason = "timeout"
                         break
                     if model_gen_tokens >= int(args.max_response_tokens):
+                        complete_reason = "max_response_tokens"
                         break
 
                     # Context length check (best-effort, based on tokenizer).
@@ -1316,6 +1482,7 @@ def main() -> int:
                     except Exception:
                         ctx_len = 0
                     if ctx_len >= int(args.lmdeploy_session_len):
+                        complete_reason = "context_full"
                         break
 
                     gen_remaining = int(args.max_response_tokens) - int(model_gen_tokens)
@@ -1328,14 +1495,13 @@ def main() -> int:
 
                     try:
                         if actor_transport == "openai":
-                            # NOTE: use /v1/completions with raw prompt for true continuation.
-                            # /v1/chat/completions would treat each chunk as a new assistant turn
-                            # (because we have to send response_text as an assistant message),
-                            # which can cause the model to re-answer/repeat and never hit EOS.
-                            new_text = _openai_completions(
+                            new_text, openai_finish_reason = _openai_generate_chunk_auto(
+                                api_mode_state=actor_api_mode_state,
                                 api_base=actor_api_base,
                                 model=actor_api_model,
-                                prompt=base_prompt_raw + response_text,
+                                base_prompt_raw=base_prompt_raw,
+                                base_messages=actor_base_messages,
+                                response_so_far=response_text,
                                 max_tokens=int(step_tokens),
                                 temperature=float(args.temperature),
                                 top_p=float(args.top_p) if args.top_p is not None else 1.0,
@@ -1343,6 +1509,7 @@ def main() -> int:
                                 seed=int(args.seed) if int(args.seed) != 0 else None,
                                 stop=stop_words,
                                 timeout_s=int(args.actor_api_timeout),
+                                extra_body=actor_extra_body,
                             )
                         else:
                             assert actor_pipe is not None and GenerationConfig is not None
@@ -1369,29 +1536,48 @@ def main() -> int:
                             new_text = str(getattr(out, "text", "") or "")
                     except Exception as e:
                         error = f"actor_generate_error: {e}"
+                        complete_reason = "error"
                         break
                     new_text, hit_stop = _apply_stop_words(new_text, stop_words)
                     if not new_text:
+                        complete_reason = "empty_output"
                         break
                     response_text += new_text
                     model_gen_tokens += len(tokenizer.encode(new_text, add_special_tokens=False))
                     control_steps += 1
                     if _has_complete_boxed_answer(response_text):
+                        complete_reason = "final_answer"
+                        break
+                    if str(openai_finish_reason).lower() in {"stop", "eos", "content_filter"}:
+                        complete_reason = "eos_or_stop"
                         break
                     if hit_stop:
+                        complete_reason = "eos_or_stop"
                         break
                     if args.degeneration_guard and _too_repetitive_suffix(response_text):
+                        complete_reason = "degeneration"
                         break
                     if control_single_shot and control_steps >= 1:
+                        if str(openai_finish_reason).lower() == "length":
+                            complete_reason = "max_response_tokens"
+                        else:
+                            complete_reason = "single_shot_limit"
                         break
 
                 dt = float(time.time() - t0)
                 # Token counts after any post-cut.
                 tok_total = len(tokenizer.encode(response_text, add_special_tokens=False)) if response_text else 0
+                if complete_reason == "unknown":
+                    complete_reason = "finished"
                 rec["control"] = {
                     "response_text": response_text,
                     "response_tokens_model_gen": int(model_gen_tokens),
                     "response_tokens_total": int(tok_total),
+                    "interventions_count": 0,
+                    "actor_transport": actor_transport,
+                    "actor_api_mode": actor_api_mode_state.get("mode", "") if actor_transport == "openai" else "",
+                    "last_openai_finish_reason": str(openai_finish_reason or "") if actor_transport == "openai" else "",
+                    "termination_reason": complete_reason,
                     "gen_s": dt,
                     "error": error,
                 }
@@ -1409,11 +1595,14 @@ def main() -> int:
                 last_hint_end_keep = 0
                 last_hint_tokens: Optional[List[int]] = None
                 error: Optional[str] = None
+                complete_reason = "unknown"
 
                 t0 = time.time()
                 while True:
+                    openai_finish_reason = ""
                     if int(args.max_sample_seconds) > 0 and (time.time() - float(t0)) > float(args.max_sample_seconds):
                         error = f"timeout>{int(args.max_sample_seconds)}s"
+                        complete_reason = "timeout"
                         break
                     try:
                         tok_total = len(tokenizer.encode(response_text, add_special_tokens=False)) if response_text else 0
@@ -1421,6 +1610,7 @@ def main() -> int:
                         tok_total = 0
                     model_gen_tokens = max(0, int(tok_total) - int(hint_token_total))
                     if model_gen_tokens >= int(args.max_response_tokens):
+                        complete_reason = "max_response_tokens"
                         break
                     if len(interventions) >= int(args.max_interventions):
                         # No more verifier calls; still allow generation to finish.
@@ -1432,6 +1622,7 @@ def main() -> int:
                     except Exception:
                         ctx_len = 0
                     if ctx_len >= int(args.lmdeploy_session_len):
+                        complete_reason = "context_full"
                         break
 
                     gen_remaining = int(args.max_response_tokens) - int(model_gen_tokens)
@@ -1445,11 +1636,13 @@ def main() -> int:
                     pending_complete_reason: Optional[str] = None
                     try:
                         if actor_transport == "openai":
-                            # True continuation: use /v1/completions with the raw chat_template prompt.
-                            new_text = _openai_completions(
+                            new_text, openai_finish_reason = _openai_generate_chunk_auto(
+                                api_mode_state=actor_api_mode_state,
                                 api_base=actor_api_base,
                                 model=actor_api_model,
-                                prompt=base_prompt_raw + response_text,
+                                base_prompt_raw=base_prompt_raw,
+                                base_messages=actor_base_messages,
+                                response_so_far=response_text,
                                 max_tokens=int(step_tokens),
                                 temperature=float(args.temperature),
                                 top_p=float(args.top_p) if args.top_p is not None else 1.0,
@@ -1457,6 +1650,7 @@ def main() -> int:
                                 seed=int(args.seed) if int(args.seed) != 0 else None,
                                 stop=stop_words,
                                 timeout_s=int(args.actor_api_timeout),
+                                extra_body=actor_extra_body,
                             )
                         else:
                             assert actor_pipe is not None and GenerationConfig is not None
@@ -1482,12 +1676,15 @@ def main() -> int:
                             new_text = str(getattr(out, "text", "") or "")
                     except Exception as e:
                         error = f"actor_generate_error: {e}"
+                        complete_reason = "error"
                         break
                     new_text, hit_stop = _apply_stop_words(new_text, stop_words)
                     if new_text:
                         response_text += new_text
                     else:
                         pending_complete_reason = "empty_output"
+                    if str(openai_finish_reason).lower() in {"stop", "eos", "content_filter"}:
+                        pending_complete_reason = "eos"
                     if hit_stop:
                         pending_complete_reason = "eos"
                     if _has_complete_boxed_answer(response_text):
@@ -1497,6 +1694,7 @@ def main() -> int:
 
                     if len(interventions) >= int(args.max_interventions):
                         if pending_complete_reason is not None:
+                            complete_reason = str(pending_complete_reason)
                             break
                         continue
 
@@ -1702,6 +1900,7 @@ def main() -> int:
                         pending_complete_reason = None
 
                     if pending_complete_reason is not None:
+                        complete_reason = str(pending_complete_reason)
                         break
 
                 try:
@@ -1710,13 +1909,20 @@ def main() -> int:
                     tok_total = 0
                 model_gen_tokens = max(0, int(tok_total) - int(hint_token_total))
                 dt = float(time.time() - t0)
+                if complete_reason == "unknown":
+                    complete_reason = "finished"
                 rec["exp"] = {
                     "response_text": response_text,
                     "response_tokens_total": len(tokenizer.encode(response_text, add_special_tokens=False)),
                     "response_tokens_model_gen": int(model_gen_tokens),
                     "interventions": interventions,
                     "num_interventions": len(interventions),
-                    "gen_s": dt,
+                    "interventions_count": len(interventions),
+                    "actor_transport": actor_transport,
+                    "actor_api_mode": actor_api_mode_state.get("mode", "") if actor_transport == "openai" else "",
+                    "last_openai_finish_reason": str(openai_finish_reason or "") if actor_transport == "openai" else "",
+                    "termination_reason": complete_reason,
+                    "gen_s": dt,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
                     "error": error,
                 }
 

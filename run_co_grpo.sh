@@ -60,7 +60,11 @@ use_curriculum_weighting="True"
 curriculum_start_weight=0.3
 curriculum_end_weight=0.5
 
-intervention_penalty_freq_coef=0.01
+# Disable intervention penalty by default (cost-based discouragement).
+# For cold-start verifier, this penalty tends to quickly collapse intervention rate
+# before we get stable positive cf-branch signal. You can still override via flags:
+#   --intervention-penalty-freq-coef / --intervention-penalty-len-coef
+intervention_penalty_freq_coef=0.0
 intervention_penalty_len_coef=0.0
 
 verifier_reward_mode="headroom"

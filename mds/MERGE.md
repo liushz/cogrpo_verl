@@ -61,10 +61,15 @@ echo "Current home is ${HOME}"
   --use-fa3 \
   --epoch 1
 ```
+
+
 - 起点模型冷启动数据：/mnt/shared-storage-user/llmit/user/lvchengqi/data/math_20250911rc0/Enhance_Evolve_GPT_OSS_sft_data_with_system/processed/general_sys/Enhance-Evolve-GPT-OSS_sft_data_with_system.jsonl
 - RL 起点模型：/mnt/shared-storage-user/llmit/user/chengguangran/model/cispo-cold-start-model/hf-170
 - RL起点模型system prompt：已写入模型tokenizer_config，使用上述路径即可
+system prompt:
+```
 You are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags.
+```
 - RL query 数据：/mnt/shared-storage-user/llmit/user/chengguangran/projects/verl-cgr/recipe/cispo/data/modified-dapo-math-17k.parquet
 - RL 训练脚本及参考配置：/mnt/shared-storage-user/llmit/user/chengguangran/projects/xtuner-cgr/crg_rl_projects/src/integration_project/scripts/rl_qwen25_7B_cold_start_grpo_dapo_math_260204_async.sh
 30b MoE模型
@@ -74,7 +79,7 @@ You are an expert reasoner with extensive experience in all areas. You approach 
 - user/llmit/user/chengguangran/projects/xtuner-cgr/crg_rl_projects/src/integration_project/scripts/rl_qwen3_30B_cold_start_grpo_rl_dataset_260204_async.sh
 基线 Infra
 - Xtuner codebase：https://gitlab.pjlab.org.cn/internlm/xtuner/-/tree/cgr/post-training-integration
-- Lmdeploy codebase：/mnt/shared-storage-user/llmit/user/lvchengqi/projects/agent_rl/lmdeploy_manually_fp8
+- Lmdeploy codebase（建议用自己可写的拷贝，避免误用他人目录）：/mnt/shared-storage-user/llmit/user/liuhongwei/verifier_llmit/lmdeploy_manually_fp8
 - 关键配置：
   - 异步采样：给定训练脚本默认开启了异步采样，如果需要关闭则设置
     - ENABLE_PARTIAL_ROLLOUT=0

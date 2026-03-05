@@ -7,6 +7,11 @@ set -eEuo pipefail
 JSONL="/mnt/shared-storage-user/liuhongwei/main_works/temp_debug/data/test/aime2025-I.jsonl"
 PROMPT_KEY="question"
 
+# Verifier WAIT-confidence gate (align with online `confidence_threshold`).
+# NOTE: This only affects the exp stream (verifier interventions).
+CONFIDENCE_THRESHOLD="${CONFIDENCE_THRESHOLD:-0.0}"
+WAIT_CONF_TAIL_TOKENS="${WAIT_CONF_TAIL_TOKENS:-64}"
+
 # Align with old OpenCompass config: use the policy actor checkpoint.
 BASE_MODEL="/mnt/shared-storage-user/opencompass-shared/liuhongwei/interns1/repro_exp/s1_model/interns1-8b-hf-1951"
 
@@ -35,6 +40,8 @@ COMMON_ARGS=(
   --eval-workers 32    
   --eval-batch-size 64
   --batch-size 2
+  --confidence-threshold "${CONFIDENCE_THRESHOLD}"
+  --wait-conf-tail-tokens "${WAIT_CONF_TAIL_TOKENS}"
 )
 
 WATCH_ARGS=(--watch --watch-interval 60)

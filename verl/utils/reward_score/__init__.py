@@ -47,10 +47,37 @@ def default_compute_score(data_source, solution_str, ground_truth, extra_info=No
 
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source == "math_dapo" or data_source.startswith("aime"):
-        from . import math_dapo
+    # DAPO-style math datasets sometimes encode extra suffixes in the tag
+    # (e.g. "math_dapo_cispo_cold_start_model"). Treat any "math_dapo*" tag as math_dapo.
+    #
+    # For baseline alignment, prefer CompassVerifier when a reward endpoint is configured.
+    # This keeps online RL reward consistent with offline evaluation and xtuner baselines.
+    elif data_source.startswith("math_dapo") or data_source.startswith("aime"):
+        question = None
+        if isinstance(extra_info, dict):
+            question = (
+                extra_info.get("question")
+                or extra_info.get("raw_problem")
+                or extra_info.get("problem")
+                or extra_info.get("raw_question")
+            )
+        if question is None and isinstance(extra_info, str):
+            question = extra_info
 
-        res = math_dapo.compute_score(solution_str, ground_truth)
+        if reward_model_clients and question:
+            from . import compassverifier
+
+            ok = compassverifier.compute_score(
+                question, ground_truth, solution_str, reward_model_clients
+            )
+            # Keep reward scale consistent with legacy GRPO: 0/1.
+            # (Affine transforms are mostly cancelled by GRPO-style group normalization,
+            # but 0/1 makes logs/labels and offline analyses simpler and consistent.)
+            res = {"score": float(bool(ok)), "acc": bool(ok)}
+        else:
+            from . import math_dapo
+
+            res = math_dapo.compute_score(solution_str, ground_truth)
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",

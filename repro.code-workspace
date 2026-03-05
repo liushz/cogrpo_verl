@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "/mnt/shared-storage-user/liuhongwei/main_works/repos/repro"
+		},
+		{
+			"path": "/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit"
+		},
+		{
+			"path": "../../../../llmit/user/liuhongwei/verifier_llmit"
+		},
+		{
+			"path": "../../../../llmit/user/liuhongwei/others"
+		}
+	],
+	"settings": {
+		"chatgpt.openOnStartup": false
+	}
+}

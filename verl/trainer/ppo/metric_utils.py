@@ -17,7 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -61,19 +61,77 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
             - response_mask: Attention mask for the response tokens
             - prompt_length: Tensor of prompt lengths for each item in the batch
             - response_length: Tensor of response lengths for each item in the batch
+            - max_prompt_length: Prompt length cap used for clip_ratio
+            - max_response_length: Response length cap used for clip_ratio
     """
-    response_length = batch.batch["responses"].shape[-1]
+    def _first_existing_key(keys: list[str]) -> Optional[str]:
+        for key in keys:
+            if key in batch.batch:
+                return key
+        return None
 
-    prompt_mask = batch.batch["attention_mask"][:, :-response_length]
-    response_mask = batch.batch["attention_mask"][:, -response_length:]
+    # Prefer the standard PPO fields; fallback to exp/control streams for Co-GRPO.
+    if ("responses" in batch.batch) and ("attention_mask" in batch.batch):
+        responses_key = "responses"
+        attention_mask_key = "attention_mask"
+        response_mask_key = "response_mask"
+        last_valid_pos_key = "last_valid_pos"
+    elif ("exp_responses" in batch.batch) and ("exp_attention_mask" in batch.batch):
+        responses_key = "exp_responses"
+        attention_mask_key = "exp_attention_mask"
+        response_mask_key = "exp_response_mask"
+        last_valid_pos_key = "exp_last_valid_pos"
+    elif ("control_responses" in batch.batch) and ("control_attention_mask" in batch.batch):
+        responses_key = "control_responses"
+        attention_mask_key = "control_attention_mask"
+        response_mask_key = "control_response_mask"
+        last_valid_pos_key = "control_last_valid_pos"
+    else:
+        # Last resort: derive from whichever masks exist.
+        responses_key = _first_existing_key(["responses", "exp_responses", "control_responses"]) or ""
+        attention_mask_key = _first_existing_key(["attention_mask", "exp_attention_mask", "control_attention_mask"]) or ""
+        response_mask_key = _first_existing_key(["response_mask", "exp_response_mask", "control_response_mask"]) or ""
+        last_valid_pos_key = _first_existing_key(["last_valid_pos", "exp_last_valid_pos", "control_last_valid_pos"]) or ""
 
-    prompt_length = prompt_mask.sum(-1).float()
+    if response_mask_key and (response_mask_key in batch.batch):
+        response_mask = batch.batch[response_mask_key].bool()
+        max_response_length = response_mask.shape[-1]
+    else:
+        if not responses_key or (responses_key not in batch.batch):
+            raise KeyError(
+                "Missing response information: expected one of "
+                "['responses','exp_responses','control_responses'] or a response_mask key."
+            )
+        if not attention_mask_key or (attention_mask_key not in batch.batch):
+            raise KeyError(
+                "Missing attention_mask information: expected one of "
+                "['attention_mask','exp_attention_mask','control_attention_mask'] or a response_mask key."
+            )
+        max_response_length = batch.batch[responses_key].shape[-1]
+        attention_mask = batch.batch[attention_mask_key].bool()
+        response_mask = attention_mask[:, -max_response_length:]
+
     response_length = response_mask.sum(-1).float()  # (batch_size,)
+
+    max_prompt_length = 0
+    prompt_length = torch.zeros_like(response_length)
+    if attention_mask_key and (attention_mask_key in batch.batch):
+        attention_mask = batch.batch[attention_mask_key].bool()
+        prompt_mask = attention_mask[:, :-max_response_length]
+        prompt_length = prompt_mask.sum(-1).float()
+        max_prompt_length = prompt_mask.size(-1)
+    elif last_valid_pos_key and (last_valid_pos_key in batch.batch):
+        last_valid_pos = batch.batch[last_valid_pos_key].float()
+        total_length = last_valid_pos + 1.0
+        prompt_length = torch.clamp(total_length - response_length, min=0.0)
+        max_prompt_length = int(prompt_length.max().item()) if prompt_length.numel() > 0 else 0
 
     return dict(
         response_mask=response_mask,
         prompt_length=prompt_length,
         response_length=response_length,
+        max_prompt_length=max_prompt_length,
+        max_response_length=max_response_length,
     )
 
 
@@ -107,22 +165,25 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
     
-    # Check if this is Co-GRPO training (has control and exp rewards)
-    is_co_grpo = "control_token_level_rewards" in batch.batch and "exp_token_level_rewards" in batch.batch
+    # Co-GRPO can run with:
+    # - EXP + global CONTROL streams (stream_mode="both")
+    # - EXP-only stream with counterfactual baselines (cf_branch modes)
+    # Log whichever stream rewards are available.
+    has_control_reward = "control_token_level_rewards" in batch.batch
+    has_exp_reward = "exp_token_level_rewards" in batch.batch
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
 
-    max_response_length = batch.batch["responses"].shape[-1]
-
-    prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
-    response_mask = batch.batch["attention_mask"][:, -max_response_length:].bool()
-
-    max_prompt_length = prompt_mask.size(-1)
-
     response_info = _compute_response_info(batch)
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
+    max_response_length = int(response_info.get("max_response_length", response_info["response_mask"].shape[-1]))
+    max_prompt_length = int(response_info.get("max_prompt_length", 0))
+
+    # Use the training-stream response_mask if available; Co-GRPO may also carry
+    # exp/control masks that can differ in length.
+    response_mask = batch.batch.get("response_mask", response_info["response_mask"]).bool()
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -173,32 +234,35 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "response_length/mean": torch.mean(response_length).detach().item(),
         "response_length/max": torch.max(response_length).detach().item(),
         "response_length/min": torch.min(response_length).detach().item(),
-        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float()).detach().item() if max_response_length > 0 else 0.0,
         # prompt length
         "prompt_length/mean": torch.mean(prompt_length).detach().item(),
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item() if max_prompt_length > 0 else 0.0,
     }
     
-    # Add Co-GRPO specific metrics if applicable
-    if is_co_grpo:
-        # Control stream rewards
+    # Add Co-GRPO specific metrics if applicable.
+    control_sequence_reward = None
+    exp_sequence_reward = None
+
+    if has_control_reward:
         control_sequence_reward = batch.batch["control_token_level_rewards"].sum(-1)
         metrics.update({
             "co_grpo/control_reward/mean": torch.mean(control_sequence_reward).detach().item(),
             "co_grpo/control_reward/max": torch.max(control_sequence_reward).detach().item(),
             "co_grpo/control_reward/min": torch.min(control_sequence_reward).detach().item(),
         })
-        
-        # Experimental stream rewards
+
+    if has_exp_reward:
         exp_sequence_reward = batch.batch["exp_token_level_rewards"].sum(-1)
         metrics.update({
             "co_grpo/exp_reward/mean": torch.mean(exp_sequence_reward).detach().item(),
             "co_grpo/exp_reward/max": torch.max(exp_sequence_reward).detach().item(),
             "co_grpo/exp_reward/min": torch.min(exp_sequence_reward).detach().item(),
         })
-        
+
+    if has_control_reward and has_exp_reward:
         # Verification advantage (r_B - r_A)
         verification_advantage = exp_sequence_reward - control_sequence_reward
         metrics.update({
@@ -207,33 +271,39 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             "co_grpo/verification_advantage/min": torch.min(verification_advantage).detach().item(),
             "co_grpo/verification_advantage/std": torch.std(verification_advantage).detach().item(),
         })
-        
+
         # Verifier help rate (percentage where exp > control)
         verifier_help_rate = torch.mean((verification_advantage > 0).float()).detach().item()
         metrics.update({
             "co_grpo/verifier_help_rate": verifier_help_rate,
         })
-        
-        # Verifier advantages and returns (if available)
-        if "verifier_advantages" in batch.batch:
-            verifier_advantages = batch.batch["verifier_advantages"]
-            verifier_response_mask = batch.batch.get("verifier_response_mask", batch.batch["exp_response_mask"])
-            valid_verifier_adv = torch.masked_select(verifier_advantages, verifier_response_mask.bool())
-            metrics.update({
-                "co_grpo/verifier_advantages/mean": torch.mean(valid_verifier_adv).detach().item(),
-                "co_grpo/verifier_advantages/max": torch.max(valid_verifier_adv).detach().item(),
-                "co_grpo/verifier_advantages/min": torch.min(valid_verifier_adv).detach().item(),
-            })
-        
-        if "verifier_returns" in batch.batch:
-            verifier_returns = batch.batch["verifier_returns"]
-            verifier_response_mask = batch.batch.get("verifier_response_mask", batch.batch["exp_response_mask"])
-            valid_verifier_returns = torch.masked_select(verifier_returns, verifier_response_mask.bool())
-            metrics.update({
-                "co_grpo/verifier_returns/mean": torch.mean(valid_verifier_returns).detach().item(),
-                "co_grpo/verifier_returns/max": torch.max(valid_verifier_returns).detach().item(),
-                "co_grpo/verifier_returns/min": torch.min(valid_verifier_returns).detach().item(),
-            })
+
+    # Verifier advantages and returns (if available)
+    if "verifier_advantages" in batch.batch:
+        verifier_advantages = batch.batch["verifier_advantages"]
+        verifier_response_mask = batch.batch.get(
+            "verifier_response_mask",
+            batch.batch.get("exp_response_mask", response_mask),
+        )
+        valid_verifier_adv = torch.masked_select(verifier_advantages, verifier_response_mask.bool())
+        metrics.update({
+            "co_grpo/verifier_advantages/mean": torch.mean(valid_verifier_adv).detach().item() if valid_verifier_adv.numel() > 0 else 0.0,
+            "co_grpo/verifier_advantages/max": safe_max(valid_verifier_adv.detach()),
+            "co_grpo/verifier_advantages/min": safe_min(valid_verifier_adv.detach()),
+        })
+
+    if "verifier_returns" in batch.batch:
+        verifier_returns = batch.batch["verifier_returns"]
+        verifier_response_mask = batch.batch.get(
+            "verifier_response_mask",
+            batch.batch.get("exp_response_mask", response_mask),
+        )
+        valid_verifier_returns = torch.masked_select(verifier_returns, verifier_response_mask.bool())
+        metrics.update({
+            "co_grpo/verifier_returns/mean": torch.mean(valid_verifier_returns).detach().item() if valid_verifier_returns.numel() > 0 else 0.0,
+            "co_grpo/verifier_returns/max": safe_max(valid_verifier_returns.detach()),
+            "co_grpo/verifier_returns/min": safe_min(valid_verifier_returns.detach()),
+        })
 
     return metrics
 

@@ -82,6 +82,8 @@ DROP_ROOT="${DROP_ROOT:-/mnt/shared-storage-user/liuhongwei/main_works/temp_debu
 
 # Full mixed verifier model (no LoRA).
 FULLMIX_VERIFIER_MODEL="${FULLMIX_VERIFIER_MODEL:-/mnt/shared-storage-user/llmit/user/liuhongwei/verifier_llmit/ckpt/cold_start_full_qwen2d5-7b/20260223230703_mixed_full/20260224105827/hf-181}"
+# Fullmix actor model: default to hf-181 as well (expected for "full mix").
+FULLMIX_ACTOR_MODEL="${FULLMIX_ACTOR_MODEL:-${FULLMIX_VERIFIER_MODEL}}"
 
 # Datasets.
 DATA_FULL="${DATA_FULL:-/mnt/shared-storage-user/liuhongwei/main_works/temp_debug/data/test/aime2025-I.jsonl}"
@@ -125,10 +127,43 @@ LMDEPLOY_LOG_LEVEL="${LMDEPLOY_LOG_LEVEL:-WARNING}"
 
 RUN_FULL="${RUN_FULL:-1}"
 RUN_HEAD4="${RUN_HEAD4:-1}"
+RUN_BASE="${RUN_BASE:-1}"
+RUN_FPFIX="${RUN_FPFIX:-1}"
+RUN_DROP="${RUN_DROP:-1}"
+RUN_FULLMIX="${RUN_FULLMIX:-1}"
 RESUME="${RESUME:-1}"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-30}"
 
 export LMDEPLOY_SKIP_WARMUP="${LMDEPLOY_SKIP_WARMUP:-1}"
+
+# Prompt/system alignment:
+# - USE_VERIFIER_SYSTEM_PROMPT=1: prepend VERIFIER_SYSTEM_PROMPT as system msg for the actor
+#   (useful when you want <think> tags / match some OpenCompass configs).
+# - Set to 0 to evaluate on raw dataset prompts only (closer to RL parquet prompts).
+USE_VERIFIER_SYSTEM_PROMPT="${USE_VERIFIER_SYSTEM_PROMPT:-1}"
+# Safety guards for offline eval (avoid runaway 65k generations on degenerate samples).
+DEGENERATION_GUARD="${DEGENERATION_GUARD:-1}"
+STOP_AT_THINK_END="${STOP_AT_THINK_END:-0}"
+
+# Prompt alignment with online OpenCompass math eval.
+ONLINE_MATH_PROMPT="${ONLINE_MATH_PROMPT:-0}"
+EVAL_PROMPT_FLAGS="${EVAL_PROMPT_FLAGS:-}"
+if [[ -z "${EVAL_PROMPT_FLAGS}" ]] && [[ "${ONLINE_MATH_PROMPT}" == "1" ]]; then
+  EVAL_PROMPT_FLAGS="--online-math-prompt"
+fi
+
+# Optional: align actor transport with online OpenAISDK decode service.
+# - pipeline (default): lmdeploy pipeline() in-process.
+# - openai: OpenAI-compatible /v1/chat/completions (either external or started in-job).
+ACTOR_TRANSPORT="${ACTOR_TRANSPORT:-pipeline}"  # pipeline|openai
+ACTOR_API_BASE="${ACTOR_API_BASE:-}"
+ACTOR_API_TIMEOUT="${ACTOR_API_TIMEOUT:-600}"
+START_ACTOR_API_SERVER="${START_ACTOR_API_SERVER:-0}"
+ACTOR_API_PORT="${ACTOR_API_PORT:-0}"
+ACTOR_API_TP="${ACTOR_API_TP:-1}"
+ACTOR_API_WORKER_NUM="${ACTOR_API_WORKER_NUM:-1}"
+ACTOR_API_EXTRA_CLI="${ACTOR_API_EXTRA_CLI:-}"
+ACTOR_DISABLE_THINKING="${ACTOR_DISABLE_THINKING:-0}"
 
 _setup_no_proxy() {
   local urls="$1"
@@ -424,9 +459,10 @@ _run_one_eval() {
   local verifier_lora="$3"
   local verifier_model="$4"
   local run_mode="${5:-${MODE}}"
+  local actor_base_model="${6:-${BASE_MODEL}}"
 
   [[ -f "${jsonl}" ]] || _die "Missing dataset jsonl: ${jsonl}"
-  [[ -f "${BASE_MODEL}/config.json" ]] || _die "Missing base model config.json: ${BASE_MODEL}"
+  [[ -f "${actor_base_model}/config.json" ]] || _die "Missing actor base model config.json: ${actor_base_model}"
   if [[ -n "${verifier_lora}" ]]; then
     [[ -f "${verifier_lora}/adapter_config.json" ]] || _die "Missing verifier LoRA adapter_config.json: ${verifier_lora}"
   fi
@@ -483,6 +519,9 @@ _run_one_eval() {
     echo "[run] tag=${tag}"
     echo "[run] dataset=${jsonl}"
     echo "[run] run_dir=${run_dir}"
+    echo "[run] actor_base_model=${actor_base_model}"
+    echo "[run] verifier_model=${verifier_model:-${actor_base_model}}"
+    echo "[run] verifier_lora=${verifier_lora:-}"
     echo "[run] workers=${SHARDS} repeat=${REPEAT} mode=${run_mode}"
     echo "============================================================"
   fi
@@ -505,6 +544,13 @@ _run_one_eval() {
   else
     local prev_mode="${MODE}"
     export MODE="${run_mode}"
+
+    # Ensure direct connections to internal endpoints (CompassVerifier + optional actor OpenAI API).
+    local no_proxy_urls="${EVAL_URLS}"
+    if [[ "${ACTOR_TRANSPORT}" == "openai" ]] && [[ -n "${ACTOR_API_BASE}" ]]; then
+      no_proxy_urls="${no_proxy_urls},${ACTOR_API_BASE}"
+    fi
+    _setup_no_proxy "${no_proxy_urls}"
 
     # Create worker script for dynamic task fetching
     local worker_script="${run_dir}/worker.sh"
@@ -556,16 +602,44 @@ while true; do
 
   echo "[task] item_${task_idx}" >> "${LOGS_DIR}/worker_${WORKER_ID}.log"
 
+  # Actor transport alignment with online OpenAISDK:
+  # - pipeline: in-process lmdeploy pipeline
+  # - openai: OpenAI-compatible /v1/chat/completions (external or started in-job)
+  actor_args=(--actor-transport "${ACTOR_TRANSPORT}" --actor-api-timeout "${ACTOR_API_TIMEOUT}")
+  if [[ "${ACTOR_DISABLE_THINKING}" == "1" ]]; then
+    actor_args+=(--actor-disable-thinking)
+  fi
+  if [[ "${ACTOR_TRANSPORT}" == "openai" ]]; then
+    if [[ -z "${ACTOR_API_BASE}" ]]; then
+      echo "[ERROR] ACTOR_API_BASE is required when ACTOR_TRANSPORT=openai" >> "${LOGS_DIR}/worker_${WORKER_ID}.log"
+      exit 2
+    fi
+    actor_args+=(--actor-api-base "${ACTOR_API_BASE}")
+  fi
+  if [[ "${START_ACTOR_API_SERVER}" == "1" ]]; then
+    actor_args+=(--start-actor-api-server)
+    actor_args+=(--actor-api-port "${ACTOR_API_PORT}")
+    actor_args+=(--actor-api-tp "${ACTOR_API_TP}")
+    actor_args+=(--actor-api-worker-num "${ACTOR_API_WORKER_NUM}")
+    if [[ -n "${ACTOR_API_EXTRA_CLI}" ]]; then
+      actor_args+=(--actor-api-extra-cli "${ACTOR_API_EXTRA_CLI}")
+    fi
+  fi
+
   # Run eval on single item
   python3 "${EVAL_PY}" \
-    --base-model "${BASE_MODEL}" \
+    --base-model "${ACTOR_BASE_MODEL}" \
     ${VERIFIER_MODEL:+--verifier-model "${VERIFIER_MODEL}"} \
     ${VERIFIER_LORA:+--verifier-lora "${VERIFIER_LORA}"} \
     --prompts-file "${item_file}" \
     --prompt-key "${PROMPT_KEY}" \
     --out-jsonl "${tmp_file}" \
+    "${actor_args[@]}" \
+    ${EVAL_PROMPT_FLAGS} \
     --mode "${MODE}" \
-    --use-verifier-system-prompt \
+    $(if [[ "${USE_VERIFIER_SYSTEM_PROMPT}" == "1" ]]; then echo "--use-verifier-system-prompt"; fi) \
+    $(if [[ "${DEGENERATION_GUARD}" == "1" ]]; then echo "--degeneration-guard"; fi) \
+    $(if [[ "${STOP_AT_THINK_END}" == "1" ]]; then echo "--stop-at-think-end"; fi) \
     --temperature "${BASE_TEMPERATURE}" \
     --max-prompt-tokens "${MAX_PROMPT_TOKENS}" \
     --max-response-tokens "${MAX_RESPONSE_TOKENS}" \
@@ -592,7 +666,10 @@ WORKER_EOF
 
     # Export needed variables for worker script
     # Note: local variables cannot be exported, so we copy to uppercase versions
-    export EVAL_PY BASE_MODEL PROMPT_KEY MODE
+    export EVAL_PY PROMPT_KEY MODE EVAL_PROMPT_FLAGS USE_VERIFIER_SYSTEM_PROMPT
+    export DEGENERATION_GUARD STOP_AT_THINK_END
+    export ACTOR_TRANSPORT ACTOR_API_BASE ACTOR_API_TIMEOUT START_ACTOR_API_SERVER
+    export ACTOR_API_PORT ACTOR_API_TP ACTOR_API_WORKER_NUM ACTOR_API_EXTRA_CLI ACTOR_DISABLE_THINKING
     export BASE_TEMPERATURE MAX_PROMPT_TOKENS MAX_RESPONSE_TOKENS
     export TOKEN_CHECK_INTERVAL MIN_STEP_TOKENS MAX_INTERVENTIONS
     export CONFIDENCE_THRESHOLD WAIT_CONF_TAIL_TOKENS
@@ -600,6 +677,7 @@ WORKER_EOF
     export STOP_TOKEN_ID LMDEPLOY_BACKEND LMDEPLOY_SESSION_LEN
     export LMDEPLOY_MAX_BATCH_SIZE LMDEPLOY_LOG_LEVEL
     # Copy local variables to exportable names (must be after the above exports)
+    export ACTOR_BASE_MODEL="${actor_base_model}"
     export VERIFIER_MODEL="${verifier_model}"
     export VERIFIER_LORA="${verifier_lora}"
 
@@ -729,64 +807,88 @@ main() {
   echo "[ckpt] fpfix_latest=${fpfix_ckpt_name} (${fpfix_ckpt_dir})"
   echo "[ckpt] drop_latest=${drop_ckpt_name} (${drop_ckpt_dir})"
 
+  # To avoid RESUME mistakenly skipping a run after prompt/style changes, encode prompt style in tag.
+  local prompt_tag=""
+  if [[ "${ONLINE_MATH_PROMPT}" == "1" ]]; then
+    prompt_tag="_online_math"
+  fi
+
   if [[ "${RUN_HEAD4}" == "1" ]]; then
-    _run_one_eval \
-      "aime2025-I_head4_lmdeploy64k_local/base/control" \
-      "${DATA_HEAD4}" \
-      "" \
-      "" \
-      "control"
+    if [[ "${RUN_BASE}" == "1" ]]; then
+      _run_one_eval \
+        "aime2025-I_head4_lmdeploy64k_local/base/control${prompt_tag}" \
+        "${DATA_HEAD4}" \
+        "" \
+        "" \
+        "control"
+    fi
 
-    _run_one_eval \
-      "aime2025-I_head4_lmdeploy64k_local/fpfix/${fpfix_ckpt_name}" \
-      "${DATA_HEAD4}" \
-      "${fpfix_ckpt_dir}" \
-      "" \
-      "${MODE}"
+    if [[ "${RUN_FPFIX}" == "1" ]]; then
+      _run_one_eval \
+        "aime2025-I_head4_lmdeploy64k_local/fpfix/${fpfix_ckpt_name}${prompt_tag}" \
+        "${DATA_HEAD4}" \
+        "${fpfix_ckpt_dir}" \
+        "" \
+        "${MODE}"
+    fi
 
-    _run_one_eval \
-      "aime2025-I_head4_lmdeploy64k_local/drop/${drop_ckpt_name}" \
-      "${DATA_HEAD4}" \
-      "${drop_ckpt_dir}" \
-      "" \
-      "${MODE}"
+    if [[ "${RUN_DROP}" == "1" ]]; then
+      _run_one_eval \
+        "aime2025-I_head4_lmdeploy64k_local/drop/${drop_ckpt_name}${prompt_tag}" \
+        "${DATA_HEAD4}" \
+        "${drop_ckpt_dir}" \
+        "" \
+        "${MODE}"
+    fi
 
-    _run_one_eval \
-      "aime2025-I_head4_lmdeploy64k_local/fullmix/hf-181" \
-      "${DATA_HEAD4}" \
-      "" \
-      "${FULLMIX_VERIFIER_MODEL}" \
-      "${MODE}"
+    if [[ "${RUN_FULLMIX}" == "1" ]]; then
+      _run_one_eval \
+        "aime2025-I_head4_lmdeploy64k_local/fullmix/hf-181_actor181${prompt_tag}" \
+        "${DATA_HEAD4}" \
+        "" \
+        "${FULLMIX_VERIFIER_MODEL}" \
+        "${MODE}" \
+        "${FULLMIX_ACTOR_MODEL}"
+    fi
   fi
 
   if [[ "${RUN_FULL}" == "1" ]]; then
-    _run_one_eval \
-      "aime2025-I_lmdeploy64k_local/base/control" \
-      "${DATA_FULL}" \
-      "" \
-      "" \
-      "control"
+    if [[ "${RUN_BASE}" == "1" ]]; then
+      _run_one_eval \
+        "aime2025-I_lmdeploy64k_local/base/control${prompt_tag}" \
+        "${DATA_FULL}" \
+        "" \
+        "" \
+        "control"
+    fi
 
-    _run_one_eval \
-      "aime2025-I_lmdeploy64k_local/fpfix/${fpfix_ckpt_name}" \
-      "${DATA_FULL}" \
-      "${fpfix_ckpt_dir}" \
-      "" \
-      "${MODE}"
+    if [[ "${RUN_FPFIX}" == "1" ]]; then
+      _run_one_eval \
+        "aime2025-I_lmdeploy64k_local/fpfix/${fpfix_ckpt_name}${prompt_tag}" \
+        "${DATA_FULL}" \
+        "${fpfix_ckpt_dir}" \
+        "" \
+        "${MODE}"
+    fi
 
-    _run_one_eval \
-      "aime2025-I_lmdeploy64k_local/drop/${drop_ckpt_name}" \
-      "${DATA_FULL}" \
-      "${drop_ckpt_dir}" \
-      "" \
-      "${MODE}"
+    if [[ "${RUN_DROP}" == "1" ]]; then
+      _run_one_eval \
+        "aime2025-I_lmdeploy64k_local/drop/${drop_ckpt_name}${prompt_tag}" \
+        "${DATA_FULL}" \
+        "${drop_ckpt_dir}" \
+        "" \
+        "${MODE}"
+    fi
 
-    _run_one_eval \
-      "aime2025-I_lmdeploy64k_local/fullmix/hf-181" \
-      "${DATA_FULL}" \
-      "" \
-      "${FULLMIX_VERIFIER_MODEL}" \
-      "${MODE}"
+    if [[ "${RUN_FULLMIX}" == "1" ]]; then
+      _run_one_eval \
+        "aime2025-I_lmdeploy64k_local/fullmix/hf-181_actor181${prompt_tag}" \
+        "${DATA_FULL}" \
+        "" \
+        "${FULLMIX_VERIFIER_MODEL}" \
+        "${MODE}" \
+        "${FULLMIX_ACTOR_MODEL}"
+    fi
   fi
 }
 

@@ -16,9 +16,11 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 import warnings
 from contextlib import nullcontext
@@ -719,9 +721,10 @@ class ActorRolloutRefWorker(Worker):
 
             if verifier_lora_rank > 0:
                 # Enable multi-LoRA support: Policy (base) + Verifier (LoRA)
-                # For Co-GRPO, we need max_loras=2 even if actor doesn't use LoRA
-                # because vLLM needs to support both actor (base) and verifier (LoRA)
-                max_loras = 2  # Always 2 when verifier LoRA is enabled
+                # NOTE: The base policy path does not occupy a LoRA "slot". If the
+                # actor itself is not a LoRA model, we only need a single LoRA slot
+                # for the verifier adapter.
+                max_loras = 2 if self._is_lora else 1
                 max_lora_rank = max(
                     self._lora_rank if self._is_lora else 0, verifier_lora_rank
                 )
@@ -943,9 +946,22 @@ class ActorRolloutRefWorker(Worker):
             self.verifier_actor = None
             verifier_cfg = self.config.get("verifier", {})
             verifier_lora_enabled = bool(verifier_cfg.get("lora_rank", 0) > 0)
+            verifier_update_base = _safe_bool(verifier_cfg.get("update_base", False))
+            # Cache flags so later logic (disable_adapter, save/reload LoRA, etc.) does not
+            # accidentally treat shared-base verifier updates as LoRA mode.
+            self._verifier_lora_enabled = bool(verifier_lora_enabled)
+            self._verifier_update_base = bool(verifier_update_base)
+            freeze_actor = _safe_bool(verifier_cfg.get("freeze_actor", False))
+            if verifier_lora_enabled and verifier_update_base:
+                logger.warning(
+                    "verifier.update_base=True is ignored because verifier.lora_rank>0 (LoRA mode)."
+                )
+                verifier_update_base = False
+                self._verifier_update_base = False
             if (
-                _safe_bool(verifier_cfg.get("freeze_actor", False))
-                and not verifier_lora_enabled
+                freeze_actor
+                and (not verifier_lora_enabled)
+                and (not verifier_update_base)
             ):
                 logger.warning(
                     "verifier.freeze_actor=True but verifier.lora_rank<=0; no parameters will be updated."
@@ -1048,6 +1064,56 @@ class ActorRolloutRefWorker(Worker):
                         assert actor_opt_param_ids.isdisjoint(lora_param_ids), (
                             "actor_optimizer must exclude verifier LoRA parameters"
                         )
+            elif verifier_update_base:
+                if freeze_actor:
+                    logger.warning(
+                        "verifier.update_base=True but verifier.freeze_actor=True; disabling base verifier updates."
+                    )
+                elif self.actor_optimizer is None:
+                    logger.warning(
+                        "verifier.update_base=True but actor_optimizer is None; verifier updates disabled."
+                    )
+                else:
+                    # Shared-base verifier update: use the *same* base model as actor and
+                    # apply PPO updates on verifier trajectories using the actor optimizer.
+                    #
+                    # NOTE: This couples actor+verifier learning into a single set of weights.
+                    # Use with care: verifier updates will change the actor policy too.
+                    verifier_actor_cfg = OmegaConf.create(
+                        OmegaConf.to_container(self.config.actor, resolve=True)
+                    )
+                    OmegaConf.set_struct(verifier_actor_cfg, False)
+                    with open_dict(verifier_actor_cfg):
+                        verifier_actor_cfg.use_kl_loss = False
+                        verifier_actor_cfg.kl_loss_coef = 0.0
+                        # Allow verifier-specific PPO/microbatch overrides.
+                        if isinstance(verifier_cfg, (dict, DictConfig)):
+                            if "use_dynamic_bsz" in verifier_cfg:
+                                verifier_actor_cfg.use_dynamic_bsz = _safe_bool(
+                                    verifier_cfg.get("use_dynamic_bsz")
+                                )
+                            if "ppo_micro_batch_size_per_gpu" in verifier_cfg:
+                                verifier_actor_cfg.ppo_micro_batch_size_per_gpu = int(
+                                    verifier_cfg.get("ppo_micro_batch_size_per_gpu")
+                                )
+                            if "ppo_mini_batch_size" in verifier_cfg:
+                                verifier_actor_cfg.ppo_mini_batch_size = int(
+                                    verifier_cfg.get("ppo_mini_batch_size")
+                                )
+                            if "ppo_max_token_len_per_gpu" in verifier_cfg:
+                                verifier_actor_cfg.ppo_max_token_len_per_gpu = int(
+                                    verifier_cfg.get("ppo_max_token_len_per_gpu")
+                                )
+
+                    # Reuse actor optimizer to avoid a second full optimizer state on base params.
+                    self.verifier_optimizer = self.actor_optimizer
+                    self.verifier_actor = DataParallelPPOActor(
+                        config=verifier_actor_cfg,
+                        actor_module=self.actor_module_fsdp,
+                        actor_optimizer=self.verifier_optimizer,
+                    )
+                    # No separate scheduler for shared optimizer; keep actor LR schedule ownership in update_actor().
+                    self.verifier_lr_scheduler = None
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout(
@@ -1127,6 +1193,134 @@ class ActorRolloutRefWorker(Worker):
                 checkpoint_contents=checkpoint_contents,
             )
 
+    def _conflict_debug_should_probe(self) -> bool:
+        """Whether to probe actor/verifier update conflict on this step.
+
+        Only meaningful for shared-base mode where verifier.update_base=True (no verifier LoRA).
+        """
+        if not _safe_bool(os.environ.get("VERL_CONFLICT_DEBUG", "0")):
+            return False
+        verifier_cfg = self.config.get("verifier", {}) or {}
+        if not _safe_bool(verifier_cfg.get("update_base", False)):
+            return False
+        try:
+            freq = int(os.environ.get("VERL_CONFLICT_DEBUG_FREQ", "1") or 1)
+        except Exception:
+            freq = 1
+        if freq <= 0:
+            return False
+        call_count = int(getattr(self, "_conflict_debug_call_count", 0) or 0) + 1
+        self._conflict_debug_call_count = call_count
+        return call_count % freq == 0
+
+    def _conflict_probe_snapshot(self) -> Union[torch.Tensor, None]:
+        """Take a small sketch snapshot of (sharded) actor params for conflict debug."""
+        if getattr(self, "actor_module_fsdp", None) is None:
+            return None
+        try:
+            sample_k = int(os.environ.get("VERL_CONFLICT_DEBUG_K", "4096") or 4096)
+        except Exception:
+            sample_k = 4096
+        if sample_k <= 0:
+            return None
+
+        spec = getattr(self, "_conflict_probe_spec", None)
+        if spec is None:
+            try:
+                seed = int(os.environ.get("VERL_CONFLICT_DEBUG_SEED", "17") or 17)
+            except Exception:
+                seed = 17
+
+            explicit = os.environ.get("VERL_CONFLICT_PARAM_NAMES", "") or ""
+            if explicit.strip():
+                param_names = [s.strip() for s in explicit.split(",") if s.strip()]
+            else:
+                named_params = [
+                    (n, p)
+                    for n, p in self.actor_module_fsdp.named_parameters()
+                    if "lora_" not in n and getattr(p, "numel", lambda: 0)() > 0
+                ]
+                layer_re = re.compile(r"(?:^|\\.)layers\\.(\\d+)\\.")
+                max_layer = -1
+                for n, _ in named_params:
+                    m = layer_re.search(n)
+                    if m:
+                        max_layer = max(max_layer, int(m.group(1)))
+
+                param_names = []
+
+                def _maybe_add(suffix: str) -> None:
+                    for n, _ in named_params:
+                        if n.endswith(suffix) and n not in param_names:
+                            param_names.append(n)
+                            return
+
+                if max_layer >= 0:
+                    for layer in (max_layer, max_layer - 1):
+                        if layer < 0:
+                            continue
+                        _maybe_add(f"model.layers.{layer}.self_attn.o_proj.weight")
+                        _maybe_add(f"model.layers.{layer}.post_attention_layernorm.weight")
+                        _maybe_add(f"model.layers.{layer}.input_layernorm.weight")
+                        _maybe_add(f"model.layers.{layer}.mlp.down_proj.weight")
+
+                if not param_names and max_layer >= 0:
+                    suffix = f"layers.{max_layer}."
+                    for n, _ in named_params:
+                        if suffix in n and n.endswith(".weight"):
+                            param_names.append(n)
+                            if len(param_names) >= 4:
+                                break
+
+                if not param_names and named_params:
+                    param_names = [n for n, _ in named_params[:4]]
+
+            # Pre-sample indices per param (local shard) so snapshots are comparable.
+            param_map = {n: p for n, p in self.actor_module_fsdp.named_parameters()}
+            indices = {}
+            for name in param_names:
+                p = param_map.get(name, None)
+                if p is None:
+                    continue
+                try:
+                    n = int(p.numel())
+                except Exception:
+                    n = 0
+                if n <= 0:
+                    continue
+                k = min(int(sample_k), int(n))
+                if k <= 0:
+                    continue
+                h = hashlib.md5(name.encode("utf-8")).hexdigest()
+                h_int = int(h[:8], 16)
+                g = torch.Generator(device="cpu")
+                g.manual_seed(int(seed) + int(h_int))
+                idx = torch.randint(0, n, size=(k,), generator=g, dtype=torch.long)
+                indices[name] = idx
+
+            spec = {"param_names": list(indices.keys()), "indices": indices}
+            self._conflict_probe_spec = spec
+
+        param_map = {n: p for n, p in self.actor_module_fsdp.named_parameters()}
+        values = []
+        for name in spec.get("param_names", []):
+            p = param_map.get(name, None)
+            idx = spec.get("indices", {}).get(name, None)
+            if p is None or idx is None or idx.numel() <= 0:
+                continue
+            try:
+                flat = p.detach().view(-1)
+                if flat.numel() <= 0:
+                    continue
+                idx_dev = idx.to(device=flat.device, non_blocking=True)
+                sampled = flat.index_select(0, idx_dev).detach().to(torch.float32).cpu()
+                values.append(sampled)
+            except Exception:
+                continue
+        if not values:
+            return None
+        return torch.cat(values, dim=0)
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
@@ -1152,7 +1346,7 @@ class ActorRolloutRefWorker(Worker):
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 disable_ctx = nullcontext()
-                if getattr(self, "verifier_optimizer", None) is not None:
+                if getattr(self, "_verifier_lora_enabled", False):
                     target = (
                         getattr(self.actor, "actor_module", None)
                         or self.actor_module_fsdp
@@ -1167,8 +1361,19 @@ class ActorRolloutRefWorker(Worker):
                         )
                     if hasattr(target, "disable_adapter"):
                         disable_ctx = target.disable_adapter()
+                conflict_probe = self._conflict_debug_should_probe()
+                self._conflict_probe_active = bool(conflict_probe)
+                theta_before = self._conflict_probe_snapshot() if conflict_probe else None
                 with disable_ctx:
                     metrics = self.actor.update_policy(data=data)
+                theta_after = self._conflict_probe_snapshot() if conflict_probe else None
+                if conflict_probe and theta_before is not None and theta_after is not None:
+                    self._conflict_theta_before = theta_before
+                    self._conflict_theta_after_actor = theta_after
+                else:
+                    self._conflict_probe_active = False
+                    self._conflict_theta_before = None
+                    self._conflict_theta_after_actor = None
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
@@ -1273,6 +1478,16 @@ class ActorRolloutRefWorker(Worker):
                 if verifier_temperature <= 0:
                     verifier_temperature = 1.0
                 data.meta_info["temperature"] = verifier_temperature
+            # Optional: verifier-only grad clip override (useful for shared-base stability studies).
+            verifier_cfg = self.config.get("verifier", {}) or {}
+            grad_clip_override = verifier_cfg.get(
+                "grad_clip", os.environ.get("VERL_VERIFIER_GRAD_CLIP", None)
+            )
+            if grad_clip_override not in (None, ""):
+                try:
+                    self.verifier_actor.config.grad_clip = float(grad_clip_override)
+                except Exception:
+                    pass
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
@@ -1284,7 +1499,48 @@ class ActorRolloutRefWorker(Worker):
                 self.actor_module_fsdp.zero_grad()
 
             with Timer(name="update_verifier", logger=None) as timer:
-                metrics = self.verifier_actor.update_policy(data=data)
+                verifier_cfg = self.config.get("verifier", {}) or {}
+                lr_scale_raw = verifier_cfg.get(
+                    "lr_scale", os.environ.get("VERL_VERIFIER_LR_SCALE", 1.0)
+                )
+                try:
+                    lr_scale = float(lr_scale_raw)
+                except Exception:
+                    lr_scale = 1.0
+                if not (lr_scale > 0):
+                    lr_scale = 1.0
+
+                orig_lrs = None
+                if lr_scale != 1.0 and getattr(self, "verifier_optimizer", None) is not None:
+                    try:
+                        orig_lrs = []
+                        for group in self.verifier_optimizer.param_groups:
+                            lr0 = float(group.get("lr", 0.0))
+                            orig_lrs.append(lr0)
+                            group["lr"] = lr0 * lr_scale
+                    except Exception:
+                        orig_lrs = None
+
+                try:
+                    raw_metrics = self.verifier_actor.update_policy(data=data)
+                finally:
+                    if orig_lrs is not None:
+                        try:
+                            for group, lr0 in zip(
+                                self.verifier_optimizer.param_groups, orig_lrs
+                            ):
+                                group["lr"] = lr0
+                        except Exception:
+                            pass
+                metrics = {}
+                if raw_metrics:
+                    for k, v in raw_metrics.items():
+                        if isinstance(k, str) and k.startswith("verifier/"):
+                            metrics[k] = v
+                        else:
+                            metrics[f"verifier/{k}"] = v
+                if lr_scale != 1.0:
+                    metrics["verifier/lr_scale"] = lr_scale
             _ = timer.last
 
             debug_asserts = (
@@ -1305,10 +1561,69 @@ class ActorRolloutRefWorker(Worker):
                         f"Examples: {nonzero[:8]}"
                     )
 
-            lr = self.verifier_lr_scheduler.get_last_lr()[0]
-            metrics["verifier/lr"] = lr
-            self.verifier_lr_scheduler.step()
+            # Verifier LR logging/scheduling:
+            # - LoRA mode: verifier_lr_scheduler exists and controls LoRA LR.
+            # - Shared-base mode (verifier.update_base=True): verifier_lr_scheduler is None because
+            #   the optimizer is shared with actor (avoid stepping actor scheduler twice here).
+            if getattr(self, "verifier_lr_scheduler", None) is not None:
+                lr = self.verifier_lr_scheduler.get_last_lr()[0]
+                metrics["verifier/lr"] = lr
+                self.verifier_lr_scheduler.step()
+            else:
+                try:
+                    lr = float(self.verifier_optimizer.param_groups[0].get("lr", 0.0))
+                    metrics["verifier/lr"] = lr
+                except Exception:  # noqa: BLE001
+                    pass
             metrics["verifier/enabled"] = 1.0
+            if _safe_bool(self.config.get("verifier", {}).get("update_base", False)):
+                metrics["verifier/update_base"] = 1.0
+            else:
+                metrics["verifier/update_base"] = 0.0
+
+            # Optional debug: quantify gradient/update conflict between actor PPO and verifier PPO
+            # when both update the same base weights (shared-base mode).
+            if getattr(self, "_conflict_probe_active", False):
+                try:
+                    theta_before = getattr(self, "_conflict_theta_before", None)
+                    theta_after_actor = getattr(self, "_conflict_theta_after_actor", None)
+                    theta_after_verifier = self._conflict_probe_snapshot()
+                    if (
+                        theta_before is not None
+                        and theta_after_actor is not None
+                        and theta_after_verifier is not None
+                    ):
+                        delta_actor = theta_after_actor - theta_before
+                        delta_verifier = theta_after_verifier - theta_after_actor
+
+                        dot = (delta_actor * delta_verifier).sum().to(torch.float64)
+                        norm_a = (delta_actor * delta_actor).sum().to(torch.float64)
+                        norm_v = (delta_verifier * delta_verifier).sum().to(torch.float64)
+                        reduce_device = (
+                            torch.device(f"{device_name}:{get_device_id()}")
+                            if device_name != "cpu"
+                            else torch.device("cpu")
+                        )
+                        agg = torch.stack([dot, norm_a, norm_v]).to(
+                            reduce_device, non_blocking=True
+                        )
+                        dist.all_reduce(agg)
+                        dot_sum, norm_a_sum, norm_v_sum = agg.detach().cpu().tolist()
+                        denom = (norm_a_sum * norm_v_sum) ** 0.5
+                        if denom > 0:
+                            cos = float(dot_sum / denom)
+                        else:
+                            cos = float("nan")
+                        ratio = float((norm_v_sum**0.5) / ((norm_a_sum**0.5) + 1e-12))
+                        metrics["conflict/cos_actor_verifier"] = cos
+                        metrics["conflict/norm_ratio_verifier_over_actor"] = ratio
+                        metrics["conflict/probe_dim_local"] = float(delta_actor.numel())
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    self._conflict_probe_active = False
+                    self._conflict_theta_before = None
+                    self._conflict_theta_after_actor = None
 
             # Clear grads again to ensure base grads from verifier backward do not leak.
             try:
@@ -1516,17 +1831,21 @@ class ActorRolloutRefWorker(Worker):
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
-        disable_for_policy = getattr(self, "verifier_optimizer", None) is not None
+        disable_for_policy = bool(getattr(self, "_verifier_lora_enabled", False))
         if is_lora or disable_for_policy:
             debug_asserts = (
                 os.getenv("VERL_DEBUG_ASSERTS", "0") == "1"
                 or os.getenv("VERL_LOGGING_LEVEL", "").upper() == "DEBUG"
             )
-            if debug_asserts and dist.get_rank() == 0:
-                assert hasattr(self.actor.actor_module, "disable_adapter"), (
-                    "Expected disable_adapter() when LoRA is enabled"
-                )
-            adapter_ctx = self.actor.actor_module.disable_adapter()
+            target = getattr(self.actor, "actor_module", None) or self.actor_module_fsdp
+            if hasattr(target, "disable_adapter"):
+                adapter_ctx = target.disable_adapter()
+            else:
+                if debug_asserts and dist.get_rank() == 0:
+                    logger.warning(
+                        "Requested disable_adapter() but model does not expose it; proceeding without adapter disable."
+                    )
+                adapter_ctx = nullcontext()
         else:
             adapter_ctx = nullcontext()
         data = data.to(get_device_id())
@@ -1625,6 +1944,53 @@ class ActorRolloutRefWorker(Worker):
             max_ckpt_to_keep=max_ckpt_to_keep,
         )
         dist.barrier()
+
+        # Save verifier LoRA optimizer/scheduler states for accurate resume.
+        # In LoRA mode, verifier optimizer is separate from actor optimizer, so we must
+        # checkpoint it explicitly (otherwise verifier Adam moments reset after resume).
+        try:
+            should_save_verifier_optim = (
+                bool(getattr(self, "_verifier_lora_enabled", False))
+                and getattr(self, "verifier_optimizer", None) is not None
+                and getattr(self, "verifier_optimizer", None)
+                is not getattr(self, "actor_optimizer", None)
+            )
+        except Exception:
+            should_save_verifier_optim = False
+
+        if should_save_verifier_optim:
+            try:
+                verifier_optim_path = os.path.join(
+                    local_path,
+                    f"verifier_optim_world_size_{self.world_size}_rank_{self.rank}.pt",
+                )
+                verifier_extra_path = os.path.join(
+                    local_path,
+                    f"verifier_extra_state_world_size_{self.world_size}_rank_{self.rank}.pt",
+                )
+                torch.save(self.verifier_optimizer.state_dict(), verifier_optim_path)
+                torch.save(
+                    {
+                        "verifier_lr_scheduler": self.verifier_lr_scheduler.state_dict()
+                        if getattr(self, "verifier_lr_scheduler", None) is not None
+                        else None,
+                    },
+                    verifier_extra_path,
+                )
+                log_with_rank(
+                    f"[rank-{self.rank}]: Saved verifier optimizer state to: {verifier_optim_path}",
+                    rank=dist.get_rank(),
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+            except Exception as e:
+                log_with_rank(
+                    f"Save verifier optimizer state error ({e})",
+                    rank=dist.get_rank(),
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+            dist.barrier()
 
         if self._is_lora and hasattr(
             getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"
@@ -1777,6 +2143,8 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        from verl.utils.logger import log_with_rank
+
         assert self._is_actor or (not self._is_actor and self._is_rollout), (
             f"Checkpoint loading is only supported for Actor or standalone Rollout Workers, but got {self._is_actor} and {self._is_rollout}"
         )
@@ -1790,12 +2158,79 @@ class ActorRolloutRefWorker(Worker):
             del_local_after_load=del_local_after_load,
         )
 
+        # Load verifier LoRA optimizer/scheduler states if present.
+        # (Only meaningful for verifier LoRA mode where verifier optimizer is separate.)
+        try:
+            should_load_verifier_optim = (
+                bool(getattr(self, "_verifier_lora_enabled", False))
+                and getattr(self, "verifier_optimizer", None) is not None
+                and getattr(self, "verifier_optimizer", None)
+                is not getattr(self, "actor_optimizer", None)
+            )
+        except Exception:
+            should_load_verifier_optim = False
+
+        if should_load_verifier_optim:
+            try:
+                verifier_optim_path = os.path.join(
+                    local_path,
+                    f"verifier_optim_world_size_{self.world_size}_rank_{self.rank}.pt",
+                )
+                verifier_extra_path = os.path.join(
+                    local_path,
+                    f"verifier_extra_state_world_size_{self.world_size}_rank_{self.rank}.pt",
+                )
+                if os.path.exists(verifier_optim_path):
+                    verifier_optim_path_local = copy_to_local(verifier_optim_path)
+                    optim_state = torch.load(verifier_optim_path_local, weights_only=False)
+                    self.verifier_optimizer.load_state_dict(optim_state)
+                    log_with_rank(
+                        f"Loaded verifier optimizer state from {verifier_optim_path}",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
+                else:
+                    log_with_rank(
+                        f"Verifier optimizer state not found at {verifier_optim_path}; "
+                        "resume will reset verifier Adam moments.",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
+
+                if (
+                    getattr(self, "verifier_lr_scheduler", None) is not None
+                    and os.path.exists(verifier_extra_path)
+                ):
+                    verifier_extra_path_local = copy_to_local(verifier_extra_path)
+                    extra_state = torch.load(verifier_extra_path_local, weights_only=False)
+                    sched_state = extra_state.get("verifier_lr_scheduler", None)
+                    if sched_state is not None:
+                        try:
+                            self.verifier_lr_scheduler.load_state_dict(sched_state)
+                        except Exception:
+                            pass
+            except Exception as e:  # noqa: BLE001
+                log_with_rank(
+                    f"Load verifier optimizer state error ({e})",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
         if self._is_offload_optimizer:
             if self.actor_optimizer is not None:
                 offload_fsdp_optimizer(self.actor_optimizer)
+            if (
+                getattr(self, "verifier_optimizer", None) is not None
+                and getattr(self, "verifier_optimizer", None)
+                is not getattr(self, "actor_optimizer", None)
+            ):
+                offload_fsdp_optimizer(self.verifier_optimizer)
 
 
 class CriticWorker(Worker):

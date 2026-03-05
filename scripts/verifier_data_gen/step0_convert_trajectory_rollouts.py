@@ -246,6 +246,11 @@ def main() -> int:
         action="store_true",
         help="Keep at most one correct and one incorrect sample per action_id (best by response_len/output_len)",
     )
+    ap.add_argument(
+        "--stream_output",
+        action="store_true",
+        help="Write output incrementally (low memory). Not compatible with --dedup_per_action.",
+    )
 
     ap.add_argument("--max_files", type=int, default=0, help="Only process first N files (0=all)")
     ap.add_argument("--max_objects_per_file", type=int, default=0, help="Only parse first N JSON objects per file (0=all)")
@@ -287,8 +292,18 @@ def main() -> int:
     total_objects = 0
     total_samples = 0
 
+    if args.stream_output and args.dedup_per_action:
+        print("[ERR] --stream_output is not compatible with --dedup_per_action", file=sys.stderr)
+        return 2
+
     candidates: Dict[Tuple[str, bool], Dict[str, Any]] = {}
     kept: List[Dict[str, Any]] = []
+    kept_count = 0
+    pos_count = 0
+    neg_count = 0
+    out_f = None
+    if args.stream_output:
+        out_f = out_path.open("w", encoding="utf-8")
 
     data_source_filter = (args.data_source or "").strip()
     require_stop = bool(args.require_finish_reason_stop)
@@ -385,30 +400,49 @@ def main() -> int:
                     candidates[key] = record
                 continue
 
-            kept.append(record)
+            if out_f is not None:
+                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                kept_count += 1
+                if bool(record.get("acc")):
+                    pos_count += 1
+                else:
+                    neg_count += 1
+            else:
+                kept.append(record)
+
+    if out_f is not None:
+        try:
+            out_f.close()
+        except Exception:
+            pass
 
     if args.dedup_per_action:
         kept = list(candidates.values())
 
-    kept.sort(key=lambda r: (r.get("action_id") or "", 0 if r.get("acc") else 1), reverse=False)
+    if out_f is None:
+        kept.sort(key=lambda r: (r.get("action_id") or "", 0 if r.get("acc") else 1), reverse=False)
+        kept_count = len(kept)
+        pos_count = sum(1 for r in kept if r.get("acc"))
+        neg_count = kept_count - pos_count
 
     print(f"[INFO] Parsed objects: {total_objects}")
     print(f"[INFO] Candidate samples (pre-dedup): {total_samples}")
-    print(f"[INFO] Kept samples: {len(kept)}")
-    if kept:
-        pos = sum(1 for r in kept if r.get("acc"))
-        neg = len(kept) - pos
-        print(f"[INFO] acc distribution: correct={pos} incorrect={neg} correct_ratio={pos/len(kept):.3f}")
+    print(f"[INFO] Kept samples: {kept_count}")
+    if kept_count:
+        print(
+            f"[INFO] acc distribution: correct={pos_count} incorrect={neg_count} correct_ratio={pos_count/kept_count:.3f}"
+        )
 
     if drop_reasons:
         print("[INFO] Drop reasons (top 12):")
         for k, v in drop_reasons.most_common(12):
             print(f"  - {k}: {v}")
 
-    # Write output jsonl
-    with out_path.open("w", encoding="utf-8") as f:
-        for rec in kept:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # Write output jsonl (non-streaming mode).
+    if out_f is None:
+        with out_path.open("w", encoding="utf-8") as f:
+            for rec in kept:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     stats_path = out_path.with_suffix(".stats.json")
     stats = {
@@ -416,7 +450,7 @@ def main() -> int:
         "num_files": len(files),
         "parsed_objects": total_objects,
         "candidate_samples": total_samples,
-        "kept_samples": len(kept),
+        "kept_samples": kept_count,
         "drop_reasons": dict(drop_reasons),
     }
     with stats_path.open("w", encoding="utf-8") as f:

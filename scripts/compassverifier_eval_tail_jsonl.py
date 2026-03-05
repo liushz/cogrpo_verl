@@ -42,6 +42,11 @@ def _question_id(rec: Dict[str, Any]) -> Optional[int]:
     origin = rec.get("origin_info") or {}
     if isinstance(origin, dict):
         qid = _maybe_int(origin.get("_orig_line_idx"))
+        if qid is None:
+            # Some runners wrap repeat metadata under origin_info["origin_info"].
+            nested = origin.get("origin_info")
+            if isinstance(nested, dict):
+                qid = _maybe_int(nested.get("_orig_line_idx"))
         if qid is not None:
             return qid
     return _maybe_int(rec.get("_orig_line_idx"))

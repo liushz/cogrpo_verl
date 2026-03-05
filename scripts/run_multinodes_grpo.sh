@@ -3,7 +3,8 @@ set -exo pipefail
 cd /mnt/shared-storage-user/liuhongwei/main_works/repos/repro
 
 source /mnt/shared-storage-user/liuhongwei/miniconda3/etc/profile.d/conda.sh
-conda activate /mnt/shared-storage-user/liuhongwei/miniconda3/envs/repro
+conda_env_path="${VERL_CONDA_ENV_PATH:-/mnt/shared-storage-user/liuhongwei/miniconda3/envs/repro}"
+conda activate "${conda_env_path}"
 
 
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"

@@ -18,6 +18,7 @@ import copy
 import logging
 import os
 import re
+import tempfile
 from collections import defaultdict
 from typing import List, Optional, Union
 
@@ -32,6 +33,38 @@ import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
+
+
+def _dir_is_writable(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        return False
+    return os.access(path, os.W_OK)
+
+
+def _ensure_writable_hf_datasets_cache() -> str:
+    """
+    Ensure HuggingFace `datasets` has a writable cache dir.
+
+    In some cluster environments, `HF_DATASETS_CACHE` (or datasets' default cache)
+    may point to a read-only shared mount, which makes `datasets.load_dataset`
+    fail when creating its lock file.
+    """
+
+    current = os.environ.get("HF_DATASETS_CACHE") or getattr(datasets.config, "HF_DATASETS_CACHE", "")
+    if current and _dir_is_writable(current):
+        return current
+
+    fallback = os.path.join(tempfile.gettempdir(), f"hf_datasets_cache_{os.getuid()}")
+    if not _dir_is_writable(fallback):
+        fallback = os.path.expanduser("~/.cache/huggingface/datasets")
+        os.makedirs(fallback, exist_ok=True)
+
+    os.environ["HF_DATASETS_CACHE"] = fallback
+    datasets.config.HF_DATASETS_CACHE = fallback
+    logger.warning("HF_DATASETS_CACHE is not writable (current=%s); override to %s", current, fallback)
+    return fallback
 
 
 def collate_fn(data_list: list[dict]) -> dict:
@@ -126,6 +159,7 @@ class RLHFDataset(Dataset):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
     def _read_files_and_tokenize(self):
+        _ensure_writable_hf_datasets_cache()
         dataframes = []
         for parquet_file in self.data_files:
             # read parquet files and cache

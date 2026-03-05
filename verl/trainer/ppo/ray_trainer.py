@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import sys
 import time
@@ -77,6 +78,8 @@ from verl.utils.torch_functional import masked_mean, pad_sequence_to_length
 from verl.utils.tracking import ValidationGenerationsLogger
 
 WorkerType = Type[Worker]
+
+log = logging.getLogger(__name__)
 
 
 class Role(Enum):
@@ -399,6 +402,14 @@ def compute_advantage(
         exp_response_mask = data.batch.get(
             "exp_response_mask", data.batch["response_mask"]
         )
+        # Prefer the trainer-provided `response_mask` for the EXP stream.
+        #
+        # In by_step Co-GRPO, the rollout worker emits `exp_loss_mask` (0=hint, 1=policy)
+        # and the trainer sets `response_mask = exp_loss_mask[:, -resp_len:]`. If we
+        # instead use `exp_response_mask` (EOS-based), injected hint tokens would be
+        # treated as on-policy actions and receive advantages, which is incorrect.
+        if "response_mask" in data.batch:
+            exp_response_mask = data.batch["response_mask"]
 
         # Get control and experimental rewards
         control_token_level_rewards = data.batch.get(
@@ -456,6 +467,57 @@ def compute_advantage(
 
         data.batch["advantages"] = policy_advantages
         data.batch["returns"] = policy_returns
+
+        # Optional: update actor on (control + exp) streams, i.e. treat rollout.n pairs
+        # as 2*rollout.n samples per prompt group. This matches "rollout=16" semantics
+        # when rollout.n=8 (8 control + 8 exp).
+        try:
+            if hasattr(config, "get"):
+                actor_update_streams = config.get("actor_update_streams", "exp") or "exp"
+            else:
+                actor_update_streams = getattr(config, "actor_update_streams", "exp") or "exp"
+        except Exception:
+            actor_update_streams = "exp"
+        actor_update_streams = str(actor_update_streams).lower()
+        if actor_update_streams in ("both", "control+exp", "control_exp", "dual"):
+            if control_token_level_rewards is not None and control_response_mask is not None:
+                try:
+                    index = data.non_tensor_batch["uid"]
+                    dual_index = np.concatenate([index, index], axis=0)
+
+                    target_len = int(exp_response_mask.size(1))
+
+                    def _pad_or_truncate_to(x: torch.Tensor, tgt: int) -> torch.Tensor:
+                        if x.size(1) == tgt:
+                            return x
+                        if x.size(1) > tgt:
+                            return x[:, :tgt]
+                        pad = torch.zeros((x.size(0), tgt - x.size(1)), device=x.device, dtype=x.dtype)
+                        return torch.cat([x, pad], dim=1)
+
+                    control_rewards = _pad_or_truncate_to(control_token_level_rewards, target_len)
+                    control_mask = _pad_or_truncate_to(control_response_mask, target_len)
+                    exp_rewards = _pad_or_truncate_to(exp_token_level_rewards, target_len)
+                    exp_mask = _pad_or_truncate_to(exp_response_mask, target_len)
+
+                    dual_rewards = torch.cat([control_rewards, exp_rewards], dim=0)
+                    dual_mask = torch.cat([control_mask, exp_mask], dim=0)
+
+                    dual_adv, dual_ret = core_algos.compute_grpo_outcome_advantage(
+                        token_level_rewards=dual_rewards,
+                        response_mask=dual_mask,
+                        index=dual_index,
+                        epsilon=1e-6,
+                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                    )
+                    bsz = int(exp_rewards.size(0))
+                    data.batch["control_advantages"] = dual_adv[:bsz]
+                    data.batch["exp_advantages"] = dual_adv[bsz:]
+                    data.batch["control_returns"] = dual_ret[:bsz]
+                    data.batch["exp_returns"] = dual_ret[bsz:]
+                except Exception:
+                    # Fall back to EXP-only actor update.
+                    pass
 
         # Store verifier advantages separately if available
         if verifier_advantages is not None:
@@ -1403,6 +1465,38 @@ class RayPPOTrainer:
                 f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch"
             )
 
+        # IMPORTANT (Co-GRPO verifier LoRA):
+        # Rollout/verifier inference runs inside vLLM and keeps its own LoRA adapter weights.
+        # After a resume, the training-side FSDP model has already loaded the checkpointed LoRA weights,
+        # but vLLM may still be using the initial `verifier.lora_path` adapter until the next periodic sync.
+        # This can cause a behavior-policy mismatch (old_log_probs from stale verifier vs new verifier weights),
+        # leading to large PPO KL / instability on the first resumed step.
+        #
+        # Fix: do a one-time "save + reload" so rollout uses the same LoRA as the resumed checkpoint.
+        try:
+            verifier_cfg = getattr(self.config, "verifier", {}) or {}
+            verifier_lora_rank = int(verifier_cfg.get("lora_rank", 0) or 0)
+        except Exception:
+            verifier_lora_rank = 0
+        if verifier_lora_rank > 0 and getattr(self, "actor_rollout_wg", None) is not None:
+            try:
+                verifier_lora_dir = os.path.join(
+                    self.config.trainer.default_local_dir,
+                    "verifier_lora_latest",
+                )
+                os.makedirs(verifier_lora_dir, exist_ok=True)
+                t0 = time.time()
+                self.actor_rollout_wg.save_verifier_lora(verifier_lora_dir)
+                t1 = time.time()
+                self.actor_rollout_wg.reload_verifier_lora(verifier_lora_dir)
+                t2 = time.time()
+                print(
+                    f"[resume] synced verifier LoRA to rollout: "
+                    f"dir={verifier_lora_dir} save_s={t1 - t0:.2f} reload_s={t2 - t1:.2f}"
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[resume] verifier LoRA sync skipped: {e}")
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         # For Co-GRPO, use exp_attention_mask; for regular, use attention_mask
@@ -1441,7 +1535,7 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
-        logger = Tracking(
+        tracker = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
@@ -1461,7 +1555,7 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            tracker.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1729,6 +1823,17 @@ class RayPPOTrainer:
                                     cf_branch_k = 1
                                 if cf_branch_k < 1:
                                     cf_branch_k = 1
+                                cf_branch_reward_tail_tokens = self.config.algorithm.get(
+                                    "cf_branch_reward_tail_tokens", 2048
+                                )
+                                try:
+                                    cf_branch_reward_tail_tokens = int(
+                                        cf_branch_reward_tail_tokens
+                                    )
+                                except Exception:
+                                    cf_branch_reward_tail_tokens = 2048
+                                if cf_branch_reward_tail_tokens < 0:
+                                    cf_branch_reward_tail_tokens = 0
                                 # In cf-branch mode, default to "all interventions" unless explicitly set.
                                 try:
                                     if use_cf_branch and int(cf_branch_max_events_per_sample) <= 0:
@@ -1743,26 +1848,39 @@ class RayPPOTrainer:
                                 cf_branch_state_hash_mod = self.config.algorithm.get(
                                     "cf_branch_state_hash_mod", 1024
                                 )
-                                gen_batch_output = (
-                                    self.actor_rollout_wg.dual_stream_rollout(
-                                        gen_batch_repeated,
-                                        intervention_mode=intervention_mode,
-                                        stream_mode="exp" if use_cf_branch else "both",
-                                        token_check_interval=token_check_interval,
-                                        min_step_tokens=min_step_tokens,
-                                        max_interventions=max_interventions,
-                                        confidence_threshold=confidence_threshold,
-                                        cf_branching=use_cf_branch,
-                                        cf_branch_prob=cf_branch_prob,
-                                        cf_branch_max_events_per_sample=cf_branch_max_events_per_sample,
-                                        cf_branch_state_hash_mod=cf_branch_state_hash_mod,
-                                        cf_branch_k=cf_branch_k,
-                                    )
+                                actor_update_streams = str(
+                                    self.config.algorithm.get("actor_update_streams", "exp")
+                                    or "exp"
+                                ).lower()
+                                want_control_stream = actor_update_streams in (
+                                    "both",
+                                    "control+exp",
+                                    "control_exp",
+                                    "dual",
+                                )
+                                stream_mode = "both"
+                                if use_cf_branch and (not want_control_stream):
+                                    stream_mode = "exp"
+
+                                gen_batch_output = self.actor_rollout_wg.dual_stream_rollout(
+                                    gen_batch_repeated,
+                                    intervention_mode=intervention_mode,
+                                    stream_mode=stream_mode,
+                                    token_check_interval=token_check_interval,
+                                    min_step_tokens=min_step_tokens,
+                                    max_interventions=max_interventions,
+                                    confidence_threshold=confidence_threshold,
+                                    cf_branching=use_cf_branch,
+                                    cf_branch_prob=cf_branch_prob,
+                                    cf_branch_max_events_per_sample=cf_branch_max_events_per_sample,
+                                    cf_branch_state_hash_mod=cf_branch_state_hash_mod,
+                                    cf_branch_k=cf_branch_k,
+                                    cf_branch_reward_tail_tokens=cf_branch_reward_tail_tokens,
                                 )
                             else:
                                 # For async mode, we need to handle differently
                                 # For now, fall back to regular generation
-                                logger.warning(
+                                log.warning(
                                     "Co-GRPO dual-stream rollout not yet supported in async mode, using regular generation"
                                 )
                                 self.async_rollout_manager.wake_up()
@@ -1959,8 +2077,93 @@ class RayPPOTrainer:
                                     (exp_resp_lens - exp_policy_lens).mean().item()
                                 )
                         except Exception as e:
-                            logger.warning(
+                            log.warning(
                                 f"Failed to log Co-GRPO response length metrics: {e}"
+                            )
+                        # Extra rollout diagnostics (from rollout non_tensor_batch) for SwanLab.
+                        # These help explain GPU utilization swings (e.g., long decode vs early-EOS)
+                        # and track cold-start truncation (gen_budget_exhausted).
+                        try:
+                            finish = batch.non_tensor_batch.get(
+                                "last_finish_reason", None
+                            )
+                            if finish is not None:
+                                finish_arr = np.array(finish, dtype=object).reshape(-1)
+                                n_finish = int(finish_arr.shape[0])
+                                if n_finish > 0:
+                                    eos_rate = float(
+                                        np.mean(finish_arr == "eos")
+                                    )
+                                    gen_budget_rate = float(
+                                        np.mean(
+                                            finish_arr == "gen_budget_exhausted"
+                                        )
+                                    )
+                                    context_rate = float(
+                                        np.mean(
+                                            (finish_arr == "context_exhausted")
+                                            | (
+                                                finish_arr
+                                                == "context_budget_exhausted"
+                                            )
+                                        )
+                                    )
+                                    max_steps_rate = float(
+                                        np.mean(
+                                            finish_arr == "max_steps_exhausted"
+                                        )
+                                    )
+                                    other_rate = float(
+                                        max(
+                                            0.0,
+                                            1.0
+                                            - (
+                                                eos_rate
+                                                + gen_budget_rate
+                                                + context_rate
+                                                + max_steps_rate
+                                            ),
+                                        )
+                                    )
+
+                                    metrics[
+                                        "co_grpo/exp_finish_eos_rate"
+                                    ] = eos_rate
+                                    metrics[
+                                        "co_grpo/exp_finish_gen_budget_exhausted_rate"
+                                    ] = gen_budget_rate
+                                    metrics[
+                                        "co_grpo/exp_finish_context_exhausted_rate"
+                                    ] = context_rate
+                                    metrics[
+                                        "co_grpo/exp_finish_max_steps_exhausted_rate"
+                                    ] = max_steps_rate
+                                    metrics[
+                                        "co_grpo/exp_finish_other_rate"
+                                    ] = other_rate
+
+                            first_step = batch.non_tensor_batch.get(
+                                "first_step_tokens_len", None
+                            )
+                            if first_step is not None:
+                                first_step_arr = np.array(
+                                    first_step, dtype=object
+                                ).reshape(-1)
+                                vals = []
+                                for x in first_step_arr:
+                                    if x is None:
+                                        continue
+                                    try:
+                                        vals.append(float(x))
+                                    except Exception:
+                                        continue
+                                if vals:
+                                    metrics[
+                                        "co_grpo/exp_first_step_tokens_len_mean"
+                                    ] = float(np.mean(vals))
+                        except Exception as e:
+                            log.warning(
+                                f"Failed to log Co-GRPO rollout finish diagnostics: {e}"
                             )
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -1997,9 +2200,32 @@ class RayPPOTrainer:
                             and verifier_credit_assignment.lower() in ("cf_branch", "cf")
                         )
 
+                        if use_co_grpo:
+                            # Rollout workers may omit *_position_ids to reduce Ray object size.
+                            # Reconstruct them here from attention masks when needed.
+                            if (
+                                "exp_position_ids" not in batch.batch
+                                and "exp_attention_mask" in batch.batch
+                            ):
+                                exp_att = batch.batch["exp_attention_mask"].to(torch.long)
+                                batch.batch["exp_position_ids"] = (
+                                    exp_att.cumsum(dim=1) - 1
+                                ) * exp_att
+                            if (
+                                "control_attention_mask" in batch.batch
+                                and "control_position_ids" not in batch.batch
+                            ):
+                                control_att = batch.batch["control_attention_mask"].to(torch.long)
+                                batch.batch["control_position_ids"] = (
+                                    control_att.cumsum(dim=1) - 1
+                                ) * control_att
+
                         if use_cf_branch:
-                            # CF-Branch mode: no global control stream.
+                            # CF-Branch credit assignment.
                             # - Policy uses EXP rewards.
+                            # - If the rollout also included a global control stream (stream_mode="both"),
+                            #   compute its rewards too so the actor can update on 8(control)+8(exp)
+                            #   (i.e. rollout_n=8 ≈ repeat_k=16 semantics).
                             # - Verifier step credit uses per-event counterfactual baseline:
                             #     Δ_j = R_main(sample) - R0(event_uid) - cost_j
                             exp_batch = batch.select(
@@ -2037,40 +2263,141 @@ class RayPPOTrainer:
                                 (len(exp_batch),), self.global_steps, dtype=np.int64
                             )
 
+                            control_batch = None
+                            has_control_stream = (
+                                "control_input_ids" in batch.batch
+                                and "control_attention_mask" in batch.batch
+                                and "control_position_ids" in batch.batch
+                                and "control_responses" in batch.batch
+                            )
+                            if has_control_stream:
+                                # Exclude exp-only metadata to keep control reward dumps clean.
+                                exp_specific_fields = {
+                                    "num_interventions",
+                                    "hint_token_counts",
+                                    "hints",
+                                    "critiques",
+                                    "prompt_len",
+                                    "response_len",
+                                    "gen_len",
+                                    "hint_len",
+                                    "last_finish_reason",
+                                    "context_exhausted",
+                                    "first_step_tokens_len",
+                                }
+                                control_non_tensor_keys = [
+                                    k
+                                    for k in batch.non_tensor_batch.keys()
+                                    if k not in exp_specific_fields
+                                ]
+                                control_batch = batch.select(
+                                    batch_keys=[
+                                        "control_input_ids",
+                                        "control_attention_mask",
+                                        "control_position_ids",
+                                    ],
+                                    non_tensor_batch_keys=control_non_tensor_keys,
+                                )
+                                control_batch.batch["input_ids"] = control_batch.batch.pop(
+                                    "control_input_ids"
+                                )
+                                control_batch.batch["attention_mask"] = control_batch.batch.pop(
+                                    "control_attention_mask"
+                                )
+                                control_batch.batch["position_ids"] = control_batch.batch.pop(
+                                    "control_position_ids"
+                                )
+                                control_batch.batch["responses"] = batch.batch[
+                                    "control_responses"
+                                ]
+                                prompt_len = control_batch.batch["input_ids"].size(1) - batch.batch[
+                                    "control_responses"
+                                ].size(1)
+                                control_batch.batch["prompts"] = control_batch.batch[
+                                    "input_ids"
+                                ][..., :prompt_len]
+                                control_batch.non_tensor_batch["stream_type"] = [
+                                    "control"
+                                ] * int(control_batch.batch.size(0))
+                                control_batch.non_tensor_batch["global_step"] = np.full(
+                                    (len(control_batch),),
+                                    self.global_steps,
+                                    dtype=np.int64,
+                                )
+                                # Map control-side rollout diagnostics to generic keys so
+                                # dual_rollout_data/control can be compared against exp.
+                                control_diag_map = {
+                                    "control_prompt_len": "prompt_len",
+                                    "control_response_len": "response_len",
+                                    "control_gen_len": "gen_len",
+                                    "control_hint_len": "hint_len",
+                                    "control_last_finish_reason": "last_finish_reason",
+                                    "control_context_exhausted": "context_exhausted",
+                                    "control_first_step_tokens_len": "first_step_tokens_len",
+                                }
+                                for src_key, dst_key in control_diag_map.items():
+                                    if (
+                                        src_key in control_batch.non_tensor_batch
+                                        and dst_key not in control_batch.non_tensor_batch
+                                    ):
+                                        control_batch.non_tensor_batch[dst_key] = (
+                                            control_batch.non_tensor_batch[src_key]
+                                        )
+
                             cf_control_batch = batch.meta_info.get("cf_control_batch", None)
                             cf_eval_batch = None
                             if cf_control_batch is not None and len(cf_control_batch) > 0:
-                                cf_eval_batch = cf_control_batch.select(
-                                    batch_keys=[
-                                        "exp_input_ids",
-                                        "exp_attention_mask",
-                                        "exp_position_ids",
-                                        "exp_loss_mask",
-                                    ],
-                                    non_tensor_batch_keys=list(
-                                        cf_control_batch.non_tensor_batch.keys()
-                                    ),
-                                )
-                                cf_eval_batch.batch["input_ids"] = cf_eval_batch.batch.pop(
-                                    "exp_input_ids"
-                                )
-                                cf_eval_batch.batch["attention_mask"] = cf_eval_batch.batch.pop(
-                                    "exp_attention_mask"
-                                )
-                                cf_eval_batch.batch["position_ids"] = cf_eval_batch.batch.pop(
-                                    "exp_position_ids"
-                                )
-                                cf_eval_batch.batch["responses"] = cf_control_batch.batch[
-                                    "exp_responses"
-                                ]
-                                exp_prompt_len = cf_eval_batch.batch["input_ids"].size(
-                                    1
-                                ) - cf_control_batch.batch["exp_responses"].size(1)
-                                cf_eval_batch.batch["prompts"] = cf_eval_batch.batch[
-                                    "input_ids"
-                                ][..., :exp_prompt_len]
+                                # New (optimized) rollout returns a compact CF batch that is already
+                                # reward-ready: {prompts, responses, attention_mask}. Older versions
+                                # return exp_* tensors which we adapt here for backward compatibility.
+                                cf_batch_keys = set()
+                                try:
+                                    if cf_control_batch.batch is not None:
+                                        cf_batch_keys = set(cf_control_batch.batch.keys())
+                                except Exception:
+                                    cf_batch_keys = set()
+
+                                if (
+                                    cf_control_batch.batch is not None
+                                    and "responses" in cf_batch_keys
+                                    and "attention_mask" in cf_batch_keys
+                                ):
+                                    cf_eval_batch = cf_control_batch
+                                else:
+                                    cf_eval_batch = cf_control_batch.select(
+                                        batch_keys=[
+                                            "exp_input_ids",
+                                            "exp_attention_mask",
+                                            "exp_position_ids",
+                                            "exp_loss_mask",
+                                        ],
+                                        non_tensor_batch_keys=list(
+                                            cf_control_batch.non_tensor_batch.keys()
+                                        ),
+                                    )
+                                    cf_eval_batch.batch["input_ids"] = cf_eval_batch.batch.pop(
+                                        "exp_input_ids"
+                                    )
+                                    cf_eval_batch.batch["attention_mask"] = cf_eval_batch.batch.pop(
+                                        "exp_attention_mask"
+                                    )
+                                    cf_eval_batch.batch["position_ids"] = cf_eval_batch.batch.pop(
+                                        "exp_position_ids"
+                                    )
+                                    cf_eval_batch.batch["responses"] = cf_control_batch.batch[
+                                        "exp_responses"
+                                    ]
+                                    exp_prompt_len = cf_eval_batch.batch["input_ids"].size(
+                                        1
+                                    ) - cf_control_batch.batch["exp_responses"].size(1)
+                                    cf_eval_batch.batch["prompts"] = cf_eval_batch.batch[
+                                        "input_ids"
+                                    ][..., :exp_prompt_len]
+
+                                # Counterfactual control rewards should not overwrite the main
+                                # dual-stream control dump (dual_rollout_data/control).
                                 cf_eval_batch.non_tensor_batch["stream_type"] = [
-                                    "control"
+                                    "cf_control"
                                 ] * int(cf_eval_batch.batch.size(0))
                                 cf_eval_batch.non_tensor_batch["global_step"] = np.full(
                                     (len(cf_eval_batch),),
@@ -2078,12 +2405,13 @@ class RayPPOTrainer:
                                     dtype=np.int64,
                                 )
 
-                                # NOTE: The rollout worker only receives a generation-only DataProto
-                                # (input_ids/attention_mask/position_ids + a few debug keys). Reward metadata
-                                # like `data_source` / `reward_model` / `extra_info` lives in the training batch
-                                # (kept on driver) and is NOT present in cf_control_batch. Re-attach it here.
-                                # Prefer joining by (sample_uid -> current batch index).
-                                # This is robust to `batch.reorder(...)` from `trainer.balance_batch=True`.
+                                # NOTE: The rollout worker only receives a generation-only DataProto.
+                                # Reward metadata like `data_source` / `reward_model` / `extra_info`
+                                # lives in the training batch (kept on driver) and is NOT present
+                                # in cf_control_batch. Re-attach it here.
+                                #
+                                # Prefer joining by (sample_uid -> current batch index). This is
+                                # robust to `batch.reorder(...)` from `trainer.balance_batch=True`.
                                 cf_parent_idx = None
                                 cf_parent_sample_uid = cf_eval_batch.non_tensor_batch.get(
                                     "cf_parent_sample_uid", None
@@ -2123,7 +2451,11 @@ class RayPPOTrainer:
                                         cf_parent_idx = None
 
                                 if cf_parent_idx is not None:
-                                    for meta_key in ("data_source", "reward_model", "extra_info"):
+                                    for meta_key in (
+                                        "data_source",
+                                        "reward_model",
+                                        "extra_info",
+                                    ):
                                         if (
                                             meta_key not in cf_eval_batch.non_tensor_batch
                                             and meta_key in batch.non_tensor_batch
@@ -2135,28 +2467,42 @@ class RayPPOTrainer:
                                                     ]
                                                 )
                                             except Exception as e:
-                                                logger.warning(
+                                                log.warning(
                                                     f"[CF_BRANCH] Failed to attach {meta_key} to cf_eval_batch: {e}"
                                                 )
 
+                            control_reward_tensor = None
                             cf_reward_tensor = None
                             if self.config.reward_model.launch_reward_fn_async:
                                 tokenizer_name_or_path = self.tokenizer.name_or_path
                                 future_exp_reward = compute_reward_async.remote(
                                     exp_batch, self.config, tokenizer_name_or_path
                                 )
+                                future_control_reward = None
+                                if control_batch is not None and len(control_batch) > 0:
+                                    future_control_reward = compute_reward_async.remote(
+                                        control_batch, self.config, tokenizer_name_or_path
+                                    )
+                                future_cf_reward = None
                                 if cf_eval_batch is not None:
                                     future_cf_reward = compute_reward_async.remote(
                                         cf_eval_batch, self.config, tokenizer_name_or_path
                                     )
-                                    exp_reward_tensor, _ = ray.get(future_exp_reward)
+                                exp_reward_tensor, _ = ray.get(future_exp_reward)
+                                if future_control_reward is not None:
+                                    control_reward_tensor, _ = ray.get(
+                                        future_control_reward
+                                    )
+                                if future_cf_reward is not None:
                                     cf_reward_tensor, _ = ray.get(future_cf_reward)
-                                else:
-                                    exp_reward_tensor, _ = ray.get(future_exp_reward)
                             else:
                                 exp_reward_tensor, _ = compute_reward(
                                     exp_batch, self.reward_fn
                                 )
+                                if control_batch is not None and len(control_batch) > 0:
+                                    control_reward_tensor, _ = compute_reward(
+                                        control_batch, self.reward_fn
+                                    )
                                 if cf_eval_batch is not None:
                                     cf_reward_tensor, _ = compute_reward(
                                         cf_eval_batch, self.reward_fn
@@ -2164,17 +2510,222 @@ class RayPPOTrainer:
 
                             # Ensure rewards are token-level (expand to match response length).
                             exp_resp_len = batch.batch["exp_responses"].size(1)
-                            if exp_reward_tensor.dim() == 1:
-                                exp_token_rewards = exp_reward_tensor.unsqueeze(-1).expand(
-                                    -1, exp_resp_len
+                            def _outcome_to_token_level_reward(
+                                outcome_reward: torch.Tensor,
+                                response_mask: torch.Tensor,
+                            ) -> torch.Tensor:
+                                # Convert outcome reward (bs,) to token-level rewards (bs, resp_len)
+                                # with reward placed at the last valid response token.
+                                if outcome_reward.dim() == 2 and outcome_reward.size(1) == 1:
+                                    outcome_reward = outcome_reward.squeeze(1)
+                                if outcome_reward.dim() != 1:
+                                    raise ValueError(
+                                        f"Expected outcome_reward to be 1D, got shape={tuple(outcome_reward.shape)}"
+                                    )
+                                bs = int(outcome_reward.size(0))
+                                resp_len = int(response_mask.size(1))
+                                token_rewards = torch.zeros(
+                                    (bs, resp_len),
+                                    device=outcome_reward.device,
+                                    dtype=outcome_reward.dtype,
+                                )
+                                last_pos = (
+                                    response_mask.to(torch.long).sum(dim=1) - 1
+                                ).clamp(min=0)
+                                token_rewards[
+                                    torch.arange(bs, device=outcome_reward.device),
+                                    last_pos,
+                                ] = outcome_reward
+                                return token_rewards
+
+                            def _pad_or_truncate_to_len(
+                                t: torch.Tensor, target_len: int
+                            ) -> torch.Tensor:
+                                if t.size(1) == target_len:
+                                    return t
+                                if t.size(1) > target_len:
+                                    return t[:, :target_len]
+                                pad = torch.zeros(
+                                    (t.size(0), target_len - t.size(1)),
+                                    device=t.device,
+                                    dtype=t.dtype,
+                                )
+                                return torch.cat([t, pad], dim=1)
+
+                            if exp_reward_tensor.dim() == 1 or (
+                                exp_reward_tensor.dim() == 2 and exp_reward_tensor.size(1) == 1
+                            ):
+                                exp_token_rewards = _outcome_to_token_level_reward(
+                                    exp_reward_tensor,
+                                    batch.batch["exp_response_mask"]
+                                    .to(exp_reward_tensor.device)
+                                    .to(torch.long),
                                 )
                             else:
                                 exp_token_rewards = exp_reward_tensor
+                            if exp_token_rewards.dim() == 2 and (
+                                int(exp_token_rewards.size(1)) != int(exp_resp_len)
+                            ):
+                                log.warning(
+                                    f"[CF_BRANCH] exp_reward_tensor shape mismatch: "
+                                    f"got={tuple(exp_token_rewards.shape)}, expected_len={int(exp_resp_len)}; "
+                                    f"pad/truncate to match."
+                                )
+                                exp_token_rewards = _pad_or_truncate_to_len(
+                                    exp_token_rewards, int(exp_resp_len)
+                                )
 
                             batch.batch["exp_token_level_rewards"] = exp_token_rewards
                             batch.batch["token_level_rewards"] = exp_token_rewards
                             reward_tensor = exp_token_rewards
                             reward_extra_infos_dict = {}
+                            if control_reward_tensor is not None:
+                                control_resp_len = batch.batch["control_responses"].size(
+                                    1
+                                )
+                                if control_reward_tensor.dim() == 1 or (
+                                    control_reward_tensor.dim() == 2
+                                    and control_reward_tensor.size(1) == 1
+                                ):
+                                    control_token_rewards = _outcome_to_token_level_reward(
+                                        control_reward_tensor,
+                                        batch.batch["control_response_mask"]
+                                        .to(control_reward_tensor.device)
+                                        .to(torch.long),
+                                    )
+                                else:
+                                    control_token_rewards = control_reward_tensor
+                                if control_token_rewards.dim() == 2 and (
+                                    int(control_token_rewards.size(1))
+                                    != int(control_resp_len)
+                                ):
+                                    log.warning(
+                                        f"[CF_BRANCH] control_reward_tensor shape mismatch: "
+                                        f"got={tuple(control_token_rewards.shape)}, expected_len={int(control_resp_len)}; "
+                                        f"pad/truncate to match."
+                                    )
+                                    control_token_rewards = _pad_or_truncate_to_len(
+                                        control_token_rewards, int(control_resp_len)
+                                    )
+                                batch.batch["control_token_level_rewards"] = (
+                                    control_token_rewards
+                                )
+
+                            # Build a per-sample "control" baseline reward for policy curriculum mixing:
+                            # - Use the counterfactual baseline of the FIRST intervention event (`event_uid = sample_uid:0`)
+                            #   if available (averaged over cf_branch_k).
+                            # - Otherwise fall back to the experimental outcome reward for that sample.
+                            #
+                            # This lets `compute_co_grpo_advantage()` incorporate control/exp mixing even in
+                            # cf-branch mode (which otherwise runs EXP-only for policy actions).
+                            reward_by_sample_uid = None
+                            reward_by_event_uid = None
+                            if (
+                                cf_control_batch is not None
+                                and len(cf_control_batch) > 0
+                                and cf_reward_tensor is not None
+                            ):
+                                try:
+                                    batch_sample_uids = batch.non_tensor_batch.get(
+                                        "sample_uid", None
+                                    )
+                                    cf_event_uids = cf_control_batch.non_tensor_batch.get(
+                                        "cf_event_uid", None
+                                    )
+                                    if batch_sample_uids is not None and cf_event_uids is not None:
+                                        def _to_outcome_reward(reward_tensor):
+                                            if reward_tensor.dim() == 1:
+                                                return reward_tensor
+                                            if reward_tensor.size(-1) == 1:
+                                                return reward_tensor.squeeze(-1)
+                                            return reward_tensor.sum(dim=-1)
+
+                                        exp_outcome = (
+                                            _to_outcome_reward(exp_reward_tensor)
+                                            .detach()
+                                            .to("cpu")
+                                        )
+                                        reward_by_sample_uid = {
+                                            str(batch_sample_uids[i]): float(
+                                                exp_outcome[i].item()
+                                            )
+                                            for i in range(len(batch_sample_uids))
+                                        }
+
+                                        cf_outcome = (
+                                            _to_outcome_reward(cf_reward_tensor)
+                                            .detach()
+                                            .to("cpu")
+                                        )
+                                        reward_sum = {}
+                                        reward_count = {}
+                                        for i in range(len(cf_event_uids)):
+                                            ev = str(cf_event_uids[i])
+                                            reward_sum[ev] = float(
+                                                reward_sum.get(ev, 0.0)
+                                            ) + float(cf_outcome[i].item())
+                                            reward_count[ev] = int(
+                                                reward_count.get(ev, 0)
+                                            ) + 1
+                                        reward_by_event_uid = {
+                                            ev: float(reward_sum[ev])
+                                            / float(max(1, reward_count[ev]))
+                                            for ev in reward_sum.keys()
+                                        }
+
+                                        if not has_control_stream:
+                                            # Per-sample baseline: first event only (sample_uid:0).
+                                            # Used only when we did NOT generate a global control stream.
+                                            control_outcome = []
+                                            missing_cf = 0
+                                            for i in range(len(batch_sample_uids)):
+                                                sample_uid = str(batch_sample_uids[i])
+                                                r0 = reward_by_event_uid.get(
+                                                    f"{sample_uid}:0", None
+                                                )
+                                                if r0 is None:
+                                                    missing_cf += 1
+                                                    r0 = float(exp_outcome[i].item())
+                                                control_outcome.append(float(r0))
+
+                                            device = exp_token_rewards.device
+                                            dtype = exp_token_rewards.dtype
+                                            control_outcome_t = torch.tensor(
+                                                control_outcome,
+                                                dtype=dtype,
+                                                device=device,
+                                            )
+                                            control_token_rewards = torch.zeros(
+                                                (len(control_outcome), exp_resp_len),
+                                                dtype=dtype,
+                                                device=device,
+                                            )
+                                            # Put outcome reward on the last token so sum() == outcome reward.
+                                            control_token_rewards[:, -1] = (
+                                                control_outcome_t
+                                            )
+                                            batch.batch[
+                                                "control_token_level_rewards"
+                                            ] = control_token_rewards
+                                            batch.batch[
+                                                "control_response_mask"
+                                            ] = batch.batch["response_mask"]
+
+                                            metrics[
+                                                "co_grpo/control_cf_first_reward_mean"
+                                            ] = float(
+                                                control_outcome_t.mean().item()
+                                            )
+                                            metrics[
+                                                "co_grpo/control_cf_first_missing_ratio"
+                                            ] = float(
+                                                missing_cf
+                                                / max(1, len(batch_sample_uids))
+                                            )
+                                except Exception as e:
+                                    log.warning(
+                                        f"[CF_BRANCH] Failed to build control baselines for policy: {e}"
+                                    )
 
                             # Prepare verifier training batch (by_step intervention trajectories).
                             verifier_batch = batch.meta_info.get("verifier_batch", None)
@@ -2238,48 +2789,14 @@ class RayPPOTrainer:
                                         raise ValueError(
                                             "batch missing non_tensor_batch['sample_uid']"
                                         )
-
-                                    def _to_outcome_reward(reward_tensor):
-                                        if reward_tensor.dim() == 1:
-                                            return reward_tensor
-                                        if reward_tensor.size(-1) == 1:
-                                            return reward_tensor.squeeze(-1)
-                                        return reward_tensor.sum(dim=-1)
-
-                                    exp_outcome = _to_outcome_reward(exp_reward_tensor).detach().to(
-                                        "cpu"
-                                    )
-                                    reward_by_sample_uid = {
-                                        str(batch_sample_uids[i]): float(
-                                            exp_outcome[i].item()
-                                        )
-                                        for i in range(len(batch_sample_uids))
-                                    }
-
-                                    cf_event_uids = cf_control_batch.non_tensor_batch.get(
-                                        "cf_event_uid", None
-                                    )
-                                    if cf_event_uids is None:
+                                    if reward_by_sample_uid is None:
                                         raise ValueError(
-                                            "cf_control_batch missing non_tensor_batch['cf_event_uid']"
+                                            "reward_by_sample_uid is None (cf-branch): cannot build verifier rewards."
                                         )
-                                    cf_outcome = _to_outcome_reward(cf_reward_tensor).detach().to(
-                                        "cpu"
-                                    )
-                                    # When cf_branch_k>1, the same event_uid appears multiple times.
-                                    # Aggregate by mean to reduce reward variance.
-                                    reward_sum = {}
-                                    reward_count = {}
-                                    for i in range(len(cf_event_uids)):
-                                        ev = str(cf_event_uids[i])
-                                        reward_sum[ev] = float(reward_sum.get(ev, 0.0)) + float(
-                                            cf_outcome[i].item()
+                                    if reward_by_event_uid is None:
+                                        raise ValueError(
+                                            "reward_by_event_uid is None (cf-branch): cannot build verifier rewards."
                                         )
-                                        reward_count[ev] = int(reward_count.get(ev, 0)) + 1
-                                    reward_by_event_uid = {
-                                        ev: float(reward_sum[ev]) / float(max(1, reward_count[ev]))
-                                        for ev in reward_sum.keys()
-                                    }
 
                                     lambda_freq = 0.0
                                     lambda_len = 0.0
@@ -2294,11 +2811,75 @@ class RayPPOTrainer:
                                             penalty_config.get("len_coef", 0.0)
                                         )
 
+                                    # Mixed/long-output cold-start models can hit generation limits after hint
+                                    # insertion. That can suppress the true benefit of the hint (the response is
+                                    # truncated). Optionally skip those truncated samples for verifier updates
+                                    # (actor still updates on the full batch).
+                                    try:
+                                        verifier_cfg = self.config.get("verifier", {}) or {}
+                                    except Exception:
+                                        verifier_cfg = getattr(self.config, "verifier", {}) or {}
+                                    skip_truncated_verifier = bool(
+                                        verifier_cfg.get("skip_truncated_samples", False)
+                                        or verifier_cfg.get("skip_truncated_for_verifier", False)
+                                        or os.environ.get("VERL_VERIFIER_SKIP_TRUNCATED", "0")
+                                        == "1"
+                                    )
+                                    trunc_finish_reasons = {
+                                        "gen_budget_exhausted",
+                                        "context_exhausted",
+                                        "max_steps_exhausted",
+                                    }
+
+                                    # Map parent sample_uid -> finish_reason/context_exhausted for filtering/stats.
+                                    finish_reason_by_sample_uid = {}
+                                    context_exhausted_by_sample_uid = {}
+                                    batch_finish_reason = batch.non_tensor_batch.get(
+                                        "last_finish_reason", None
+                                    )
+                                    batch_context_exhausted = batch.non_tensor_batch.get(
+                                        "context_exhausted", None
+                                    )
+                                    try:
+                                        for i in range(len(batch_sample_uids)):
+                                            su = str(batch_sample_uids[i])
+                                            fr = ""
+                                            if (
+                                                batch_finish_reason is not None
+                                                and i < len(batch_finish_reason)
+                                            ):
+                                                fr_val = batch_finish_reason[i]
+                                                fr = str(fr_val) if fr_val is not None else ""
+                                            finish_reason_by_sample_uid[su] = fr
+                                            ce = False
+                                            if (
+                                                batch_context_exhausted is not None
+                                                and i < len(batch_context_exhausted)
+                                            ):
+                                                try:
+                                                    ce = bool(batch_context_exhausted[i])
+                                                except Exception:
+                                                    ce = False
+                                            context_exhausted_by_sample_uid[su] = ce
+                                    except Exception:
+                                        finish_reason_by_sample_uid = {}
+                                        context_exhausted_by_sample_uid = {}
+
                                     keep_idxs = []
                                     step_rewards = []
                                     costs = []
+                                    diffs = []
+                                    r_main_values = []
+                                    r0_values = []
+                                    diffs_untrunc = []
+                                    deltas_untrunc = []
+                                    diffs_trunc = []
+                                    deltas_trunc = []
+                                    trunc_event_count = 0
+                                    trunc_skip_count = 0
                                     group_index = []
                                     missing_cf = 0
+                                    missing_main = 0
                                     for j in range(len(verifier_batch)):
                                         ev = str(event_uids[j])
                                         r0 = reward_by_event_uid.get(ev, None)
@@ -2309,7 +2890,11 @@ class RayPPOTrainer:
                                         su = str(parent_sample_uids[j])
                                         gu = str(parent_group_uids[j])
                                         step_idx = int(step_indices[j])
-                                        r_main = float(reward_by_sample_uid.get(su, 0.0))
+                                        r_main = reward_by_sample_uid.get(su, None)
+                                        if r_main is None:
+                                            missing_main += 1
+                                            r_main = 0.0
+                                        r_main = float(r_main)
 
                                         hint_len = 0
                                         if hint_token_counts is not None:
@@ -2318,11 +2903,35 @@ class RayPPOTrainer:
                                             except Exception:
                                                 hint_len = 0
                                         cost = lambda_freq + (lambda_len * hint_len / 100.0)
-                                        delta = (r_main - float(r0)) - float(cost)
+                                        diff = r_main - float(r0)
+                                        delta = float(diff) - float(cost)
+
+                                        finish_reason = finish_reason_by_sample_uid.get(
+                                            su, ""
+                                        )
+                                        ctx_exhausted = bool(
+                                            context_exhausted_by_sample_uid.get(su, False)
+                                        )
+                                        is_trunc = ctx_exhausted or (
+                                            finish_reason in trunc_finish_reasons
+                                        )
+                                        if is_trunc:
+                                            trunc_event_count += 1
+                                            diffs_trunc.append(float(diff))
+                                            deltas_trunc.append(float(delta))
+                                            if skip_truncated_verifier:
+                                                trunc_skip_count += 1
+                                                continue
+                                        else:
+                                            diffs_untrunc.append(float(diff))
+                                            deltas_untrunc.append(float(delta))
 
                                         keep_idxs.append(j)
                                         step_rewards.append(float(delta))
                                         costs.append(float(cost))
+                                        diffs.append(float(diff))
+                                        r_main_values.append(float(r_main))
+                                        r0_values.append(float(r0))
 
                                         prefix_bucket = -1
                                         conf_bucket = -1
@@ -2349,79 +2958,181 @@ class RayPPOTrainer:
                                             f"{gu}:{step_idx}:{prefix_bucket}:{conf_bucket}:{hash_bucket}"
                                         )
 
+                                    total_cf_events = int(
+                                        len(diffs_untrunc) + len(diffs_trunc)
+                                    )
+                                    if total_cf_events > 0:
+                                        metrics["co_grpo/cf_trunc_event_ratio"] = float(
+                                            trunc_event_count / total_cf_events
+                                        )
+                                        metrics["co_grpo/cf_trunc_event_count"] = float(
+                                            trunc_event_count
+                                        )
+                                        if skip_truncated_verifier:
+                                            metrics[
+                                                "co_grpo/cf_trunc_event_skip_ratio"
+                                            ] = float(trunc_skip_count / total_cf_events)
+                                            metrics[
+                                                "co_grpo/cf_trunc_event_skip_count"
+                                            ] = float(trunc_skip_count)
+
+                                    # "插入后未被截断" 的相对增益统计：只看 untruncated subset。
+                                    if deltas_untrunc:
+                                        deltas_u = np.asarray(
+                                            deltas_untrunc, dtype=np.float32
+                                        )
+                                        metrics["co_grpo/cf_delta_mean_untrunc"] = float(
+                                            deltas_u.mean()
+                                        )
+                                        metrics[
+                                            "co_grpo/cf_delta_pos_ratio_untrunc"
+                                        ] = float((deltas_u > 0).mean())
+                                        metrics[
+                                            "co_grpo/cf_delta_zero_ratio_untrunc"
+                                        ] = float((np.abs(deltas_u) < 1e-6).mean())
+                                        metrics[
+                                            "co_grpo/cf_delta_neg_ratio_untrunc"
+                                        ] = float((deltas_u < -1e-6).mean())
+                                    if diffs_untrunc:
+                                        diffs_u = np.asarray(
+                                            diffs_untrunc, dtype=np.float32
+                                        )
+                                        metrics["co_grpo/cf_diff_mean_untrunc"] = float(
+                                            diffs_u.mean()
+                                        )
+                                        metrics[
+                                            "co_grpo/cf_diff_pos_ratio_untrunc"
+                                        ] = float((diffs_u > 0).mean())
+                                        metrics[
+                                            "co_grpo/cf_diff_zero_ratio_untrunc"
+                                        ] = float((np.abs(diffs_u) < 1e-6).mean())
+                                        metrics[
+                                            "co_grpo/cf_diff_neg_ratio_untrunc"
+                                        ] = float((diffs_u < -1e-6).mean())
+
                                     if not keep_idxs:
-                                        raise ValueError(
-                                            "No verifier interventions have counterfactual baselines."
+                                        # All events were filtered out (e.g., truncated) or missing baselines.
+                                        # Skip verifier update for this step.
+                                        metrics["co_grpo/cf_verifier_train_events"] = 0.0
+                                        metrics["co_grpo/cf_missing_ratio"] = float(
+                                            missing_cf / max(1, len(event_uids))
+                                        )
+                                        metrics["co_grpo/cf_missing_main_ratio"] = float(
+                                            missing_main / max(1, len(event_uids))
+                                        )
+                                    else:
+                                        metrics["co_grpo/cf_verifier_train_events"] = float(
+                                            len(keep_idxs)
+                                        )
+                                        verifier_batch = verifier_batch.select_idxs(keep_idxs)
+                                        step_rewards_t = torch.tensor(
+                                            step_rewards, dtype=torch.float32
+                                        )
+                                        response_len = int(
+                                            verifier_batch.batch["responses"].size(1)
+                                        )
+                                        verifier_response_mask = verifier_batch.batch[
+                                            "attention_mask"
+                                        ][:, -response_len:].to(torch.float32)
+                                        token_counts = verifier_response_mask.sum(
+                                            dim=-1, keepdim=True
+                                        ).clamp_min(1.0)
+                                        token_level_rewards = (
+                                            step_rewards_t.unsqueeze(-1) / token_counts
+                                        ) * verifier_response_mask
+
+                                        advantages, _ = compute_grpo_outcome_advantage(
+                                            token_level_rewards=token_level_rewards,
+                                            response_mask=verifier_response_mask,
+                                            index=np.array(group_index, dtype=object),
+                                            norm_adv_by_std_in_grpo=True,
                                         )
 
-                                    verifier_batch = verifier_batch.select_idxs(keep_idxs)
-                                    step_rewards_t = torch.tensor(
-                                        step_rewards, dtype=torch.float32
-                                    )
-                                    response_len = int(
-                                        verifier_batch.batch["responses"].size(1)
-                                    )
-                                    verifier_response_mask = verifier_batch.batch[
-                                        "attention_mask"
-                                    ][:, -response_len:].to(torch.float32)
-                                    token_counts = verifier_response_mask.sum(
-                                        dim=-1, keepdim=True
-                                    ).clamp_min(1.0)
-                                    token_level_rewards = (
-                                        step_rewards_t.unsqueeze(-1) / token_counts
-                                    ) * verifier_response_mask
-
-                                    advantages, _ = compute_grpo_outcome_advantage(
-                                        token_level_rewards=token_level_rewards,
-                                        response_mask=verifier_response_mask,
-                                        index=np.array(group_index, dtype=object),
-                                        norm_adv_by_std_in_grpo=True,
-                                    )
-
-                                    verifier_loss_weight = float(
-                                        getattr(self.config, "verifier", {}).get(
-                                            "loss_weight", 1.0
+                                        verifier_loss_weight = float(
+                                            getattr(self.config, "verifier", {}).get(
+                                                "loss_weight", 1.0
+                                            )
                                         )
-                                    )
-                                    verifier_batch.batch["advantages"] = (
-                                        advantages * verifier_loss_weight
-                                    )
-                                    verifier_batch.non_tensor_batch["step_reward"] = np.array(
-                                        step_rewards, dtype=np.float32
-                                    )
-                                    verifier_batch.non_tensor_batch["step_cost"] = np.array(
-                                        costs, dtype=np.float32
-                                    )
-                                    verifier_batch.non_tensor_batch["group_index"] = np.array(
-                                        group_index, dtype=object
-                                    )
-                                    batch.meta_info["verifier_train_batch"] = verifier_batch
-
-                                    step_rewards_t_cpu = step_rewards_t.detach()
-                                    metrics["co_grpo/cf_delta_mean"] = float(
-                                        step_rewards_t_cpu.mean().item()
-                                    )
-                                    metrics["co_grpo/cf_delta_std"] = float(
-                                        step_rewards_t_cpu.std(unbiased=False).item()
-                                    )
-                                    metrics["co_grpo/cf_delta_pos_ratio"] = float(
-                                        (step_rewards_t_cpu > 0).float().mean().item()
-                                    )
-                                    metrics["co_grpo/cf_missing_ratio"] = float(
-                                        missing_cf / max(1, len(event_uids))
-                                    )
-                                    if costs:
-                                        metrics["co_grpo/cf_cost_mean"] = float(
-                                            np.mean(costs)
+                                        verifier_batch.batch["advantages"] = (
+                                            advantages * verifier_loss_weight
                                         )
+                                        verifier_batch.non_tensor_batch["step_reward"] = np.array(
+                                            step_rewards, dtype=np.float32
+                                        )
+                                        verifier_batch.non_tensor_batch["step_cost"] = np.array(
+                                            costs, dtype=np.float32
+                                        )
+                                        verifier_batch.non_tensor_batch["group_index"] = np.array(
+                                            group_index, dtype=object
+                                        )
+                                        batch.meta_info["verifier_train_batch"] = verifier_batch
+
+                                        step_rewards_t_cpu = step_rewards_t.detach()
+                                        metrics["co_grpo/cf_delta_mean"] = float(
+                                            step_rewards_t_cpu.mean().item()
+                                        )
+                                        metrics["co_grpo/cf_delta_std"] = float(
+                                            step_rewards_t_cpu.std(unbiased=False).item()
+                                        )
+                                        metrics["co_grpo/cf_delta_pos_ratio"] = float(
+                                            (step_rewards_t_cpu > 0).float().mean().item()
+                                        )
+                                        metrics["co_grpo/cf_delta_zero_ratio"] = float(
+                                            (step_rewards_t_cpu.abs() < 1e-6)
+                                            .float()
+                                            .mean()
+                                            .item()
+                                        )
+                                        metrics["co_grpo/cf_delta_neg_ratio"] = float(
+                                            (step_rewards_t_cpu < -1e-6)
+                                            .float()
+                                            .mean()
+                                            .item()
+                                        )
+                                        if diffs:
+                                            diffs_np = np.asarray(diffs, dtype=np.float32)
+                                            metrics["co_grpo/cf_diff_mean"] = float(
+                                                diffs_np.mean()
+                                            )
+                                            metrics["co_grpo/cf_diff_std"] = float(
+                                                diffs_np.std()
+                                            )
+                                            metrics["co_grpo/cf_diff_pos_ratio"] = float(
+                                                (diffs_np > 0).mean()
+                                            )
+                                            metrics["co_grpo/cf_diff_zero_ratio"] = float(
+                                                (np.abs(diffs_np) < 1e-6).mean()
+                                            )
+                                            metrics["co_grpo/cf_diff_neg_ratio"] = float(
+                                                (diffs_np < -1e-6).mean()
+                                            )
+                                            metrics["co_grpo/cf_r_main_mean"] = float(
+                                                np.mean(r_main_values)
+                                            )
+                                            metrics["co_grpo/cf_r0_mean"] = float(
+                                                np.mean(r0_values)
+                                            )
+                                        metrics["co_grpo/cf_missing_ratio"] = float(
+                                            missing_cf / max(1, len(event_uids))
+                                        )
+                                        metrics["co_grpo/cf_missing_main_ratio"] = float(
+                                            missing_main / max(1, len(event_uids))
+                                        )
+                                        if costs:
+                                            metrics["co_grpo/cf_cost_mean"] = float(
+                                                np.mean(costs)
+                                            )
                                 except Exception as e:
-                                    logger.warning(
+                                    log.warning(
                                         f"Failed to build verifier_train_batch (cf-branch): {e}"
                                     )
 
                             # Drop large cf-control rollouts after reward mapping to
                             # avoid bloating the training batch/meta_info.
                             batch.meta_info.pop("cf_control_batch", None)
+                            # `verifier_batch` is only used to build `verifier_train_batch`.
+                            # Drop it to avoid accidentally shipping large objects through Ray.
+                            batch.meta_info.pop("verifier_batch", None)
 
                         elif use_co_grpo:
                             # Compute rewards for control stream
@@ -2470,25 +3181,12 @@ class RayPPOTrainer:
                             if "prompts" in batch.batch.keys():
                                 control_batch.batch["prompts"] = batch.batch["prompts"]
                             else:
-                                # [CORRECT FIX] Calculate prompt length using masks to handle padding correctly
-                                # input_valid_len = prompt + response
-                                input_valid_len = control_batch.batch[
-                                    "attention_mask"
-                                ].sum(dim=1)
-                                # control_response_mask is already computed above
-                                resp_valid_len = batch.batch[
-                                    "control_response_mask"
-                                ].sum(dim=1)
-
-                                # Derive prompt lengths
-                                prompt_lens = input_valid_len - resp_valid_len
-
-                                # Safe truncation: use the minimum valid prompt length in the batch
-                                # (Assuming left-padded or consistent prompt lengths in batch)
-                                min_prompt_len = int(prompt_lens.min().item())
+                                prompt_len = control_batch.batch["input_ids"].size(
+                                    1
+                                ) - batch.batch["control_responses"].size(1)
                                 control_batch.batch["prompts"] = control_batch.batch[
                                     "input_ids"
-                                ][:, :min_prompt_len]
+                                ][..., :prompt_len]
                             # Mark stream type for reward manager dump
                             # CRITICAL FIX: Must be a list, not a scalar, to avoid IndexError in protocol.py:275
                             control_batch.non_tensor_batch["stream_type"] = [
@@ -2562,56 +3260,9 @@ class RayPPOTrainer:
                                     exp_batch, self.reward_fn
                                 )
 
-                            # ========== Co-GRPO Diagnostic: Batch Comparison ==========
-                            print(f"\n{'=' * 80}", file=sys.stderr)
-                            print(
-                                f"[Co-GRPO Batch Statistics] After Reward Computation",
-                                file=sys.stderr,
-                            )
-                            print(f"{'=' * 80}", file=sys.stderr)
-
-                            # Print sample comparison
-                            sample_idx = 0
-                            control_resp = self.tokenizer.decode(
-                                batch.batch["control_responses"][sample_idx][
-                                    : batch.batch["control_attention_mask"][
-                                        sample_idx
-                                    ].sum()
-                                ],
-                                skip_special_tokens=True,
-                            )
-                            exp_resp = self.tokenizer.decode(
-                                batch.batch["exp_responses"][sample_idx][
-                                    : batch.batch["exp_attention_mask"][
-                                        sample_idx
-                                    ].sum()
-                                ],
-                                skip_special_tokens=True,
-                            )
-
-                            # print(f"\n[Control Sample {sample_idx}] (first 500 chars):\n{control_resp[:500]}...\n", file=sys.stderr)
-                            # print(f"[Exp Sample {sample_idx}] (first 500 chars):\n{exp_resp[:500]}...\n", file=sys.stderr)
-
-                            # Intervention stats
-                            if "num_interventions" in batch.non_tensor_batch:
-                                interventions = batch.non_tensor_batch[
-                                    "num_interventions"
-                                ]
-                                print(f"[Intervention Stats]:", file=sys.stderr)
-                                print(
-                                    f"  Mean: {float(np.mean(interventions)):.2f}",
-                                    file=sys.stderr,
-                                )
-                                print(
-                                    f"  Max: {int(np.max(interventions))}",
-                                    file=sys.stderr,
-                                )
-                                print(
-                                    f"  Min: {int(np.min(interventions))}",
-                                    file=sys.stderr,
-                                )
-
-                            # Reward comparison (outcome-level)
+                            # Reward comparison/utilities (outcome-level)
+                            # NOTE: Keep this helper outside debug-only blocks since it is
+                            # used in the main verifier-reward path too.
                             def _to_outcome_reward(reward_tensor):
                                 if reward_tensor.dim() == 1:
                                     return reward_tensor
@@ -2619,49 +3270,174 @@ class RayPPOTrainer:
                                     return reward_tensor.squeeze(-1)
                                 return reward_tensor.sum(dim=-1)
 
-                            control_outcome_early = _to_outcome_reward(
-                                control_reward_tensor
-                            )
-                            exp_outcome_early = _to_outcome_reward(exp_reward_tensor)
+                            # Co-GRPO reward diagnostics can be extremely verbose/slow for 32k.
+                            # Enable explicitly only when debugging.
+                            if os.getenv("VERL_COGRPO_DEBUG_REWARD", "0") == "1":
+                                print(f"\n{'=' * 80}", file=sys.stderr)
+                                print(
+                                    f"[Co-GRPO Batch Statistics] After Reward Computation",
+                                    file=sys.stderr,
+                                )
+                                print(f"{'=' * 80}", file=sys.stderr)
 
-                            print(f"[Reward Comparison]:", file=sys.stderr)
-                            print(
-                                f"  Control reward: {float(control_outcome_early.mean()):.4f} ± {float(control_outcome_early.std()):.4f}",
-                                file=sys.stderr,
-                            )
-                            print(
-                                f"  Exp reward: {float(exp_outcome_early.mean()):.4f} ± {float(exp_outcome_early.std()):.4f}",
-                                file=sys.stderr,
-                            )
-                            print(
-                                f"  Gap (exp - control): {float(exp_outcome_early.mean() - control_outcome_early.mean()):.4f}",
-                                file=sys.stderr,
-                            )
-                            print(f"{'=' * 80}\n", file=sys.stderr)
-                            # ========== End Co-GRPO Diagnostic ==========
+                                # Print sample comparison
+                                sample_idx = 0
+                                control_resp = self.tokenizer.decode(
+                                    batch.batch["control_responses"][sample_idx][
+                                        : batch.batch["control_attention_mask"][
+                                            sample_idx
+                                        ].sum()
+                                    ],
+                                    skip_special_tokens=True,
+                                )
+                                exp_resp = self.tokenizer.decode(
+                                    batch.batch["exp_responses"][sample_idx][
+                                        : batch.batch["exp_attention_mask"][
+                                            sample_idx
+                                        ].sum()
+                                    ],
+                                    skip_special_tokens=True,
+                                )
+
+                                # print(f\"\\n[Control Sample {sample_idx}] (first 500 chars):\\n{control_resp[:500]}...\\n\", file=sys.stderr)
+                                # print(f\"[Exp Sample {sample_idx}] (first 500 chars):\\n{exp_resp[:500]}...\\n\", file=sys.stderr)
+
+                                # Intervention stats
+                                if "num_interventions" in batch.non_tensor_batch:
+                                    interventions = batch.non_tensor_batch[
+                                        "num_interventions"
+                                    ]
+                                    print(f"[Intervention Stats]:", file=sys.stderr)
+                                    print(
+                                        f"  Mean: {float(np.mean(interventions)):.2f}",
+                                        file=sys.stderr,
+                                    )
+                                    print(
+                                        f"  Max: {int(np.max(interventions))}",
+                                        file=sys.stderr,
+                                    )
+                                    print(
+                                        f"  Min: {int(np.min(interventions))}",
+                                        file=sys.stderr,
+                                    )
+
+                                # Reward comparison (outcome-level)
+                                control_outcome_early = _to_outcome_reward(
+                                    control_reward_tensor
+                                )
+                                exp_outcome_early = _to_outcome_reward(exp_reward_tensor)
+
+                                print(f"[Reward Comparison]:", file=sys.stderr)
+                                print(
+                                    f"  Control reward: {float(control_outcome_early.mean()):.4f} ± {float(control_outcome_early.std()):.4f}",
+                                    file=sys.stderr,
+                                )
+                                print(
+                                    f"  Exp reward: {float(exp_outcome_early.mean()):.4f} ± {float(exp_outcome_early.std()):.4f}",
+                                    file=sys.stderr,
+                                )
+                                print(
+                                    f"  Gap (exp - control): {float(exp_outcome_early.mean() - control_outcome_early.mean()):.4f}",
+                                    file=sys.stderr,
+                                )
+                                print(f"{'=' * 80}\n", file=sys.stderr)
 
                             # Ensure rewards are token-level (expand to match response length)
                             control_resp_len = batch.batch["control_responses"].size(1)
                             exp_resp_len = batch.batch["exp_responses"].size(1)
 
-                            # Handle different reward tensor shapes
-                            if control_reward_tensor.dim() == 1:
-                                # Outcome rewards: expand to token level
-                                control_token_rewards = control_reward_tensor.unsqueeze(
-                                    -1
-                                ).expand(-1, control_resp_len)
-                            else:
-                                # Already token-level
-                                control_token_rewards = control_reward_tensor
+                            def _outcome_to_token_level_reward(
+                                outcome_reward: torch.Tensor,
+                                response_mask: torch.Tensor,
+                            ) -> torch.Tensor:
+                                # Convert outcome reward (bs,) to token-level rewards (bs, resp_len)
+                                # with reward placed at the last valid response token.
+                                if outcome_reward.dim() == 2 and outcome_reward.size(1) == 1:
+                                    outcome_reward = outcome_reward.squeeze(1)
+                                if outcome_reward.dim() != 1:
+                                    raise ValueError(
+                                        f"Expected outcome_reward to be 1D, got shape={tuple(outcome_reward.shape)}"
+                                    )
+                                bs = int(outcome_reward.size(0))
+                                resp_len = int(response_mask.size(1))
+                                token_rewards = torch.zeros(
+                                    (bs, resp_len),
+                                    device=outcome_reward.device,
+                                    dtype=outcome_reward.dtype,
+                                )
+                                last_pos = (
+                                    response_mask.to(torch.long).sum(dim=1) - 1
+                                ).clamp(min=0)
+                                token_rewards[
+                                    torch.arange(bs, device=outcome_reward.device),
+                                    last_pos,
+                                ] = outcome_reward
+                                return token_rewards
 
-                            if exp_reward_tensor.dim() == 1:
-                                # Outcome rewards: expand to token level
-                                exp_token_rewards = exp_reward_tensor.unsqueeze(
-                                    -1
-                                ).expand(-1, exp_resp_len)
+                            def _pad_or_truncate_to_len(
+                                t: torch.Tensor, target_len: int
+                            ) -> torch.Tensor:
+                                if t.size(1) == target_len:
+                                    return t
+                                if t.size(1) > target_len:
+                                    return t[:, :target_len]
+                                pad = torch.zeros(
+                                    (t.size(0), target_len - t.size(1)),
+                                    device=t.device,
+                                    dtype=t.dtype,
+                                )
+                                return torch.cat([t, pad], dim=1)
+
+                            # Handle different reward tensor shapes.
+                            # IMPORTANT: Do NOT broadcast outcome rewards across all tokens.
+                            # GRPO/Co-GRPO uses sum(token_rewards) as the outcome reward.
+                            if control_reward_tensor.dim() == 1 or (
+                                control_reward_tensor.dim() == 2
+                                and control_reward_tensor.size(1) == 1
+                            ):
+                                control_token_rewards = _outcome_to_token_level_reward(
+                                    control_reward_tensor,
+                                    batch.batch["control_response_mask"]
+                                    .to(control_reward_tensor.device)
+                                    .to(torch.long),
+                                )
                             else:
-                                # Already token-level
+                                control_token_rewards = control_reward_tensor
+                            if control_token_rewards.dim() == 2 and (
+                                int(control_token_rewards.size(1)) != int(control_resp_len)
+                            ):
+                                log.warning(
+                                    f"[Co-GRPO] control_reward_tensor shape mismatch: "
+                                    f"got={tuple(control_token_rewards.shape)}, expected_len={int(control_resp_len)}; "
+                                    f"pad/truncate to match."
+                                )
+                                control_token_rewards = _pad_or_truncate_to_len(
+                                    control_token_rewards, int(control_resp_len)
+                                )
+
+                            if exp_reward_tensor.dim() == 1 or (
+                                exp_reward_tensor.dim() == 2
+                                and exp_reward_tensor.size(1) == 1
+                            ):
+                                exp_token_rewards = _outcome_to_token_level_reward(
+                                    exp_reward_tensor,
+                                    batch.batch["exp_response_mask"]
+                                    .to(exp_reward_tensor.device)
+                                    .to(torch.long),
+                                )
+                            else:
                                 exp_token_rewards = exp_reward_tensor
+                            if exp_token_rewards.dim() == 2 and (
+                                int(exp_token_rewards.size(1)) != int(exp_resp_len)
+                            ):
+                                log.warning(
+                                    f"[Co-GRPO] exp_reward_tensor shape mismatch: "
+                                    f"got={tuple(exp_token_rewards.shape)}, expected_len={int(exp_resp_len)}; "
+                                    f"pad/truncate to match."
+                                )
+                                exp_token_rewards = _pad_or_truncate_to_len(
+                                    exp_token_rewards, int(exp_resp_len)
+                                )
 
                             # Store rewards in batch
                             batch.batch["control_token_level_rewards"] = (
@@ -2704,7 +3480,7 @@ class RayPPOTrainer:
                                             dtype=np.int32,
                                         )
                                     except Exception as e:
-                                        logger.warning(
+                                        log.warning(
                                             f"Failed to cast {name} to int array: {e}"
                                         )
                                         return None
@@ -2750,7 +3526,7 @@ class RayPPOTrainer:
                                 )
                             else:
                                 if reward_mode != "gap":
-                                    logger.warning(
+                                    log.warning(
                                         f"Unknown verifier_reward_mode={reward_mode}, fallback to 'gap'"
                                     )
                                 clamped_gap = torch.clamp(
@@ -3052,9 +3828,12 @@ class RayPPOTrainer:
                                         verifier_batch
                                     )
                                 except Exception as e:
-                                    logger.warning(
+                                    log.warning(
                                         f"Failed to build verifier_train_batch: {e}"
                                     )
+                            # `verifier_batch` is only used to build `verifier_train_batch`.
+                            # Drop it to avoid accidentally shipping large objects through Ray.
+                            batch.meta_info.pop("verifier_batch", None)
 
                             # Use experimental rewards as main rewards for policy training
                             batch.batch["token_level_rewards"] = exp_token_rewards
@@ -3363,7 +4142,27 @@ class RayPPOTrainer:
                             ).sum(1) / (repro_value_mask_sum + 1e-6)
                             repro_value = repro_value.detach()
 
-                    if self.use_reference_policy:
+                    # Compute reference log_prob only when KL is actually used.
+                    # - `algorithm.use_kl_in_reward`: needs ref_log_prob to shape rewards
+                    # - `actor.use_kl_loss`: needs ref_log_prob for auxiliary KL loss
+                    need_ref_log_prob = False
+                    try:
+                        need_ref_log_prob = bool(config.algorithm.use_kl_in_reward)
+                    except Exception:
+                        pass
+                    try:
+                        need_ref_log_prob = need_ref_log_prob or bool(
+                            config.actor_rollout_ref.actor.get("use_kl_loss", False)
+                        )
+                    except Exception:
+                        try:
+                            need_ref_log_prob = need_ref_log_prob or bool(
+                                getattr(config.actor_rollout_ref.actor, "use_kl_loss", False)
+                            )
+                        except Exception:
+                            pass
+
+                    if self.use_reference_policy and need_ref_log_prob:
                         # compute reference log_prob
                         with _timer("ref", timing_raw):
                             if use_co_grpo:
@@ -3642,88 +4441,225 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # Update Verifier (LoRA) BEFORE Actor (Base) to reduce base drift breaking PPO stability.
+                        verifier_train_batch = None
                         if use_co_grpo and "verifier_train_batch" in batch.meta_info:
                             verifier_train_batch = batch.meta_info.pop(
                                 "verifier_train_batch", None
                             )
-                            if (
-                                verifier_train_batch is not None
-                                and len(verifier_train_batch) > 0
-                            ):
-                                metrics["verifier/train_batch_size"] = float(
-                                    len(verifier_train_batch)
-                                )
-                                with _timer("update_verifier", timing_raw):
-                                    verifier_output = (
-                                        self.actor_rollout_wg.update_verifier(
-                                            verifier_train_batch
-                                        )
-                                    )
-                                verifier_output_metrics = reduce_metrics(
-                                    verifier_output.meta_info["metrics"]
-                                )
-                                metrics.update(verifier_output_metrics)
 
-                                # Periodically sync verifier LoRA weights to rollout (vLLM) workers.
+                        # Shared-base verifier update (no LoRA) changes actor weights too.
+                        # To preserve PPO behavior-policy alignment for actor updates, update actor first.
+                        verifier_cfg = self.config.get("verifier", {}) or {}
+                        try:
+                            verifier_lora_rank = int(verifier_cfg.get("lora_rank", 0) or 0)
+                        except Exception:
+                            verifier_lora_rank = 0
+                        update_base = bool(verifier_cfg.get("update_base", False)) and (
+                            verifier_lora_rank <= 0
+                        )
+
+                        def _maybe_update_verifier(train_batch):
+                            if train_batch is None or len(train_batch) <= 0:
+                                return
+                            metrics["verifier/train_batch_size"] = float(len(train_batch))
+                            with _timer("update_verifier", timing_raw):
+                                verifier_output = self.actor_rollout_wg.update_verifier(
+                                    train_batch
+                                )
+                            verifier_output_metrics = reduce_metrics(
+                                verifier_output.meta_info["metrics"]
+                            )
+                            metrics.update(verifier_output_metrics)
+
+                            # Periodically sync verifier LoRA weights to rollout (vLLM) workers.
+                            # (Not needed for shared-base mode.)
+                            if not update_base:
                                 sync_freq = int(
-                                    self.config.trainer.get(
-                                        "verifier_lora_sync_freq", 10
-                                    )
+                                    self.config.trainer.get("verifier_lora_sync_freq", 10)
                                 )
                                 if sync_freq > 0 and (
-                                    is_last_step or self.global_steps % sync_freq == 0
+                                    is_last_step
+                                    or self.global_steps % sync_freq == 0
                                 ):
                                     verifier_lora_dir = os.path.join(
                                         self.config.trainer.default_local_dir,
                                         "verifier_lora_latest",
                                     )
                                     t0 = time.time()
-                                    self.actor_rollout_wg.save_verifier_lora(
-                                        verifier_lora_dir
-                                    )
+                                    self.actor_rollout_wg.save_verifier_lora(verifier_lora_dir)
                                     t1 = time.time()
-                                    self.actor_rollout_wg.reload_verifier_lora(
-                                        verifier_lora_dir
-                                    )
+                                    self.actor_rollout_wg.reload_verifier_lora(verifier_lora_dir)
                                     t2 = time.time()
-                                    metrics["verifier/lora_sync_freq"] = float(
-                                        sync_freq
-                                    )
+                                    metrics["verifier/lora_sync_freq"] = float(sync_freq)
                                     metrics["verifier/lora_save_s"] = float(t1 - t0)
                                     metrics["verifier/lora_reload_s"] = float(t2 - t1)
                                     metrics["verifier/lora_sync_s"] = float(t2 - t0)
 
+                        # LoRA verifier can be updated before actor safely (base params unchanged).
+                        if not update_base:
+                            _maybe_update_verifier(verifier_train_batch)
+
                         # update actor
                         with _timer("update_actor", timing_raw):
+                            actor_update_batch = batch
                             if use_co_grpo:
-                                # Map experimental stream to standard keys for actor update
-                                batch.batch["responses"] = batch.batch["exp_responses"]
-                                batch.batch["attention_mask"] = batch.batch[
-                                    "exp_attention_mask"
-                                ]
-                                batch.batch["input_ids"] = batch.batch["exp_input_ids"]
-                                batch.batch["position_ids"] = batch.batch[
-                                    "exp_position_ids"
-                                ]
-                                # Ensure prompts exist for logging / decoding
-                                if "exp_prompts" in batch.batch:
-                                    batch.batch["prompts"] = batch.batch["exp_prompts"]
+                                actor_update_streams = str(
+                                    self.config.algorithm.get(
+                                        "actor_update_streams", "exp"
+                                    )
+                                    or "exp"
+                                ).lower()
+
+                                can_update_both = (
+                                    actor_update_streams
+                                    in (
+                                        "both",
+                                        "control+exp",
+                                        "control_exp",
+                                        "dual",
+                                    )
+                                    and "control_input_ids" in batch.batch
+                                    and "control_responses" in batch.batch
+                                    and "control_attention_mask" in batch.batch
+                                    and "control_position_ids" in batch.batch
+                                    and "control_response_mask" in batch.batch
+                                    and "control_rollout_log_probs" in batch.batch
+                                    and "control_advantages" in batch.batch
+                                    and "exp_advantages" in batch.batch
+                                )
+                                # If KL loss is enabled, we need ref_log_prob for BOTH streams.
+                                # Current pipeline only computes ref_log_prob for EXP.
+                                if can_update_both and "ref_log_prob" in batch.batch:
+                                    can_update_both = False
+
+                                if can_update_both:
+                                    from tensordict import TensorDict
+
+                                    control_resp = batch.batch["control_responses"]
+                                    control_input = batch.batch["control_input_ids"]
+                                    control_att = batch.batch["control_attention_mask"]
+                                    control_pos = batch.batch["control_position_ids"]
+                                    control_old_lp = batch.batch[
+                                        "control_rollout_log_probs"
+                                    ]
+                                    control_adv = batch.batch["control_advantages"]
+                                    control_resp_mask = batch.batch[
+                                        "control_response_mask"
+                                    ]
+
+                                    exp_resp = batch.batch["exp_responses"]
+                                    exp_input = batch.batch["exp_input_ids"]
+                                    exp_att = batch.batch["exp_attention_mask"]
+                                    exp_pos = batch.batch["exp_position_ids"]
+                                    exp_old_lp = batch.batch["old_log_probs"]
+                                    exp_adv = batch.batch["exp_advantages"]
+                                    exp_resp_mask = batch.batch["response_mask"]
+
+                                    combined = {
+                                        "responses": torch.cat(
+                                            [control_resp, exp_resp], dim=0
+                                        ),
+                                        "input_ids": torch.cat(
+                                            [control_input, exp_input], dim=0
+                                        ),
+                                        "attention_mask": torch.cat(
+                                            [control_att, exp_att], dim=0
+                                        ),
+                                        "position_ids": torch.cat(
+                                            [control_pos, exp_pos], dim=0
+                                        ),
+                                        "old_log_probs": torch.cat(
+                                            [control_old_lp, exp_old_lp], dim=0
+                                        ),
+                                        "advantages": torch.cat(
+                                            [control_adv, exp_adv], dim=0
+                                        ),
+                                        "response_mask": torch.cat(
+                                            [control_resp_mask, exp_resp_mask], dim=0
+                                        ),
+                                    }
+                                    combined_batch = TensorDict(
+                                        combined, batch_size=combined["responses"].size(0)
+                                    )
+
+                                    # Update token counts to match the expanded batch.
+                                    control_tok = (
+                                        control_att.to(torch.long).sum(dim=1).to(torch.long)
+                                    )
+                                    exp_tok = exp_att.to(torch.long).sum(dim=1).to(torch.long)
+                                    global_token_num = (
+                                        torch.cat([control_tok, exp_tok], dim=0)
+                                        .cpu()
+                                        .tolist()
+                                    )
+
+                                    actor_update_batch = DataProto(
+                                        batch=combined_batch,
+                                        non_tensor_batch={},
+                                        meta_info={
+                                            "temperature": batch.meta_info.get(
+                                                "temperature", 1.0
+                                            ),
+                                            "global_token_num": global_token_num,
+                                            "multi_turn": batch.meta_info.get(
+                                                "multi_turn", False
+                                            ),
+                                        },
+                                    )
                                 else:
-                                    exp_prompt_len = batch.batch["exp_input_ids"].size(
-                                        1
-                                    ) - batch.batch["exp_responses"].size(1)
-                                    batch.batch["prompts"] = batch.batch[
+                                    # Default: EXP-only actor update (historical behavior).
+                                    batch.batch["responses"] = batch.batch["exp_responses"]
+                                    batch.batch["attention_mask"] = batch.batch[
+                                        "exp_attention_mask"
+                                    ]
+                                    batch.batch["input_ids"] = batch.batch[
                                         "exp_input_ids"
-                                    ][..., :exp_prompt_len]
+                                    ]
+                                    batch.batch["position_ids"] = batch.batch[
+                                        "exp_position_ids"
+                                    ]
+                                    # Send only the tensors needed for actor update through Ray to
+                                    # reduce Ray object store pressure (avoid spilling).
+                                    actor_batch_keys = [
+                                        "responses",
+                                        "input_ids",
+                                        "attention_mask",
+                                        "position_ids",
+                                        "old_log_probs",
+                                        "advantages",
+                                    ]
+                                    if "response_mask" in batch.batch:
+                                        actor_batch_keys.append("response_mask")
+                                    if "ref_log_prob" in batch.batch:
+                                        actor_batch_keys.append("ref_log_prob")
+                                    if "loss_mask" in batch.batch:
+                                        actor_batch_keys.append("loss_mask")
+                                    actor_update_batch = batch.select(
+                                        batch_keys=actor_batch_keys,
+                                        non_tensor_batch_keys=[],
+                                        meta_info_keys=[
+                                            "temperature",
+                                            "global_token_num",
+                                            "multi_turn",
+                                        ],
+                                    )
                             batch.meta_info["multi_turn"] = (
                                 self.config.actor_rollout_ref.rollout.multi_turn.enable
                             )
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_update_batch.meta_info["multi_turn"] = batch.meta_info[
+                                "multi_turn"
+                            ]
+                            actor_output = self.actor_rollout_wg.update_actor(
+                                actor_update_batch
+                            )
                         actor_output_metrics = reduce_metrics(
                             actor_output.meta_info["metrics"]
                         )
                         metrics.update(actor_output_metrics)
+
+                        # Shared-base verifier update must happen AFTER actor update.
+                        if update_base:
+                            _maybe_update_verifier(verifier_train_batch)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -3739,89 +4675,130 @@ class RayPPOTrainer:
                         )
                     if should_dump_rollout:
                         with _timer("dump_rollout_generations", timing_raw):
-                            inputs = self.tokenizer.batch_decode(
-                                batch.batch["prompts"], skip_special_tokens=True
-                            )
-                            outputs = self.tokenizer.batch_decode(
-                                batch.batch["responses"], skip_special_tokens=True
-                            )
+                            inputs = None
+                            outputs = None
                             scores = (
                                 batch.batch["token_level_scores"].sum(-1).cpu().tolist()
                             )
                             # For Co-GRPO, also dump control/exp streams separately to compare intervention effect
                             extra_infos = dict(reward_extra_infos_dict)
                             if use_co_grpo:
-                                has_control_stream = (
-                                    "control_input_ids" in batch.batch
-                                    and "control_responses" in batch.batch
-                                )
+                                if (
+                                    "exp_input_ids" in batch.batch
+                                    and "exp_responses" in batch.batch
+                                ):
+                                    has_control_stream = (
+                                        "control_input_ids" in batch.batch
+                                        and "control_responses" in batch.batch
+                                    )
 
-                                if has_control_stream:
-                                    control_prompt_len = batch.batch[
-                                        "control_input_ids"
-                                    ].size(1) - batch.batch["control_responses"].size(1)
-                                    control_prompts = batch.batch["control_input_ids"][
-                                        ..., :control_prompt_len
+                                    if has_control_stream:
+                                        control_prompt_len = batch.batch[
+                                            "control_input_ids"
+                                        ].size(1) - batch.batch[
+                                            "control_responses"
+                                        ].size(1)
+                                        control_prompts = batch.batch[
+                                            "control_input_ids"
+                                        ][..., :control_prompt_len]
+                                    exp_prompt_len = batch.batch["exp_input_ids"].size(
+                                        1
+                                    ) - batch.batch["exp_responses"].size(1)
+                                    exp_prompts = batch.batch["exp_input_ids"][
+                                        ..., :exp_prompt_len
                                     ]
-                                exp_prompt_len = batch.batch["exp_input_ids"].size(
-                                    1
-                                ) - batch.batch["exp_responses"].size(1)
-                                exp_prompts = batch.batch["exp_input_ids"][
-                                    ..., :exp_prompt_len
-                                ]
 
-                                if has_control_stream:
-                                    extra_infos["control_prompt"] = (
-                                        self.tokenizer.batch_decode(
-                                            control_prompts, skip_special_tokens=True
-                                        )
+                                    # Default dump uses EXP stream (policy path).
+                                    inputs = self.tokenizer.batch_decode(
+                                        exp_prompts, skip_special_tokens=True
                                     )
-                                extra_infos["exp_prompt"] = self.tokenizer.batch_decode(
-                                    exp_prompts, skip_special_tokens=True
-                                )
-                                if has_control_stream:
-                                    extra_infos["control_output"] = (
-                                        self.tokenizer.batch_decode(
-                                            batch.batch["control_responses"],
-                                            skip_special_tokens=True,
-                                        )
+                                    outputs = self.tokenizer.batch_decode(
+                                        batch.batch["exp_responses"],
+                                        skip_special_tokens=True,
                                     )
-                                extra_infos["exp_output"] = self.tokenizer.batch_decode(
-                                    batch.batch["exp_responses"],
-                                    skip_special_tokens=True,
-                                )
 
-                                # Add Verifier outputs for analysis
-                                if hasattr(batch, "non_tensor_batch"):
-                                    if "critiques" in batch.non_tensor_batch:
-                                        extra_infos["verifier_critiques"] = (
-                                            batch.non_tensor_batch["critiques"].tolist()
+                                    if has_control_stream:
+                                        extra_infos["control_prompt"] = (
+                                            self.tokenizer.batch_decode(
+                                                control_prompts,
+                                                skip_special_tokens=True,
+                                            )
                                         )
-                                    if "hints" in batch.non_tensor_batch:
-                                        extra_infos["verifier_hints"] = (
-                                            batch.non_tensor_batch["hints"].tolist()
+                                    extra_infos["exp_prompt"] = inputs
+                                    if has_control_stream:
+                                        extra_infos["control_output"] = (
+                                            self.tokenizer.batch_decode(
+                                                batch.batch["control_responses"],
+                                                skip_special_tokens=True,
+                                            )
                                         )
-                                    if "num_interventions" in batch.non_tensor_batch:
-                                        extra_infos["num_interventions"] = (
-                                            batch.non_tensor_batch[
-                                                "num_interventions"
-                                            ].tolist()
-                                        )
-                                    if "hint_token_counts" in batch.non_tensor_batch:
-                                        extra_infos["hint_token_counts"] = (
-                                            batch.non_tensor_batch[
-                                                "hint_token_counts"
-                                            ].tolist()
-                                        )
+                                    extra_infos["exp_output"] = outputs
+
+                                    # Add Verifier outputs for analysis
+                                    if hasattr(batch, "non_tensor_batch"):
+                                        if "critiques" in batch.non_tensor_batch:
+                                            extra_infos["verifier_critiques"] = (
+                                                batch.non_tensor_batch[
+                                                    "critiques"
+                                                ].tolist()
+                                            )
+                                        if "hints" in batch.non_tensor_batch:
+                                            extra_infos["verifier_hints"] = (
+                                                batch.non_tensor_batch[
+                                                    "hints"
+                                                ].tolist()
+                                            )
+                                        if (
+                                            "num_interventions"
+                                            in batch.non_tensor_batch
+                                        ):
+                                            extra_infos["num_interventions"] = (
+                                                batch.non_tensor_batch[
+                                                    "num_interventions"
+                                                ].tolist()
+                                            )
+                                        if (
+                                            "hint_token_counts"
+                                            in batch.non_tensor_batch
+                                        ):
+                                            extra_infos["hint_token_counts"] = (
+                                                batch.non_tensor_batch[
+                                                    "hint_token_counts"
+                                                ].tolist()
+                                            )
+                                else:
+                                    # Unexpected batch layout. Skip dump instead of
+                                    # crashing the whole training job.
+                                    inputs = None
+                                    outputs = None
+                                        
+                            else:
+                                # Non-CoGRPO path uses standard batch layout.
+                                if (
+                                    "prompts" in batch.batch
+                                    and "responses" in batch.batch
+                                ):
+                                    inputs = self.tokenizer.batch_decode(
+                                        batch.batch["prompts"],
+                                        skip_special_tokens=True,
+                                    )
+                                    outputs = self.tokenizer.batch_decode(
+                                        batch.batch["responses"],
+                                        skip_special_tokens=True,
+                                    )
+                                else:
+                                    inputs = None
+                                    outputs = None
 
                             # answers = batch.batch["responses"].cpu().tolist()
-                            self._dump_generations(
-                                inputs=inputs,
-                                outputs=outputs,
-                                scores=scores,
-                                reward_extra_infos_dict=extra_infos,
-                                dump_path=rollout_data_dir,
-                            )
+                            if inputs is not None and outputs is not None:
+                                self._dump_generations(
+                                    inputs=inputs,
+                                    outputs=outputs,
+                                    scores=scores,
+                                    reward_extra_infos_dict=extra_infos,
+                                    dump_path=rollout_data_dir,
+                                )
 
                     # validate
                     if (
@@ -3914,7 +4891,7 @@ class RayPPOTrainer:
                 )
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                tracker.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1

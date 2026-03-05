@@ -340,7 +340,21 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
+        debug_mask_grad = os.environ.get("VERL_DEBUG_MASK_GRAD", "0") == "1"
+        debug_mask_grad_done = False
+        try:
+            debug_mask_grad_tol = float(
+                os.environ.get("VERL_DEBUG_MASK_GRAD_TOL", "1e-7") or "1e-7"
+            )
+        except Exception:  # noqa: BLE001
+            debug_mask_grad_tol = 1e-7
+
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        # `response_mask` is a per-token mask (shape: bsz x response_len) computed by the trainer.
+        # For by_step Co-GRPO, it can exclude injected hint tokens (exp_loss_mask slice). Use it
+        # to avoid applying KL/entropy regularization on non-policy tokens.
+        if "response_mask" in data.batch:
+            select_keys.append("response_mask")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -387,6 +401,14 @@ class DataParallelPPOActor(BasePPOActor):
                     attention_mask = data["attention_mask"]
                     if multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
+                        # If the trainer provides a `response_mask` (e.g. Co-GRPO exp_loss_mask slice),
+                        # combine it to also exclude non-policy tokens such as injected hints.
+                        if "response_mask" in data:
+                            response_mask = (
+                                response_mask * data["response_mask"][:, -response_length:]
+                            )
+                    elif "response_mask" in data:
+                        response_mask = data["response_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
@@ -406,6 +428,12 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     # 
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    probe_mask_grad = bool(debug_mask_grad and not debug_mask_grad_done)
+                    if probe_mask_grad:
+                        try:
+                            log_prob.retain_grad()
+                        except Exception:  # noqa: BLE001
+                            probe_mask_grad = False
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
@@ -443,6 +471,54 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
+                    if probe_mask_grad:
+                        try:
+                            with torch.no_grad():
+                                grad = log_prob.grad
+                                if grad is not None:
+                                    policy_mask = response_mask.to(torch.bool)
+                                    masked = ~policy_mask
+                                    masked_ratio = float(masked.float().mean().item())
+                                    masked_absmax = 0.0
+                                    unmasked_absmean = 0.0
+                                    if masked.any():
+                                        masked_absmax = float(
+                                            grad[masked].abs().max().item()
+                                        )
+                                    if policy_mask.any():
+                                        unmasked_absmean = float(
+                                            grad[policy_mask].abs().mean().item()
+                                        )
+                                    append_to_dict(
+                                        metrics,
+                                        {
+                                            "debug/masked_token_ratio": masked_ratio,
+                                            "debug/masked_logprob_grad_absmax": masked_absmax,
+                                            "debug/unmasked_logprob_grad_absmean": unmasked_absmean,
+                                        },
+                                    )
+
+                                    try:
+                                        import torch.distributed as dist
+
+                                        is_rank0 = (
+                                            (not dist.is_available())
+                                            or (not dist.is_initialized())
+                                            or dist.get_rank() == 0
+                                        )
+                                    except Exception:
+                                        is_rank0 = True
+                                    if is_rank0 and masked_absmax > debug_mask_grad_tol:
+                                        logger.warning(
+                                            "Non-zero masked log_prob grad detected: "
+                                            "masked_absmax=%g tol=%g masked_ratio=%g",
+                                            masked_absmax,
+                                            debug_mask_grad_tol,
+                                            masked_ratio,
+                                        )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        debug_mask_grad_done = True
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),

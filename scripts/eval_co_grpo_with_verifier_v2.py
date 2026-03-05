@@ -12,7 +12,9 @@ NOTE: The original script may be executed by remote jobs on shared FS (ETXTBSY).
 """
 
 import argparse
+import importlib.util
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -107,6 +109,105 @@ class Decision:
     action: str  # "Pass" or "Intervene"
     hint: str
     critique: str
+
+
+_ONLINE_HINT_INJECTION_MODULE: Any = None
+
+
+def _load_online_hint_injection_module() -> Any:
+    """
+    Load the online-canonical hint injection helpers (natural insertion, rollback guards).
+
+    Preferred: import from an installed `verl` package.
+    Fallback: dynamic import from a repo checkout path (set via $REPRO_ROOT or $ONLINE_HINT_INJECTION_PY).
+    """
+    # 1) Try normal import first (works if repro is installed / in PYTHONPATH).
+    try:
+        from verl.workers.rollout.vllm_rollout import verifier_hint_injection as inj  # type: ignore
+
+        return inj
+    except Exception:
+        pass
+
+    # 2) Dynamic import from file path.
+    candidates: List[Path] = []
+    p_env = (os.environ.get("ONLINE_HINT_INJECTION_PY") or "").strip()
+    if p_env:
+        candidates.append(Path(p_env))
+    repro_root = (os.environ.get("REPRO_ROOT") or "").strip()
+    if repro_root:
+        candidates.append(
+            Path(repro_root)
+            / "verl"
+            / "workers"
+            / "rollout"
+            / "vllm_rollout"
+            / "verifier_hint_injection.py"
+        )
+    # Default: repo-relative.
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        candidates.append(
+            repo_root
+            / "verl"
+            / "workers"
+            / "rollout"
+            / "vllm_rollout"
+            / "verifier_hint_injection.py"
+        )
+    except Exception:
+        pass
+
+    for p in candidates:
+        try:
+            if not p or not p.exists():
+                continue
+            spec = importlib.util.spec_from_file_location("_online_hint_injection", str(p))
+            if spec is None or spec.loader is None:
+                continue
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)  # type: ignore[attr-defined]
+            return m
+        except Exception:
+            continue
+
+    raise FileNotFoundError(
+        "Failed to load online hint injection helpers. Set $REPRO_ROOT to the repro checkout root "
+        "or $ONLINE_HINT_INJECTION_PY to verifier_hint_injection.py."
+    )
+
+
+def _get_online_hint_injection_module() -> Any:
+    global _ONLINE_HINT_INJECTION_MODULE
+    if _ONLINE_HINT_INJECTION_MODULE is None:
+        _ONLINE_HINT_INJECTION_MODULE = _load_online_hint_injection_module()
+    return _ONLINE_HINT_INJECTION_MODULE
+
+
+def _normalize_eos_token_ids(eos_token_id) -> set[int]:
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, (list, tuple, set)):
+        out: set[int] = set()
+        for t in eos_token_id:
+            try:
+                out.add(int(t))
+            except Exception:
+                continue
+        return out
+    try:
+        return {int(eos_token_id)}
+    except Exception:
+        return set()
+
+
+# Prefer online-canonical verifier prompts from the shared hint injection module.
+try:
+    _inj_prompts0 = _get_online_hint_injection_module()
+    VERIFIER_SYSTEM_PROMPT = str(getattr(_inj_prompts0, "VERIFIER_SYSTEM_PROMPT", VERIFIER_SYSTEM_PROMPT))
+    VERIFIER_INTERVENE_PROMPT = str(getattr(_inj_prompts0, "VERIFIER_INTERVENE_PROMPT", VERIFIER_INTERVENE_PROMPT))
+except Exception:
+    pass
 
 
 def _messages_to_prompt_ids(tokenizer, messages: List[Dict[str, str]]) -> List[int]:
@@ -491,26 +592,12 @@ def _hint_allowed(hint: str, previous_hints: List[str]) -> bool:
 
 
 def _format_hint_text(*, hint: str, response_ids: List[int], tokenizer) -> str:
-    hint = (hint or "").strip()
-    if not hint:
-        return ""
-
-    # Insert hints naturally, without a hard marker like "[Guide]:".
-    # Keep a stable separation from the current text, but avoid adding extra
-    # blank lines if we are already at a newline boundary.
-    tail = ""
+    inj = _get_online_hint_injection_module()
     try:
         tail = tokenizer.decode(response_ids[-32:], skip_special_tokens=True) if response_ids else ""
     except Exception:
         tail = ""
-
-    if tail.endswith("\n\n"):
-        prefix = ""
-    elif tail.endswith("\n"):
-        prefix = "\n"
-    else:
-        prefix = "\n\n"
-    return f"{prefix}{hint}\n\n"
+    return inj.format_hint_text(hint=(hint or ""), tail_text=tail)
 
 
 def _infer_lora_rank(lora_dir: Path, default_rank: int = 64) -> int:
@@ -527,25 +614,31 @@ def _infer_lora_rank(lora_dir: Path, default_rank: int = 64) -> int:
 def _init_vllm_engine(
     *,
     model_dir: Path,
-    verifier_lora_dir: Path,
+    verifier_lora_dir: Optional[Path],
     tensor_parallel_size: int,
     gpu_memory_utilization: float,
     max_model_len: int,
 ):
     from vllm import LLM
 
-    lora_rank = _infer_lora_rank(verifier_lora_dir, default_rank=64)
-    llm = LLM(
-        model=str(model_dir),
-        tokenizer=str(model_dir),
-        trust_remote_code=True,
-        tensor_parallel_size=int(tensor_parallel_size),
-        gpu_memory_utilization=float(gpu_memory_utilization),
-        max_model_len=int(max_model_len),
-        enable_lora=True,
-        max_loras=1,
-        max_lora_rank=int(lora_rank),
-    )
+    kwargs: Dict[str, Any] = {
+        "model": str(model_dir),
+        "tokenizer": str(model_dir),
+        "trust_remote_code": True,
+        "tensor_parallel_size": int(tensor_parallel_size),
+        "gpu_memory_utilization": float(gpu_memory_utilization),
+        "max_model_len": int(max_model_len),
+    }
+    if verifier_lora_dir is not None:
+        lora_rank = _infer_lora_rank(verifier_lora_dir, default_rank=64)
+        kwargs.update(
+            {
+                "enable_lora": True,
+                "max_loras": 1,
+                "max_lora_rank": int(lora_rank),
+            }
+        )
+    llm = LLM(**kwargs)
     return llm
 
 
@@ -583,6 +676,47 @@ def _vllm_generate_tokens(
     t1 = time.time()
     gen = out[0].outputs[0]
     return list(gen.token_ids), str(gen.text or ""), float(t1 - t0)
+
+
+def _vllm_generate_tokens_with_logprobs(
+    llm,
+    *,
+    prompt_token_ids: List[int],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    stop_token_ids: List[int],
+    seed: Optional[int],
+    logprobs: int,
+    lora_request: Optional[object] = None,
+) -> Tuple[List[int], str, List[float], float]:
+    from vllm.inputs import TokensPrompt
+    from vllm.sampling_params import SamplingParams
+
+    t0 = time.time()
+    params = SamplingParams(
+        n=1,
+        temperature=float(temperature),
+        top_p=float(top_p) if top_p is not None else 1.0,
+        top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
+        max_tokens=int(max_tokens),
+        stop_token_ids=[int(x) for x in (stop_token_ids or [])],
+        seed=int(seed) if seed is not None else None,
+        logprobs=int(logprobs) if int(logprobs) > 0 else 0,
+    )
+    out = llm.generate(
+        prompts=[TokensPrompt(prompt_token_ids=list(prompt_token_ids))],
+        sampling_params=params,
+        use_tqdm=False,
+        lora_request=[lora_request] if lora_request is not None else None,
+    )
+    t1 = time.time()
+    gen = out[0].outputs[0]
+    token_ids = list(gen.token_ids)
+    text = str(gen.text or "")
+    token_logprobs = _extract_generated_token_logprobs(gen)
+    return token_ids, text, token_logprobs, float(t1 - t0)
 
 
 def _vllm_generate_batch(
@@ -647,6 +781,143 @@ def _vllm_generate_batch(
     return token_ids_list, texts, float(t1 - t0)
 
 
+def _vllm_generate_batch_with_logprobs(
+    llm,
+    *,
+    prompt_token_ids_list: List[List[int]],
+    max_tokens: Any,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    stop_token_ids: List[int],
+    seed: Optional[int],
+    logprobs: int,
+    lora_requests: Optional[List[object]] = None,
+) -> Tuple[List[List[int]], List[str], List[List[float]], float]:
+    from vllm.inputs import TokensPrompt
+    from vllm.sampling_params import SamplingParams
+
+    if not prompt_token_ids_list:
+        return [], [], [], 0.0
+
+    t0 = time.time()
+    stop_ids = [int(x) for x in (stop_token_ids or [])]
+    seed_i = int(seed) if seed is not None else None
+    lp = int(logprobs) if int(logprobs) > 0 else 0
+
+    if isinstance(max_tokens, (list, tuple)):
+        params = [
+            SamplingParams(
+                n=1,
+                temperature=float(temperature),
+                top_p=float(top_p) if top_p is not None else 1.0,
+                top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
+                max_tokens=int(mt),
+                stop_token_ids=stop_ids,
+                seed=seed_i,
+                logprobs=lp,
+            )
+            for mt in max_tokens
+        ]
+    else:
+        params = SamplingParams(
+            n=1,
+            temperature=float(temperature),
+            top_p=float(top_p) if top_p is not None else 1.0,
+            top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
+            max_tokens=int(max_tokens),
+            stop_token_ids=stop_ids,
+            seed=seed_i,
+            logprobs=lp,
+        )
+    out = llm.generate(
+        prompts=[TokensPrompt(prompt_token_ids=list(ids)) for ids in prompt_token_ids_list],
+        sampling_params=params,
+        use_tqdm=False,
+        lora_request=lora_requests,
+    )
+    t1 = time.time()
+
+    token_ids_list: List[List[int]] = []
+    texts: List[str] = []
+    token_logprobs_list: List[List[float]] = []
+    for req in out:
+        gen = req.outputs[0]
+        token_ids_list.append(list(gen.token_ids))
+        texts.append(str(gen.text or ""))
+        token_logprobs_list.append(_extract_generated_token_logprobs(gen))
+    return token_ids_list, texts, token_logprobs_list, float(t1 - t0)
+
+
+def _extract_generated_token_logprobs(gen: Any) -> List[float]:
+    """
+    Extract per-token logprobs for the generated token_ids.
+
+    vLLM returns `gen.logprobs` as a list where each entry is a dict mapping
+    token_id -> Logprob (or float-like). We only need the logprob of the
+    actually generated token at each step.
+    """
+    out: List[float] = []
+    logprobs = getattr(gen, "logprobs", None)
+    token_ids = list(getattr(gen, "token_ids", []) or [])
+    if not logprobs or not token_ids:
+        return out
+
+    for tok, lp_dict in zip(token_ids, logprobs):
+        val = None
+        try:
+            if isinstance(lp_dict, dict):
+                item = lp_dict.get(tok, None)
+                if item is None:
+                    item = lp_dict.get(str(tok), None)
+                if item is None and lp_dict:
+                    item = next(iter(lp_dict.values()))
+                if item is not None:
+                    if hasattr(item, "logprob"):
+                        val = float(getattr(item, "logprob"))
+                    else:
+                        val = float(item)
+            elif lp_dict is not None:
+                val = float(lp_dict)
+        except Exception:
+            val = None
+
+        out.append(float(val) if val is not None else float("nan"))
+    return out
+
+
+def _compute_wait_confidence_from_logprobs(
+    token_logprobs: List[float], *, tail_tokens: int = 64
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Match online `verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py::_compute_wait_confidence`
+    as closely as possible:
+      confidence = exp(mean(last N token logprobs))
+    """
+    if not token_logprobs:
+        return None, None
+    vals: List[float] = []
+    for x in token_logprobs:
+        try:
+            xf = float(x)
+        except Exception:
+            continue
+        if math.isfinite(xf):
+            vals.append(xf)
+    if not vals:
+        return None, None
+    try:
+        tail_tokens = int(tail_tokens)
+    except Exception:
+        tail_tokens = 64
+    if tail_tokens > 0 and len(vals) > tail_tokens:
+        vals = vals[-tail_tokens:]
+
+    avg_logprob = float(sum(vals) / max(1, len(vals)))
+    avg_logprob = float(min(0.0, max(-20.0, avg_logprob)))
+    return float(math.exp(avg_logprob)), avg_logprob
+
+
 def _generate_control_vllm(
     *,
     llm,
@@ -676,7 +947,7 @@ def _generate_with_verifier_vllm(
     *,
     llm,
     tokenizer,
-    verifier_lora_dir: Path,
+    verifier_lora_dir: Optional[Path],
     question: str,
     prompt_ids: List[int],
     max_model_len: int,
@@ -687,20 +958,26 @@ def _generate_with_verifier_vllm(
     verifier_max_prompt_length: int,
     verifier_max_new_tokens: int,
     verifier_max_hint_tokens: int,
+    confidence_threshold: float,
+    wait_conf_tail_tokens: int,
     temperature: float,
     top_p: float,
     top_k: int,
     stop_token_ids: List[int],
     seed: Optional[int],
 ) -> Dict[str, Any]:
-    from vllm.lora.request import LoRARequest
+    verifier_lora_req = None
+    if verifier_lora_dir is not None:
+        from vllm.lora.request import LoRARequest
 
-    verifier_lora_req = LoRARequest(
-        lora_name="verifier_lora",
-        lora_int_id=1,
-        lora_path=str(verifier_lora_dir),
-    )
+        verifier_lora_req = LoRARequest(
+            lora_name="verifier_lora",
+            lora_int_id=1,
+            lora_path=str(verifier_lora_dir),
+        )
 
+    inj = _get_online_hint_injection_module()
+    eos_token_ids = _normalize_eos_token_ids(getattr(tokenizer, "eos_token_id", None))
     eos_id = int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
     stop_set = set(int(x) for x in (stop_token_ids or []) if x is not None)
 
@@ -762,7 +1039,7 @@ def _generate_with_verifier_vllm(
             max_model_len=max_model_len,
         )
 
-        verifier_new_tokens, verifier_text, _ = _vllm_generate_tokens(
+        verifier_new_tokens, verifier_text, verifier_logprobs, _ = _vllm_generate_tokens_with_logprobs(
             llm,
             prompt_token_ids=verifier_prompt_ids,
             max_tokens=int(verifier_max_new_tokens),
@@ -772,12 +1049,21 @@ def _generate_with_verifier_vllm(
             top_k=1,
             stop_token_ids=[],
             seed=None,
+            logprobs=1,
             lora_request=verifier_lora_req,
         )
         if not verifier_text and verifier_new_tokens:
             verifier_text = tokenizer.decode(verifier_new_tokens, skip_special_tokens=True)
 
         decision = _parse_verifier_decision(verifier_text)
+        wait_confidence, wait_avg_logprob = (None, None)
+        if decision.action == "Intervene":
+            wait_confidence, wait_avg_logprob = _compute_wait_confidence_from_logprobs(
+                verifier_logprobs, tail_tokens=int(wait_conf_tail_tokens)
+            )
+            if float(confidence_threshold) > 0:
+                if wait_confidence is None or float(wait_confidence) < float(confidence_threshold):
+                    continue
         if decision.hint and verifier_max_hint_tokens > 0:
             hint_ids = tokenizer.encode(decision.hint, add_special_tokens=False)
             if len(hint_ids) > verifier_max_hint_tokens:
@@ -794,9 +1080,15 @@ def _generate_with_verifier_vllm(
 
         hint_text = _format_hint_text(hint=decision.hint, response_ids=response_ids, tokenizer=tokenizer)
         hint_ids = tokenizer.encode(hint_text, add_special_tokens=False)
+        hint_applied = False
         if hint_ids:
-            response_ids.extend(hint_ids)  # Hint tokens do not count toward model_gen_tokens.
-            previous_hints.append(decision.hint)
+            state = {"response_tokens": response_ids, "loss_masks": [1] * len(response_ids)}
+            hint_applied = bool(inj.insert_hint_tokens(state, hint_ids, tokenizer, eos_token_ids))
+            if hint_applied:
+                previous_hints.append(decision.hint)
+                tokens_since_boundary = 0  # align with online behavior
+        if not hint_applied:
+            continue
 
         interventions.append(
             {
@@ -804,6 +1096,8 @@ def _generate_with_verifier_vllm(
                 "hint_text": hint_text,
                 "verifier_action": decision.action,
                 "verifier_critique": decision.critique,
+                "wait_confidence": wait_confidence,
+                "wait_avg_logprob": wait_avg_logprob,
                 "response_tokens_after": len(response_ids),
             }
         )
@@ -837,7 +1131,7 @@ def _generate_with_verifier_vllm_batch(
     *,
     llm,
     tokenizer,
-    verifier_lora_dir: Path,
+    verifier_lora_dir: Optional[Path],
     states: List[_ExpState],
     max_model_len: int,
     max_model_tokens: int,
@@ -847,6 +1141,8 @@ def _generate_with_verifier_vllm_batch(
     verifier_max_prompt_length: int,
     verifier_max_new_tokens: int,
     verifier_max_hint_tokens: int,
+    confidence_threshold: float,
+    wait_conf_tail_tokens: int,
     temperature: float,
     top_p: float,
     top_k: int,
@@ -858,14 +1154,18 @@ def _generate_with_verifier_vllm_batch(
     - actor chunks: no stop_token_ids passed into vLLM; stop tokens handled locally.
     - verifier called once per step chunk (per sample) unless sample complete or max_interventions reached.
     """
-    from vllm.lora.request import LoRARequest
+    verifier_lora_req = None
+    if verifier_lora_dir is not None:
+        from vllm.lora.request import LoRARequest
 
-    verifier_lora_req = LoRARequest(
-        lora_name="verifier_lora",
-        lora_int_id=1,
-        lora_path=str(verifier_lora_dir),
-    )
+        verifier_lora_req = LoRARequest(
+            lora_name="verifier_lora",
+            lora_int_id=1,
+            lora_path=str(verifier_lora_dir),
+        )
 
+    inj = _get_online_hint_injection_module()
+    eos_token_ids = _normalize_eos_token_ids(getattr(tokenizer, "eos_token_id", None))
     eos_id = int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
     stop_set = set(int(x) for x in (stop_token_ids or []) if x is not None)
 
@@ -958,11 +1258,12 @@ def _generate_with_verifier_vllm_batch(
         if not verifier_batch:
             continue
 
-        verifier_lora_requests = [
-            LoRARequest(lora_name="verifier_lora", lora_int_id=1, lora_path=str(verifier_lora_dir)) for _ in verifier_batch
-        ]
+        verifier_lora_requests = None
+        if verifier_lora_req is not None:
+            verifier_lora_requests = [verifier_lora_req] * len(verifier_batch)
+
         try:
-            v_token_lists, v_texts, _ = _vllm_generate_batch(
+            v_token_lists, v_texts, v_logprobs_lists, _ = _vllm_generate_batch_with_logprobs(
                 llm,
                 prompt_token_ids_list=verifier_prompt_ids_list,
                 max_tokens=int(verifier_max_new_tokens),
@@ -971,6 +1272,7 @@ def _generate_with_verifier_vllm_batch(
                 top_k=1,
                 stop_token_ids=[],
                 seed=None,
+                logprobs=1,
                 lora_requests=verifier_lora_requests,
             )
         except Exception as e:
@@ -978,10 +1280,20 @@ def _generate_with_verifier_vllm_batch(
                 s.error = f"verifier_generate_error: {e}"
             continue
 
-        for s, v_tokens, v_text in zip(verifier_batch, v_token_lists, v_texts):
+        for s, v_tokens, v_text, v_logprobs in zip(
+            verifier_batch, v_token_lists, v_texts, v_logprobs_lists
+        ):
             if not v_text and v_tokens:
                 v_text = tokenizer.decode(v_tokens, skip_special_tokens=True)
             decision = _parse_verifier_decision(v_text)
+            wait_confidence, wait_avg_logprob = (None, None)
+            if decision.action == "Intervene":
+                wait_confidence, wait_avg_logprob = _compute_wait_confidence_from_logprobs(
+                    v_logprobs, tail_tokens=int(wait_conf_tail_tokens)
+                )
+                if float(confidence_threshold) > 0:
+                    if wait_confidence is None or float(wait_confidence) < float(confidence_threshold):
+                        continue
             if decision.hint and verifier_max_hint_tokens > 0:
                 hint_ids = tokenizer.encode(decision.hint, add_special_tokens=False)
                 if len(hint_ids) > int(verifier_max_hint_tokens):
@@ -998,9 +1310,15 @@ def _generate_with_verifier_vllm_batch(
 
             hint_text = _format_hint_text(hint=decision.hint, response_ids=s.response_ids, tokenizer=tokenizer)
             hint_ids = tokenizer.encode(hint_text, add_special_tokens=False)
+            hint_applied = False
             if hint_ids:
-                s.response_ids.extend(hint_ids)  # Hint tokens do not count toward model_gen_tokens.
-                s.previous_hints.append(decision.hint)
+                state = {"response_tokens": s.response_ids, "loss_masks": [1] * len(s.response_ids)}
+                hint_applied = bool(inj.insert_hint_tokens(state, hint_ids, tokenizer, eos_token_ids))
+                if hint_applied:
+                    s.previous_hints.append(decision.hint)
+                    s.tokens_since_boundary = 0  # align with online behavior
+            if not hint_applied:
+                continue
 
             s.interventions.append(
                 {
@@ -1008,6 +1326,8 @@ def _generate_with_verifier_vllm_batch(
                     "hint_text": hint_text,
                     "verifier_action": decision.action,
                     "verifier_critique": decision.critique,
+                    "wait_confidence": wait_confidence,
+                    "wait_avg_logprob": wait_avg_logprob,
                     "response_tokens_after": len(s.response_ids),
                 }
             )
@@ -1041,6 +1361,19 @@ def main() -> int:
     ap.add_argument("--token-check-interval", type=int, default=4096)
     ap.add_argument("--min-step-tokens", type=int, default=4096)
     ap.add_argument("--max-interventions", type=int, default=5)
+    ap.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.0,
+        help="Only apply <WAIT> hints when wait_confidence>=threshold. "
+        "wait_confidence is computed from verifier token logprobs (exp(mean tail logprob)); 0 disables the gate.",
+    )
+    ap.add_argument(
+        "--wait-conf-tail-tokens",
+        type=int,
+        default=64,
+        help="Tail tokens used to estimate wait_confidence (match online default=64).",
+    )
 
     ap.add_argument("--verifier-max-prompt-length", type=int, default=16384)
     ap.add_argument("--verifier-max-new-tokens", type=int, default=2048)
@@ -1094,15 +1427,14 @@ def main() -> int:
     run_control = args.mode in ["control", "both"]
     run_exp = args.mode in ["exp", "both"]
 
-    verifier_lora_dir: Optional[Path]
+    verifier_lora_dir: Optional[Path] = None
     if args.verifier_lora:
         verifier_lora_dir = Path(args.verifier_lora).resolve()
-    else:
-        if run_exp:
-            if run_dir is None:
-                raise SystemExit("Must provide --verifier-lora (required for --mode exp|both) or --run-dir")
+    elif run_exp and run_dir is not None:
+        # Best-effort auto-detect (kept for backwards compatibility with old run-dir based eval).
+        try:
             verifier_lora_dir = _detect_verifier_lora_dir(run_dir)
-        else:
+        except Exception:
             verifier_lora_dir = None
 
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
@@ -1151,8 +1483,6 @@ def main() -> int:
         if run_exp:
             raise SystemExit("backend=lmdeploy currently supports only --mode control (verifier LoRA interventions require vLLM).")
     else:
-        if verifier_lora_dir is None:
-            raise SystemExit("backend=vllm currently requires --verifier-lora in this script.")
         llm = _init_vllm_engine(
             model_dir=base_model_dir,
             verifier_lora_dir=verifier_lora_dir,
@@ -1217,7 +1547,7 @@ def main() -> int:
                         "prompt_text": p_text,
                         "origin_info": origin_info,
                         "base_model_dir": str(base_model_dir),
-                        "verifier_lora_dir": str(verifier_lora_dir),
+                        "verifier_lora_dir": str(verifier_lora_dir) if verifier_lora_dir is not None else "",
                         "backend": args.backend,
                         "mode": args.mode,
                         "system_prompt": "VERIFIER_SYSTEM_PROMPT" if args.use_verifier_system_prompt else None,
@@ -1300,6 +1630,8 @@ def main() -> int:
                     verifier_max_prompt_length=int(args.verifier_max_prompt_length),
                     verifier_max_new_tokens=int(args.verifier_max_new_tokens),
                     verifier_max_hint_tokens=int(args.verifier_max_hint_tokens),
+                    confidence_threshold=float(args.confidence_threshold),
+                    wait_conf_tail_tokens=int(args.wait_conf_tail_tokens),
                     temperature=float(args.temperature),
                     top_p=float(args.top_p),
                     top_k=int(args.top_k),
