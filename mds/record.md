@@ -438,7 +438,48 @@
 2) 对 vLLM：先降并发（`max_num_seqs/max_num_batched_tokens`），再调 `gpu_memory_utilization`、再看是否 prefix-cache 相关；
 3) 对训练侧：先降 `micro_bsz_per_gpu` 或开 `use_dynamic_bsz`，再考虑 offload（如果允许）。
 
-### 5) 32 卡 4 节点：每张卡在做什么？（以当前 CoGRPO/GRPO 为例）
+### 2026-03-30
+
+### OC Offline Eval 性能瓶颈分析与修复（Control vs Exp 对比）
+
+#### 问题
+
+Exp eval（verifier intervention）rjob `rjob-oc4269-exp-full-aime24-gpqa-16w-short-0-c018b` 跑了 18h+ 只完成 8/32 shard，预估 40h+。Control eval 同样的数据集 1h10min 跑完。
+
+#### Control vs Exp 配置对比
+
+| 参数 | Control (0315 direct) | Control (0318 proxy) | **Exp (当前 0329)** |
+|---|---|---|---|
+| `batch_size` | **512** | **512** | **16** |
+| `max_workers` | **32** | **32** | **16** |
+| `query_per_second` | **128** | **128** | **16** |
+| `openai_api_base` | 16 直连 IP | 1 proxy URL | 16 直连 wrapper |
+| `type` | OpenAISDK | OpenAISDK | OpenAISDK |
+| 推理耗时 | **~1h10min** | **~4.5h** | **40h+ 卡死** |
+
+#### 根因分析（三重叠加）
+
+1. **`batch_size` 从 512 降到 16**：并发从 32 降到 16，吞吐直接减半。推测是有人担心 wrapper 承受不住而降低，但降过头了。
+2. **OpenAISDK URL pin 死**（`openai_api.py:619`）：每个 rjob worker 初始化时 `random.choice(openai_api_base)` 只选一个 URL 绑定终身。16 个 worker 随机选 16 个 URL → 生日问题 → 有的 wrapper 背 3-4 个 worker 的请求，有的空闲。
+3. **Batch 同步阻塞**（`openai_api.py:188`）：`list(executor.map(...))` 等 batch 内全部请求完成才继续。Verfier intervention 单请求 200-500s，一个慢请求拖住整批。
+4. Control 不受影响的原因：`batch_size=512` + `max_workers=32` → 32 并发 + 滑动窗口（一个完成立刻补下一个），且 plain lmdeploy 无 verifier 开销，单请求快。
+
+#### 修复方案
+
+**改 1（配置对齐，必做）：** `batch_size=512`, `max_workers=32`, `query_per_second=128`，与 control 一致。
+
+- `executor.map` 提交 512 任务，32 线程并发，滑动窗口调度（不会被单个慢请求卡住整批，因为 batch 内有足够多任务保持流水线满载）
+- 预估：2544 条 / 32 并发 × ~300s ≈ **6-7h**（wrapper 有 verifier 开销，比 control 慢）
+
+**改 2（URL rotation patch，加速）：** 修改 `OpenAISDK._generate` 支持 per-request URL 轮转。
+
+- 创建 client 池（16 个 URL 各一个 client），每次 `_generate` 随机选一个
+- 32 并发分布到 16 wrapper → 每个 wrapper 同时 ~2 个请求
+- 预估：**~3h**（wrapper 分摊负载，单请求响应更快）
+
+**改 3（可选，不改 OC 源码的折中）：** 只做改 1，不改 OC 源码。预估 6-7h 可接受。
+
+#### 5) 32 卡 4 节点：每张卡在做什么？（以当前 CoGRPO/GRPO 为例）
 
 **Ray 层面**
 - 4 个 placement group（每节点 1 个），每个 PG 有 8 个 bundle（1 GPU + 1 CPU），总计 32 个 worker slot。  

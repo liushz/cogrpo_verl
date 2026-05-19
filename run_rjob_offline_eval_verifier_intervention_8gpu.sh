@@ -39,17 +39,79 @@ _latest_run_group_id() {
   ls -1 "${ds_dir}" 2>/dev/null | sort | tail -n 1
 }
 
+_infer_dataset_tag() {
+  local raw="${AIME2024_PATH_OVERRIDE:-${DATASETS:-}}"
+  raw="$(basename "${raw}")"
+  case "${raw}" in
+    *topgap6*) echo "t6" ;;
+    *smoke*) echo "s1" ;;
+    *aime2024*) echo "a24" ;;
+    *gpqa*) echo "gpqa" ;;
+    *) echo "eval" ;;
+  esac
+}
+
+_sched_tag() {
+  local out=""
+  if [[ -n "${PREEMPTIBLE:-}" ]]; then
+    out+="p"
+  fi
+  if [[ "${PRIVATE_MACHINE:-1}" == "1" ]]; then
+    out+="g"
+  fi
+  if [[ -z "${out}" ]]; then
+    out="n"
+  fi
+  echo "${out}"
+}
+
+_auto_job_name() {
+  local ds_tag="$(_infer_dataset_tag)"
+  local sched_tag="$(_sched_tag)"
+  echo "rjob-vllm-${ds_tag}-${gpus}g-${sched_tag}-$(date +%m%d%H%M%S)"
+}
+
+_compact_job_name_if_needed() {
+  local raw="$1"
+  local auto_compact="${AUTO_COMPACT_RJOB_NAME:-1}"
+  if [[ "${auto_compact}" != "1" ]]; then
+    echo "${raw}"
+    return 0
+  fi
+
+  local dash_count=0
+  dash_count="$(awk -F- '{print NF-1}' <<<"${raw}")"
+  if [[ "${#raw}" -le 48 && "${dash_count}" -le 6 ]]; then
+    echo "${raw}"
+    return 0
+  fi
+
+  local ds_tag="$(_infer_dataset_tag)"
+  local sched_tag="$(_sched_tag)"
+  local hash=""
+  hash="$(printf '%s' "${raw}" | md5sum | cut -c1-6)"
+  echo "rjob-vllm-${ds_tag}-${gpus}g-${sched_tag}-${hash}"
+}
+
 cluster="${CLUSTER:-llmit_gpu}"
 gpus="${GPUS:-8}"
 nnodes="${NNODES:-1}"
-cpu="${RJOB_CPU:-64}"
-memory="${RJOB_MEMORY:-512000}"
-use_rdma="${USE_RDMA:-1}"
+# Match the known-good vLLM alignment submit profile by default; larger CPU/memory
+# or RDMA requests made preemptible jobs linger in STARTING with poor schedulability.
+cpu="${RJOB_CPU:-16}"
+memory="${RJOB_MEMORY:-160000}"
+use_rdma="${USE_RDMA:-0}"
 use_private_machine="${PRIVATE_MACHINE:-1}"
+preemptible="${PREEMPTIBLE:-}"
 
-image="${IMAGE:-registry.h.pjlab.org.cn/ailab-llmit-llmit_gpu/liuhongwei_image:lhw-main-llmit-20260127162605}"
+image="${IMAGE:-registry.h.pjlab.org.cn/ailab-puyu-puyu_gpu/lmdeploy-dev:lmdeploy-v0.11.1-cu128-326e7d47-260105}"
 job_prefix="${JOB_PREFIX:-rjob-offline-align-aime2024}"
-job_name="${RJOB_NAME:-${job_prefix}-$(date +%m%d%H%M)}"
+requested_job_name="${RJOB_NAME:-}"
+if [[ -n "${requested_job_name}" ]]; then
+  job_name="$(_compact_job_name_if_needed "${requested_job_name}")"
+else
+  job_name="$(_auto_job_name)"
+fi
 
 out_root="${OUT_ROOT:-/mnt/shared-storage-user/liuhongwei/main_works/temp_debug/offline_eval_verifier}"
 run_group_id="${RUN_GROUP_ID:-}"
@@ -69,9 +131,14 @@ if [[ -z "${eval_urls}" ]]; then
 fi
 
 echo "[rjob] name=${job_name}"
+if [[ -n "${requested_job_name}" && "${requested_job_name}" != "${job_name}" ]]; then
+  echo "[rjob] requested_name=${requested_job_name}"
+  echo "[rjob] compacted_name=${job_name}"
+fi
 echo "[rjob] run_group_id=${run_group_id}"
 echo "[rjob] out_root=${out_root}"
 echo "[rjob] datasets=${DATASETS:-aime2024} mode=${MODE:-both} control_variant=${CONTROL_VARIANT:-both}"
+echo "[rjob] aime2024_path_override=${AIME2024_PATH_OVERRIDE:-<none>}"
 echo "[rjob] metric_mode=${EVAL_METRIC_MODE:-both} repeat(aime2024)=${AIME2024_REPEAT:-32}"
 echo "[rjob] debug_n=${DEBUG_N:-0} monitor_interval=${PROGRESS_INTERVAL:-30}"
 echo "[rjob] actor_model=${ACTOR_MODEL:-<default>}"
@@ -81,9 +148,13 @@ echo "[rjob] ckpt_root=${CKPT_ROOT:-<default>}"
 echo "[rjob] actor_transport=${ACTOR_TRANSPORT:-openai} actor_api_base=${ACTOR_API_BASE:-<default>}"
 echo "[rjob] actor_api_model=${ACTOR_API_MODEL:-<auto>}"
 echo "[rjob] actor_api_mode=${ACTOR_API_MODE:-auto} actor_server_pool=${ACTOR_SERVER_POOL:-auto} actor_api_port_base=${ACTOR_API_PORT_BASE:-0}"
+echo "[rjob] actor_disable_thinking=${ACTOR_DISABLE_THINKING:-1} oc_align_strict=${OC_ALIGN_STRICT:-1}"
+echo "[rjob] require_image_env=${REQUIRE_IMAGE_ENV:-1} conda_env=${CONDA_ENV:-none}"
+echo "[rjob] tokenizer_path=${TOKENIZER_PATH:-/mnt/shared-storage-user/llmit/user/lvchengqi/ckpt/xpuyu/qwen2d5-7b_cold-start/20251028062856/hf-170}"
 echo "[rjob] token_check(chunk/exact)=${CHUNK_TOKEN_CHECK_INTERVAL:-4096}/${EXACT_TOKEN_CHECK_INTERVAL:-65536} resume_from_tmp=${RESUME_FROM_TMP:-0}"
 echo "[rjob] use_rdma=${use_rdma}"
 echo "[rjob] private_machine=${use_private_machine}"
+echo "[rjob] preemptible=${preemptible:-<default>}"
 
 rdma_args=()
 if [[ "${use_rdma}" == "1" ]]; then
@@ -93,6 +164,11 @@ fi
 private_args=()
 if [[ "${use_private_machine}" == "1" ]]; then
   private_args=(--private-machine=group)
+fi
+
+preemptible_args=()
+if [[ -n "${preemptible}" ]]; then
+  preemptible_args=(--preemptible="${preemptible}")
 fi
 
 gpu_ids_str=""
@@ -109,6 +185,7 @@ rjob submit \
   --memory="${memory}" \
   --cpu="${cpu}" \
   --charged-group="${cluster}" \
+  "${preemptible_args[@]}" \
   "${private_args[@]}" \
   --share-host-shm=True \
   --mount=gpfs://gpfs1/llmit:/mnt/shared-storage-user/llmit \
@@ -129,6 +206,7 @@ rjob submit \
     export MODE='${MODE:-both}'
     export CONTROL_VARIANT='${CONTROL_VARIANT:-both}'
     export EVAL_METRIC_MODE='${EVAL_METRIC_MODE:-both}'
+    export AIME2024_PATH_OVERRIDE='${AIME2024_PATH_OVERRIDE:-}'
     export OC_ROOT='${OC_ROOT:-}'
     export OC_REPO_ROOT='${OC_REPO_ROOT:-}'
     export OC_PRED_ABBR='${OC_PRED_ABBR:-}'
@@ -150,21 +228,30 @@ rjob submit \
     export GPU_IDS='${GPU_IDS:-${gpu_ids_str}}'
     export SHARDS='${SHARDS:-${gpus}}'
     export BACKEND='${BACKEND:-lmdeploy}'
-    export CONDA_ENV='${CONDA_ENV:-oc}'
+    export REQUIRE_IMAGE_ENV='${REQUIRE_IMAGE_ENV:-1}'
+    export EXPECT_LMDEPLOY_VERSION='${EXPECT_LMDEPLOY_VERSION:-}'
+    export EXPECT_TRANSFORMERS_VERSION='${EXPECT_TRANSFORMERS_VERSION:-}'
+    export CONDA_ENV='${CONDA_ENV:-none}'
     export USE_VERIFIER_SYSTEM_PROMPT='${USE_VERIFIER_SYSTEM_PROMPT:-1}'
+    export OC_ALIGN_STRICT='${OC_ALIGN_STRICT:-1}'
     export ACTOR_TRANSPORT='${ACTOR_TRANSPORT:-openai}'
     export ACTOR_API_BASE='${ACTOR_API_BASE:-}'
+    export ACTOR_API_KEY='${ACTOR_API_KEY:-}'
     export ACTOR_API_MODEL='${ACTOR_API_MODEL:-}'
-    export ACTOR_API_MODE='${ACTOR_API_MODE:-auto}'
+    export ACTOR_API_MODE='${ACTOR_API_MODE:-chat}'
     export ACTOR_API_TIMEOUT='${ACTOR_API_TIMEOUT:-600}'
-    export START_ACTOR_API_SERVER='${START_ACTOR_API_SERVER:-0}'
+    export ACTOR_OPENAI_CLIENT='${ACTOR_OPENAI_CLIENT:-}'
+    export ACTOR_OC_REPO_PARENT='${ACTOR_OC_REPO_PARENT:-}'
+    export START_ACTOR_API_SERVER='${START_ACTOR_API_SERVER:-1}'
     export ACTOR_API_PORT='${ACTOR_API_PORT:-0}'
     export ACTOR_API_TP='${ACTOR_API_TP:-1}'
     export ACTOR_API_WORKER_NUM='${ACTOR_API_WORKER_NUM:-1}'
-    export ACTOR_API_EXTRA_CLI='${ACTOR_API_EXTRA_CLI:-}'
-    export ACTOR_SERVER_POOL='${ACTOR_SERVER_POOL:-auto}'
-    export ACTOR_API_PORT_BASE='${ACTOR_API_PORT_BASE:-0}'
-    export ACTOR_DISABLE_THINKING='${ACTOR_DISABLE_THINKING:-0}'
+    export ACTOR_API_EXTRA_CLI='${ACTOR_API_EXTRA_CLI:---backend pytorch --session-len 65536 --max-batch-size 1024}'
+    export ACTOR_SERVER_POOL='${ACTOR_SERVER_POOL:-1}'
+    export ACTOR_POOL_WAIT_ALL='${ACTOR_POOL_WAIT_ALL:-1}'
+    export ACTOR_API_PORT_BASE='${ACTOR_API_PORT_BASE:-22000}'
+    export ACTOR_DISABLE_THINKING='${ACTOR_DISABLE_THINKING:-1}'
+    export TOKENIZER_PATH='${TOKENIZER_PATH:-/mnt/shared-storage-user/llmit/user/lvchengqi/ckpt/xpuyu/qwen2d5-7b_cold-start/20251028062856/hf-170}'
     export CHUNK_TOKEN_CHECK_INTERVAL='${CHUNK_TOKEN_CHECK_INTERVAL:-4096}'
     export EXACT_TOKEN_CHECK_INTERVAL='${EXACT_TOKEN_CHECK_INTERVAL:-65536}'
     export RESUME_FROM_TMP='${RESUME_FROM_TMP:-0}'

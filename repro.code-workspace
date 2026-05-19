@@ -1,9 +1,6 @@
 {
 	"folders": [
 		{
-			"path": "/mnt/shared-storage-user/liuhongwei/main_works/repos/repro"
-		},
-		{
 			"path": "/mnt/shared-storage-user/llmit/user/liuhongwei/rl_llmit"
 		},
 		{
@@ -11,6 +8,12 @@
 		},
 		{
 			"path": "../../../../llmit/user/liuhongwei/others"
+		},
+		{
+			"path": "../../../../../../root/minemind"
+		},
+		{
+			"path": "../../../../../shared-storage-gpfs2/llmit1/user/liuhongwei"
 		}
 	],
 	"settings": {

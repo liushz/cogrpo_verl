@@ -66,7 +66,7 @@ def _extract_human_prompt(origin_prompt: Any) -> str:
                 if text is None:
                     text = msg.get("content")
                 if text is not None:
-                    return str(text).strip()
+                    return str(text)
 
         # Fallback: first dict with prompt/content.
         for msg in origin_prompt:
@@ -76,12 +76,12 @@ def _extract_human_prompt(origin_prompt: Any) -> str:
             if text is None:
                 text = msg.get("content")
             if text is not None:
-                return str(text).strip()
+                return str(text)
 
     # Scalar fallback.
     if origin_prompt is None:
         return ""
-    return str(origin_prompt).strip()
+    return str(origin_prompt)
 
 
 def _iter_records_from_shard(obj: Any) -> Iterable[Dict[str, Any]]:
@@ -177,4 +177,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

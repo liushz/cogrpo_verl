@@ -762,6 +762,16 @@ algorithm:
   
   # by_token mode parameters
   token_check_interval: 5  # Check every N tokens
+
+  # Late-stage token count threshold to switch to a different verifier check interval.
+  token_check_late_start_tokens: 0
+
+  # Verifier check interval used after late-stage threshold is reached.
+  token_check_interval_late: 0
+
+  # Skip verifier request when remaining generation budget is below this threshold.
+  verifier_skip_budget_tokens: 0
+
   entropy_threshold: 0.5  # Entropy threshold for filtering
   use_entropy_filter: true  # Whether to use entropy filtering
 

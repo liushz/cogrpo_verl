@@ -201,6 +201,76 @@ def _normalize_eos_token_ids(eos_token_id) -> set[int]:
         return set()
 
 
+def _build_step_boundary_stop_config(tokenizer, extra_stop_token_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+    stop_token_ids = set(int(x) for x in (extra_stop_token_ids or []) if x is not None)
+    stop_sequences = {
+        "</think>",
+        "</think>\n",
+        "</think>\n\n",
+        "<｜end of thought｜>",
+        "<|end of thought|>",
+        "<|end_of_thought|>",
+        "\n\n",
+        ".\n\n",
+    }
+    eos_ids = set(int(x) for x in stop_token_ids)
+
+    try:
+        if getattr(tokenizer, "pad_token_id", None) is not None:
+            stop_token_ids.add(int(tokenizer.pad_token_id))
+    except Exception:
+        pass
+
+    try:
+        im_start_ids = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+        if im_start_ids:
+            stop_token_ids.add(int(im_start_ids[-1]))
+    except Exception:
+        pass
+
+    stop_seq_token_ids: List[List[int]] = []
+    for seq in stop_sequences:
+        try:
+            ids = tokenizer.encode(seq, add_special_tokens=False)
+            if ids:
+                stop_seq_token_ids.append([int(x) for x in ids])
+        except Exception:
+            continue
+
+    return {
+        "stop_token_ids": sorted(stop_token_ids),
+        "stop_sequences": sorted(stop_sequences),
+        "stop_seq_token_ids": stop_seq_token_ids,
+        "eos_token_ids": eos_ids,
+    }
+
+
+def _build_control_stop_token_ids(tokenizer, extra_stop_token_ids: Optional[List[int]] = None) -> List[int]:
+    stop_token_ids = set(int(x) for x in (extra_stop_token_ids or []) if x is not None)
+    try:
+        im_start_ids = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+        if im_start_ids:
+            stop_token_ids.add(int(im_start_ids[-1]))
+    except Exception:
+        pass
+    return sorted(stop_token_ids)
+
+
+def _response_hits_local_stop(
+    response_ids: List[int],
+    new_tokens: List[int],
+    stop_token_ids: set[int],
+    stop_seq_token_ids: List[List[int]],
+) -> bool:
+    if stop_token_ids and any(int(t) in stop_token_ids for t in (new_tokens or [])):
+        return True
+    if response_ids and stop_seq_token_ids:
+        for seq_ids in stop_seq_token_ids:
+            if seq_ids and len(response_ids) >= len(seq_ids) and response_ids[-len(seq_ids):] == seq_ids:
+                return True
+    return False
+
+
 # Prefer online-canonical verifier prompts from the shared hint injection module.
 try:
     _inj_prompts0 = _get_online_hint_injection_module()
@@ -594,7 +664,7 @@ def _hint_allowed(hint: str, previous_hints: List[str]) -> bool:
 def _format_hint_text(*, hint: str, response_ids: List[int], tokenizer) -> str:
     inj = _get_online_hint_injection_module()
     try:
-        tail = tokenizer.decode(response_ids[-32:], skip_special_tokens=True) if response_ids else ""
+        tail = tokenizer.decode(response_ids[-128:], skip_special_tokens=True) if response_ids else ""
     except Exception:
         tail = ""
     return inj.format_hint_text(hint=(hint or ""), tail_text=tail)
@@ -614,21 +684,30 @@ def _infer_lora_rank(lora_dir: Path, default_rank: int = 64) -> int:
 def _init_vllm_engine(
     *,
     model_dir: Path,
+    tokenizer_dir: Optional[Path],
     verifier_lora_dir: Optional[Path],
     tensor_parallel_size: int,
     gpu_memory_utilization: float,
     max_model_len: int,
+    enforce_eager: bool = False,
+    max_num_batched_tokens: int = 0,
+    enable_chunked_prefill: Optional[bool] = None,
 ):
     from vllm import LLM
 
     kwargs: Dict[str, Any] = {
         "model": str(model_dir),
-        "tokenizer": str(model_dir),
+        "tokenizer": str(tokenizer_dir if tokenizer_dir is not None else model_dir),
         "trust_remote_code": True,
         "tensor_parallel_size": int(tensor_parallel_size),
         "gpu_memory_utilization": float(gpu_memory_utilization),
         "max_model_len": int(max_model_len),
+        "enforce_eager": bool(enforce_eager),
     }
+    if int(max_num_batched_tokens) > 0:
+        kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+    if enable_chunked_prefill is not None:
+        kwargs["enable_chunked_prefill"] = bool(enable_chunked_prefill)
     if verifier_lora_dir is not None:
         lora_rank = _infer_lora_rank(verifier_lora_dir, default_rank=64)
         kwargs.update(
@@ -651,6 +730,7 @@ def _vllm_generate_tokens(
     top_p: float,
     top_k: int,
     stop_token_ids: List[int],
+    stop_sequences: Optional[List[str]] = None,
     seed: Optional[int],
     lora_request: Optional[object] = None,
 ) -> Tuple[List[int], str, float]:
@@ -665,6 +745,7 @@ def _vllm_generate_tokens(
         top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
         max_tokens=int(max_tokens),
         stop_token_ids=[int(x) for x in (stop_token_ids or [])],
+        stop=list(stop_sequences or []),
         seed=int(seed) if seed is not None else None,
     )
     out = llm.generate(
@@ -687,6 +768,7 @@ def _vllm_generate_tokens_with_logprobs(
     top_p: float,
     top_k: int,
     stop_token_ids: List[int],
+    stop_sequences: Optional[List[str]] = None,
     seed: Optional[int],
     logprobs: int,
     lora_request: Optional[object] = None,
@@ -702,6 +784,7 @@ def _vllm_generate_tokens_with_logprobs(
         top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
         max_tokens=int(max_tokens),
         stop_token_ids=[int(x) for x in (stop_token_ids or [])],
+        stop=list(stop_sequences or []),
         seed=int(seed) if seed is not None else None,
         logprobs=int(logprobs) if int(logprobs) > 0 else 0,
     )
@@ -728,6 +811,7 @@ def _vllm_generate_batch(
     top_p: float,
     top_k: int,
     stop_token_ids: List[int],
+    stop_sequences: Optional[List[str]] = None,
     seed: Optional[int],
     lora_requests: Optional[List[object]] = None,
 ) -> Tuple[List[List[int]], List[str], float]:
@@ -750,6 +834,7 @@ def _vllm_generate_batch(
                 top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
                 max_tokens=int(mt),
                 stop_token_ids=stop_ids,
+                stop=list(stop_sequences or []),
                 seed=seed_i,
             )
             for mt in max_tokens
@@ -762,6 +847,7 @@ def _vllm_generate_batch(
             top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
             max_tokens=int(max_tokens),
             stop_token_ids=stop_ids,
+            stop=list(stop_sequences or []),
             seed=seed_i,
         )
     out = llm.generate(
@@ -790,6 +876,7 @@ def _vllm_generate_batch_with_logprobs(
     top_p: float,
     top_k: int,
     stop_token_ids: List[int],
+    stop_sequences: Optional[List[str]] = None,
     seed: Optional[int],
     logprobs: int,
     lora_requests: Optional[List[object]] = None,
@@ -814,6 +901,7 @@ def _vllm_generate_batch_with_logprobs(
                 top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
                 max_tokens=int(mt),
                 stop_token_ids=stop_ids,
+                stop=list(stop_sequences or []),
                 seed=seed_i,
                 logprobs=lp,
             )
@@ -827,6 +915,7 @@ def _vllm_generate_batch_with_logprobs(
             top_k=int(top_k) if top_k is not None and int(top_k) > 0 else 0,
             max_tokens=int(max_tokens),
             stop_token_ids=stop_ids,
+            stop=list(stop_sequences or []),
             seed=seed_i,
             logprobs=lp,
         )
@@ -937,6 +1026,7 @@ def _generate_control_vllm(
         top_p=top_p,
         top_k=top_k,
         stop_token_ids=stop_token_ids,
+        stop_sequences=None,
         seed=seed,
         lora_request=None,
     )
@@ -977,9 +1067,11 @@ def _generate_with_verifier_vllm(
         )
 
     inj = _get_online_hint_injection_module()
-    eos_token_ids = _normalize_eos_token_ids(getattr(tokenizer, "eos_token_id", None))
-    eos_id = int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
-    stop_set = set(int(x) for x in (stop_token_ids or []) if x is not None)
+    stop_cfg = _build_step_boundary_stop_config(tokenizer, stop_token_ids)
+    eos_token_ids = set(int(x) for x in (stop_cfg.get("eos_token_ids") or []))
+    terminal_stop_set = set(int(x) for x in (stop_cfg.get("stop_token_ids") or []))
+    boundary_stop_set = set(int(x) for x in (stop_cfg.get("stop_token_ids") or []))
+    stop_seq_token_ids = list(stop_cfg.get("stop_seq_token_ids") or [])
 
     response_ids: List[int] = []
     interventions: List[Dict[str, Any]] = []
@@ -1009,6 +1101,7 @@ def _generate_with_verifier_vllm(
             # Match training (vllm_rollout_spmd.py): do NOT pass stop_token_ids into vLLM;
             # stop tokens are handled locally for boundary detection.
             stop_token_ids=[],
+            stop_sequences=None,
             seed=seed,
             lora_request=None,
         )
@@ -1019,14 +1112,16 @@ def _generate_with_verifier_vllm(
         model_gen_tokens += len(new_tokens)
         tokens_since_boundary += len(new_tokens)
 
-        if eos_id is not None and eos_id in new_tokens:
+        if terminal_stop_set and any(int(t) in terminal_stop_set for t in (new_tokens or [])):
             break
 
         if len(interventions) >= int(max_interventions):
             continue
 
         # Stop boundary (training uses this for stop detection; verifier call happens every step regardless).
-        if tokens_since_boundary >= int(min_step_tokens) and stop_set and any(int(t) in stop_set for t in new_tokens):
+        if tokens_since_boundary >= int(min_step_tokens) and _response_hits_local_stop(
+            response_ids, new_tokens, boundary_stop_set, stop_seq_token_ids
+        ):
             tokens_since_boundary = 0
 
         current_reasoning = tokenizer.decode(response_ids, skip_special_tokens=True)
@@ -1048,6 +1143,7 @@ def _generate_with_verifier_vllm(
             top_p=1.0,
             top_k=1,
             stop_token_ids=[],
+            stop_sequences=None,
             seed=None,
             logprobs=1,
             lora_request=verifier_lora_req,
@@ -1119,12 +1215,131 @@ class _ExpState:
     prompt_ids: List[int]
     prompt_text: str
     response_ids: List[int]
+    loss_masks: List[int]
     interventions: List[Dict[str, Any]]
     previous_hints: List[str]
     tokens_since_boundary: int
     model_gen_tokens: int
     is_complete: bool
+    pending_complete_reason: Optional[str] = None
+    prethink_rollback_used: bool = False
     error: Optional[str] = None
+
+
+def _rollback_exp_state_to_keep_len(state: _ExpState, keep_len: int) -> bool:
+    inj = _get_online_hint_injection_module()
+    raw_state = {
+        "response_tokens": list(state.response_ids),
+        "loss_masks": list(state.loss_masks),
+        "gen_len": int(state.model_gen_tokens),
+    }
+    ok = bool(inj.rollback_state_to_keep_len(raw_state, int(keep_len)))
+    if not ok:
+        return False
+    state.response_ids = list(raw_state.get("response_tokens") or [])
+    state.loss_masks = list(raw_state.get("loss_masks") or [])
+    try:
+        state.model_gen_tokens = int(raw_state.get("gen_len") or 0)
+    except Exception:
+        pass
+    return True
+
+
+def _compute_exp_anchor_keep(
+    state: _ExpState,
+    tokenizer,
+    stop_token_ids_set: set[int],
+    *,
+    hint_rollback_window_tokens: int = 512,
+    pending_hint_tail_decode_tokens: int = 128,
+) -> Tuple[int, bool, bool]:
+    inj = _get_online_hint_injection_module()
+
+    hint_anchor_keep = len(state.response_ids)
+    try:
+        tail_keep = inj.compute_tail_rollback_keep_len(
+            state.response_ids,
+            tokenizer,
+            int(hint_rollback_window_tokens),
+        )
+        if tail_keep is not None:
+            hint_anchor_keep = int(tail_keep)
+    except Exception:
+        pass
+
+    last_hint_keep = 0
+    try:
+        last_hint_keep = int(inj.last_hint_end(state.loss_masks))
+        if last_hint_keep > int(hint_anchor_keep):
+            hint_anchor_keep = int(last_hint_keep)
+    except Exception:
+        last_hint_keep = 0
+
+    if state.pending_complete_reason == "eos":
+        try:
+            if (
+                int(hint_anchor_keep) > 0
+                and int(state.response_ids[int(hint_anchor_keep) - 1]) in stop_token_ids_set
+            ):
+                hint_anchor_keep = max(int(last_hint_keep), int(hint_anchor_keep) - 1)
+        except Exception:
+            pass
+
+    use_prethink_anchor = False
+    anchor_tokens = state.response_ids[: int(hint_anchor_keep)]
+    try:
+        has_safe_think_anchor = inj.find_think_close_pos(anchor_tokens, tokenizer) is not None
+        is_post_think_finalized = bool(
+            inj.is_post_think_finalized(
+                anchor_tokens,
+                tokenizer,
+                decode_tail_tokens=int(pending_hint_tail_decode_tokens),
+            )
+        )
+    except Exception:
+        has_safe_think_anchor = False
+        is_post_think_finalized = False
+
+    if (not state.prethink_rollback_used) and (not has_safe_think_anchor) and is_post_think_finalized:
+        try:
+            prethink_keep = inj.find_prethink_rollback_keep_len(anchor_tokens, tokenizer)
+        except Exception:
+            prethink_keep = None
+        if prethink_keep is not None and int(prethink_keep) < int(hint_anchor_keep):
+            hint_anchor_keep = int(prethink_keep)
+            use_prethink_anchor = True
+            try:
+                tail_keep = inj.compute_tail_rollback_keep_len(
+                    state.response_ids[: int(hint_anchor_keep)],
+                    tokenizer,
+                    int(hint_rollback_window_tokens),
+                )
+                if tail_keep is not None:
+                    hint_anchor_keep = int(tail_keep)
+            except Exception:
+                pass
+            try:
+                last_hint_keep = int(inj.last_hint_end(state.loss_masks))
+                if last_hint_keep > int(hint_anchor_keep):
+                    hint_anchor_keep = int(last_hint_keep)
+            except Exception:
+                pass
+            anchor_tokens = state.response_ids[: int(hint_anchor_keep)]
+            try:
+                has_safe_think_anchor = inj.find_think_close_pos(anchor_tokens, tokenizer) is not None
+                is_post_think_finalized = bool(
+                    inj.is_post_think_finalized(
+                        anchor_tokens,
+                        tokenizer,
+                        decode_tail_tokens=int(pending_hint_tail_decode_tokens),
+                    )
+                )
+            except Exception:
+                has_safe_think_anchor = False
+                is_post_think_finalized = False
+
+    anchor_insertable = bool(has_safe_think_anchor or (not is_post_think_finalized))
+    return int(hint_anchor_keep), bool(use_prethink_anchor), bool(anchor_insertable)
 
 
 def _generate_with_verifier_vllm_batch(
@@ -1138,6 +1353,9 @@ def _generate_with_verifier_vllm_batch(
     token_check_interval: int,
     min_step_tokens: int,
     max_interventions: int,
+    token_check_interval_late: int,
+    token_check_late_start_tokens: int,
+    verifier_skip_budget_tokens: int,
     verifier_max_prompt_length: int,
     verifier_max_new_tokens: int,
     verifier_max_hint_tokens: int,
@@ -1147,6 +1365,8 @@ def _generate_with_verifier_vllm_batch(
     top_p: float,
     top_k: int,
     stop_token_ids: List[int],
+    hint_rollback_window_tokens: int,
+    pending_hint_tail_decode_tokens: int,
     seed: Optional[int],
 ) -> None:
     """
@@ -1165,9 +1385,12 @@ def _generate_with_verifier_vllm_batch(
         )
 
     inj = _get_online_hint_injection_module()
-    eos_token_ids = _normalize_eos_token_ids(getattr(tokenizer, "eos_token_id", None))
-    eos_id = int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
-    stop_set = set(int(x) for x in (stop_token_ids or []) if x is not None)
+    stop_cfg = _build_step_boundary_stop_config(tokenizer, stop_token_ids)
+    eos_token_ids = set(int(x) for x in (stop_cfg.get("eos_token_ids") or []))
+    terminal_stop_set = set(int(x) for x in (stop_cfg.get("stop_token_ids") or []))
+    boundary_stop_set = set(int(x) for x in (stop_cfg.get("stop_token_ids") or []))
+    stop_seq_token_ids = list(stop_cfg.get("stop_seq_token_ids") or [])
+    stop_token_ids_set = set(int(x) for x in (stop_token_ids or []))
 
     t0 = time.time()
     while True:
@@ -1203,6 +1426,7 @@ def _generate_with_verifier_vllm_batch(
                 top_p=top_p,
                 top_k=top_k,
                 stop_token_ids=[],  # local stop detection only
+                stop_sequences=None,
                 seed=seed,
                 lora_requests=None,
             )
@@ -1218,29 +1442,64 @@ def _generate_with_verifier_vllm_batch(
                 s.is_complete = True
                 continue
             s.response_ids.extend(new_tokens)
+            s.loss_masks.extend([1] * len(new_tokens))
             s.model_gen_tokens += len(new_tokens)
             s.tokens_since_boundary += len(new_tokens)
-            if eos_id is not None and eos_id in new_tokens:
-                s.is_complete = True
+            if terminal_stop_set and any(int(t) in terminal_stop_set for t in (new_tokens or [])):
+                s.pending_complete_reason = "eos"
                 continue
             if s.model_gen_tokens >= int(max_model_tokens):
                 s.is_complete = True
                 continue
 
-            # Local stop detection with minimum token gap (used for boundary reset only).
-            if s.tokens_since_boundary >= int(min_step_tokens) and stop_set and any(int(t) in stop_set for t in new_tokens):
-                s.tokens_since_boundary = 0
+            # Local stop detection is only used for boundary semantics; unlike the
+            # old offline version, do not reset the periodic window here.
+            _ = _response_hits_local_stop(s.response_ids, new_tokens, boundary_stop_set, stop_seq_token_ids)
 
         # Prepare verifier calls (batched) for samples still eligible.
         verifier_batch: List[_ExpState] = []
         verifier_prompt_ids_list: List[List[int]] = []
+        verifier_anchor_keep_list: List[int] = []
+        verifier_use_prethink_anchor_list: List[bool] = []
         for s in states:
             if s.is_complete:
                 continue
-            if len(s.interventions) >= int(max_interventions):
+            effective_token_check_interval = int(token_check_interval)
+            if (
+                int(token_check_interval_late) > 0
+                and int(token_check_late_start_tokens) > 0
+                and int(s.model_gen_tokens) >= int(token_check_late_start_tokens)
+            ):
+                effective_token_check_interval = int(token_check_interval_late)
+            periodic_threshold = max(int(min_step_tokens), int(effective_token_check_interval))
+            periodic_hit = int(s.tokens_since_boundary) >= int(periodic_threshold)
+            final_boundary_hit = s.pending_complete_reason is not None
+            should_request_verifier = (
+                final_boundary_hit or periodic_hit
+            ) and (len(s.interventions) < int(max_interventions))
+            if not should_request_verifier:
                 continue
             try:
-                current_reasoning = tokenizer.decode(s.response_ids, skip_special_tokens=True)
+                remaining_after_step = max(0, int(max_model_tokens) - int(s.model_gen_tokens))
+                if (
+                    int(verifier_skip_budget_tokens) > 0
+                    and int(remaining_after_step) < int(verifier_skip_budget_tokens)
+                ):
+                    s.tokens_since_boundary = 0
+                    continue
+                s.tokens_since_boundary = 0
+                hint_anchor_keep, use_prethink_anchor, anchor_insertable = _compute_exp_anchor_keep(
+                    s,
+                    tokenizer,
+                    stop_token_ids_set,
+                    hint_rollback_window_tokens=hint_rollback_window_tokens,
+                    pending_hint_tail_decode_tokens=pending_hint_tail_decode_tokens,
+                )
+                if not anchor_insertable:
+                    continue
+                current_reasoning = tokenizer.decode(
+                    s.response_ids[: int(hint_anchor_keep)], skip_special_tokens=True
+                )
                 vp_ids = _build_verifier_prompt_ids(
                     tokenizer,
                     question=s.prompt_text,
@@ -1251,6 +1510,8 @@ def _generate_with_verifier_vllm_batch(
                 )
                 verifier_batch.append(s)
                 verifier_prompt_ids_list.append(vp_ids)
+                verifier_anchor_keep_list.append(int(hint_anchor_keep))
+                verifier_use_prethink_anchor_list.append(bool(use_prethink_anchor))
             except Exception as e:
                 # If verifier prompt build fails, just skip verifier for this step.
                 s.error = f"verifier_prompt_build_error: {e}"
@@ -1271,6 +1532,7 @@ def _generate_with_verifier_vllm_batch(
                 top_p=1.0,
                 top_k=1,
                 stop_token_ids=[],
+                stop_sequences=None,
                 seed=None,
                 logprobs=1,
                 lora_requests=verifier_lora_requests,
@@ -1280,8 +1542,14 @@ def _generate_with_verifier_vllm_batch(
                 s.error = f"verifier_generate_error: {e}"
             continue
 
-        for s, v_tokens, v_text, v_logprobs in zip(
-            verifier_batch, v_token_lists, v_texts, v_logprobs_lists
+        intervened_this_round: set[int] = set()
+        for s, v_tokens, v_text, v_logprobs, hint_anchor_keep, use_prethink_anchor in zip(
+            verifier_batch,
+            v_token_lists,
+            v_texts,
+            v_logprobs_lists,
+            verifier_anchor_keep_list,
+            verifier_use_prethink_anchor_list,
         ):
             if not v_text and v_tokens:
                 v_text = tokenizer.decode(v_tokens, skip_special_tokens=True)
@@ -1308,15 +1576,24 @@ def _generate_with_verifier_vllm_batch(
             if not _hint_allowed(decision.hint, s.previous_hints):
                 continue
 
+            if int(hint_anchor_keep) < len(s.response_ids):
+                _rollback_exp_state_to_keep_len(s, int(hint_anchor_keep))
+            if use_prethink_anchor:
+                s.prethink_rollback_used = True
+
             hint_text = _format_hint_text(hint=decision.hint, response_ids=s.response_ids, tokenizer=tokenizer)
             hint_ids = tokenizer.encode(hint_text, add_special_tokens=False)
             hint_applied = False
             if hint_ids:
-                state = {"response_tokens": s.response_ids, "loss_masks": [1] * len(s.response_ids)}
+                state = {"response_tokens": s.response_ids, "loss_masks": s.loss_masks}
                 hint_applied = bool(inj.insert_hint_tokens(state, hint_ids, tokenizer, eos_token_ids))
                 if hint_applied:
+                    s.response_ids = list(state.get("response_tokens") or [])
+                    s.loss_masks = list(state.get("loss_masks") or [])
                     s.previous_hints.append(decision.hint)
-                    s.tokens_since_boundary = 0  # align with online behavior
+                    s.tokens_since_boundary = 0
+                    s.pending_complete_reason = None
+                    intervened_this_round.add(int(s.idx))
             if not hint_applied:
                 continue
 
@@ -1332,6 +1609,12 @@ def _generate_with_verifier_vllm_batch(
                 }
             )
 
+        for s in states:
+            if s.is_complete:
+                continue
+            if s.pending_complete_reason is not None and int(s.idx) not in intervened_this_round:
+                s.is_complete = True
+
     # Attach timing info per-sample (roughly equal across the batch).
     dt = float(time.time() - t0)
     for s in states:
@@ -1345,6 +1628,11 @@ def main() -> int:
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--base-model", default=None)
     ap.add_argument("--verifier-lora", default=None)
+    ap.add_argument(
+        "--tokenizer-path",
+        default="",
+        help="Optional tokenizer dir. If set, use it for prompt encoding and vLLM tokenizer init.",
+    )
 
     ap.add_argument("--prompts-file", default=None)
     ap.add_argument("--prompt-key", default="prompt")
@@ -1361,6 +1649,9 @@ def main() -> int:
     ap.add_argument("--token-check-interval", type=int, default=4096)
     ap.add_argument("--min-step-tokens", type=int, default=4096)
     ap.add_argument("--max-interventions", type=int, default=5)
+    ap.add_argument("--token-check-interval-late", type=int, default=0)
+    ap.add_argument("--token-check-late-start-tokens", type=int, default=0)
+    ap.add_argument("--verifier-skip-budget-tokens", type=int, default=0)
     ap.add_argument(
         "--confidence-threshold",
         type=float,
@@ -1378,6 +1669,8 @@ def main() -> int:
     ap.add_argument("--verifier-max-prompt-length", type=int, default=16384)
     ap.add_argument("--verifier-max-new-tokens", type=int, default=2048)
     ap.add_argument("--verifier-max-hint-tokens", type=int, default=512)
+    ap.add_argument("--hint-rollback-window-tokens", type=int, default=512)
+    ap.add_argument("--pending-hint-tail-decode-tokens", type=int, default=128)
 
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=1.0)
@@ -1388,6 +1681,21 @@ def main() -> int:
     ap.add_argument("--vllm-tp", type=int, default=1)
     ap.add_argument("--vllm-gpu-mem-util", type=float, default=0.8)
     ap.add_argument("--vllm-max-model-len", type=int, default=0)
+    ap.add_argument("--vllm-enforce-eager", action="store_true")
+    ap.add_argument("--vllm-max-num-batched-tokens", type=int, default=0)
+    ap.add_argument(
+        "--vllm-enable-chunked-prefill",
+        dest="vllm_enable_chunked_prefill",
+        action="store_true",
+        help="Force enable chunked prefill for vLLM.",
+    )
+    ap.add_argument(
+        "--vllm-disable-chunked-prefill",
+        dest="vllm_enable_chunked_prefill",
+        action="store_false",
+        help="Force disable chunked prefill for vLLM.",
+    )
+    ap.set_defaults(vllm_enable_chunked_prefill=None)
     ap.add_argument("--batch-size", type=int, default=1, help="Batch size for vLLM (control + exp).")
 
     ap.add_argument("--lmdeploy-backend", default="pytorch", choices=["pytorch", "turbomind"])
@@ -1440,7 +1748,13 @@ def main() -> int:
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     device_map = None if str(args.device_map).lower() in ("none", "null", "") else args.device_map
 
-    tokenizer = _load_tokenizer(str(base_model_dir))
+    tokenizer_dir: Optional[Path] = None
+    if str(args.tokenizer_path or "").strip():
+        tokenizer_dir = Path(args.tokenizer_path).resolve()
+        if not tokenizer_dir.exists():
+            raise SystemExit(f"tokenizer_path not found: {tokenizer_dir}")
+
+    tokenizer = _load_tokenizer(str(tokenizer_dir if tokenizer_dir is not None else base_model_dir))
     # Load training chat_template if present.
     if verifier_lora_dir is not None:
         tmpl = verifier_lora_dir / "chat_template.jinja"
@@ -1485,10 +1799,14 @@ def main() -> int:
     else:
         llm = _init_vllm_engine(
             model_dir=base_model_dir,
+            tokenizer_dir=tokenizer_dir,
             verifier_lora_dir=verifier_lora_dir,
             tensor_parallel_size=args.vllm_tp,
             gpu_memory_utilization=args.vllm_gpu_mem_util,
             max_model_len=max_model_len,
+            enforce_eager=bool(args.vllm_enforce_eager),
+            max_num_batched_tokens=int(args.vllm_max_num_batched_tokens),
+            enable_chunked_prefill=args.vllm_enable_chunked_prefill,
         )
 
     prompt_items: List[Tuple[Any, Dict[str, Any]]] = []
@@ -1558,6 +1876,7 @@ def main() -> int:
             if run_control:
                 if args.backend == "vllm":
                     assert llm is not None
+                    control_stop_token_ids = _build_control_stop_token_ids(tokenizer, stop_token_ids)
                     token_lists, texts, dt = _vllm_generate_batch(
                         llm,
                         prompt_token_ids_list=prompt_ids_list,
@@ -1565,7 +1884,8 @@ def main() -> int:
                         temperature=float(args.temperature),
                         top_p=float(args.top_p),
                         top_k=int(args.top_k),
-                        stop_token_ids=stop_token_ids,
+                        stop_token_ids=control_stop_token_ids,
+                        stop_sequences=None,
                         seed=seed,
                         lora_requests=None,
                     )
@@ -1609,6 +1929,7 @@ def main() -> int:
                             prompt_ids=list(p_ids),
                             prompt_text=str(p_text),
                             response_ids=[],
+                            loss_masks=[],
                             interventions=[],
                             previous_hints=[],
                             tokens_since_boundary=0,
@@ -1627,6 +1948,9 @@ def main() -> int:
                     token_check_interval=int(args.token_check_interval),
                     min_step_tokens=int(args.min_step_tokens),
                     max_interventions=int(args.max_interventions),
+                    token_check_interval_late=int(args.token_check_interval_late),
+                    token_check_late_start_tokens=int(args.token_check_late_start_tokens),
+                    verifier_skip_budget_tokens=int(args.verifier_skip_budget_tokens),
                     verifier_max_prompt_length=int(args.verifier_max_prompt_length),
                     verifier_max_new_tokens=int(args.verifier_max_new_tokens),
                     verifier_max_hint_tokens=int(args.verifier_max_hint_tokens),
@@ -1636,6 +1960,8 @@ def main() -> int:
                     top_p=float(args.top_p),
                     top_k=int(args.top_k),
                     stop_token_ids=stop_token_ids,
+                    hint_rollback_window_tokens=int(args.hint_rollback_window_tokens),
+                    pending_hint_tail_decode_tokens=int(args.pending_hint_tail_decode_tokens),
                     seed=seed,
                 )
 

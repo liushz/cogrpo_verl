@@ -2765,6 +2765,10 @@ class vLLMRollout(BaseRollout):
             "verifier_wait_conf_missing": 0,
             "verifier_wait_conf_invalid": 0,
             "verifier_wait_blocked_low_conf": 0,
+            "verifier_request_candidates": 0,
+            "verifier_skipped_low_budget": 0,
+            "token_check_interval_effective_sum": 0.0,
+            "token_check_interval_effective_count": 0,
         }
 
         # Verifier PPO trajectories (only intervention steps are used for training).
@@ -2798,6 +2802,17 @@ class vLLMRollout(BaseRollout):
         min_step_tokens = int(
             kwargs.get("min_step_tokens", token_check_interval)
         )  # FIX: Extract from kwargs
+        verifier_skip_budget_tokens = int(kwargs.get("verifier_skip_budget_tokens", 0))
+        token_check_late_start_tokens = int(
+            kwargs.get("token_check_late_start_tokens", 0)
+        )
+        token_check_interval_late = int(kwargs.get("token_check_interval_late", 0))
+        if verifier_skip_budget_tokens < 0:
+            verifier_skip_budget_tokens = 0
+        if token_check_late_start_tokens < 0:
+            token_check_late_start_tokens = 0
+        if token_check_interval_late < 0:
+            token_check_interval_late = 0
 
         # Context budget: prompt + response(gen budget) + hint headroom
         # Reserve space for hints so that hint insertion doesn't cause context_exhausted.
@@ -3275,7 +3290,18 @@ class vLLMRollout(BaseRollout):
                 # Verifier trigger policy (strict):
                 # 1) periodic trigger every min_step_tokens policy tokens;
                 # 2) for short outputs near completion, allow one final trigger.
-                periodic_hit = state["tokens_since_boundary"] >= min_step_tokens
+                post_step_gen_len = int(state.get("gen_len") or 0)
+                effective_token_check_interval = int(token_check_interval)
+                if (
+                    token_check_interval_late > 0
+                    and token_check_late_start_tokens > 0
+                    and post_step_gen_len >= token_check_late_start_tokens
+                ):
+                    effective_token_check_interval = int(token_check_interval_late)
+                periodic_threshold = max(
+                    int(min_step_tokens), int(effective_token_check_interval)
+                )
+                periodic_hit = state["tokens_since_boundary"] >= periodic_threshold
                 final_boundary_hit = pending_complete_reason is not None
                 should_trigger_verifier = periodic_hit or final_boundary_hit
 
@@ -3287,6 +3313,20 @@ class vLLMRollout(BaseRollout):
                 )
 
                 if should_request_verifier:
+                    metrics["verifier_request_candidates"] += 1
+                    metrics["token_check_interval_effective_sum"] += float(
+                        effective_token_check_interval
+                    )
+                    metrics["token_check_interval_effective_count"] += 1
+                    remaining_after_step = max(0, response_budget - post_step_gen_len)
+                    if (
+                        verifier_skip_budget_tokens > 0
+                        and remaining_after_step < verifier_skip_budget_tokens
+                    ):
+                        metrics["verifier_skipped_low_budget"] += 1
+                        state["tokens_since_boundary"] = 0
+                        state["_pending_complete_reason"] = pending_complete_reason
+                        continue
                     if boundary_hit:
                         metrics["stop_sequence_hits"] += 1
                     # Reset periodic window only when a verifier request is actually issued.
@@ -3704,6 +3744,9 @@ class vLLMRollout(BaseRollout):
         # 7. 记录监控指标
         wait_total = metrics["verifier_wait_total"]
         wait_conf_count = metrics["verifier_wait_conf_count"]
+        verifier_request_candidates = metrics["verifier_request_candidates"]
+        verifier_skipped_low_budget = metrics["verifier_skipped_low_budget"]
+        interval_effective_count = metrics["token_check_interval_effective_count"]
         timing_info["exp_metrics"] = {
             "avg_steps": sum(s["step_count"] for s in sample_states) / batch_size
             if batch_size > 0
@@ -3760,6 +3803,17 @@ class vLLMRollout(BaseRollout):
             / wait_total
             if wait_total > 0
             else 0,
+            "verifier_skipped_low_budget_count": verifier_skipped_low_budget,
+            "verifier_skipped_low_budget_ratio": verifier_skipped_low_budget
+            / verifier_request_candidates
+            if verifier_request_candidates > 0
+            else 0,
+            "token_check_interval_effective_mean": metrics[
+                "token_check_interval_effective_sum"
+            ]
+            / interval_effective_count
+            if interval_effective_count > 0
+            else float(token_check_interval),
         }
         logger.info(
             f"[BY_STEP] metrics: avg_steps={timing_info['exp_metrics']['avg_steps']:.1f}, "
@@ -3768,6 +3822,7 @@ class vLLMRollout(BaseRollout):
             f"wait_blocked_low_conf={metrics['verifier_wait_blocked_low_conf']}, "
             f"wait_conf_mean={timing_info['exp_metrics']['wait_conf_mean']:.4f}, "
             f"hint_skipped_late_stage={metrics['hint_skipped_late_stage']}, "
+            f"verifier_skipped_low_budget={verifier_skipped_low_budget}/{verifier_request_candidates}, "
             f"verifier_skipped_no_insert_anchor={metrics['verifier_skipped_no_insert_anchor']}, "
             f"errors={metrics['errors']}"
         )

@@ -22,6 +22,78 @@ import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+
+DEFAULT_OC_REPO_ROOT = "/mnt/shared-storage-user/opencompass-shared/qa-llm-cicd/opencompass-main2/opencompass"
+
+
+def _iter_url_like_strings(obj: Any) -> List[str]:
+    urls: List[str] = []
+    if isinstance(obj, str):
+        text = obj.strip()
+        if text.startswith("http://") or text.startswith("https://"):
+            urls.append(text)
+        return urls
+    if isinstance(obj, dict):
+        for value in obj.values():
+            urls.extend(_iter_url_like_strings(value))
+        return urls
+    if isinstance(obj, (list, tuple, set)):
+        for value in obj:
+            urls.extend(_iter_url_like_strings(value))
+    return urls
+
+
+def _collect_internal_no_proxy_hosts(*objs: Any) -> List[str]:
+    hosts: List[str] = []
+    seen = set()
+
+    def _add(host: str) -> None:
+        host = str(host or "").strip()
+        if not host or host in seen:
+            return
+        seen.add(host)
+        hosts.append(host)
+
+    for obj in objs:
+        for url in _iter_url_like_strings(obj):
+            try:
+                parsed = urlparse(url)
+            except Exception:
+                continue
+            host = str(parsed.hostname or "").strip()
+            if not host:
+                continue
+            _add(host)
+            if host.endswith(".svc"):
+                _add(".svc")
+            parts = host.split(".")
+            for i in range(1, len(parts)):
+                suffix = "." + ".".join(parts[i:])
+                if suffix.endswith(".svc") or suffix.endswith(".cluster.local") or suffix.endswith(".local"):
+                    _add(suffix)
+    return hosts
+
+
+def _extend_no_proxy(hosts: List[str]) -> List[str]:
+    if not hosts:
+        return []
+
+    existing_raw = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "").strip()
+    existing = [item.strip() for item in existing_raw.split(",") if item.strip()]
+    merged: List[str] = []
+    seen = set()
+    for item in existing + list(hosts):
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    merged_value = ",".join(merged)
+    os.environ["NO_PROXY"] = merged_value
+    os.environ["no_proxy"] = merged_value
+    return merged
 
 
 def _is_writable_dir(path: Path) -> bool:
@@ -87,6 +159,22 @@ def _setup_runtime_cache_env() -> Dict[str, str]:
         os.environ["HF_HUB_CACHE"] = str(chosen_hub)
 
     os.environ.setdefault("TRANSFORMERS_CACHE", str(chosen_hub))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ.setdefault("HF_EVALUATE_OFFLINE", "1")
+
+    tiktoken_cache_env = (os.environ.get("TIKTOKEN_CACHE_DIR") or "").strip()
+    if tiktoken_cache_env:
+        tiktoken_cache = Path(tiktoken_cache_env).expanduser()
+    else:
+        shared_tiktoken = Path("/mnt/shared-storage-user/auto-eval-pipeline/opencompass/llmeval/share_tiktoken")
+        if _is_readable_dir(shared_tiktoken):
+            tiktoken_cache = shared_tiktoken
+        else:
+            tiktoken_cache = root / "tiktoken"
+            _is_writable_dir(tiktoken_cache)
+    os.environ["TIKTOKEN_CACHE_DIR"] = str(tiktoken_cache)
     return {k: str(v) for k, v in resolved.items()}
 
 
@@ -174,9 +262,9 @@ def _load_opencompass_repo(oc_repo_root: str) -> Path:
         candidates.append(Path(env_root).expanduser())
     candidates.extend(
         [
+            Path(DEFAULT_OC_REPO_ROOT),
             Path("/mnt/shared-storage-user/auto-eval-pipeline/opencompass@f1e50d4/opencompass"),
             Path("/mnt/shared-storage-user/auto-eval-pipeline/opencompass@f1e50d4.bak20260226-new/opencompass"),
-            Path("/mnt/shared-storage-user/opencompass-shared/qa-llm-cicd/opencompass-main2/opencompass"),
             Path("/mnt/shared-storage-user/opencompass-shared/liushudong/opencompass/opencompass"),
         ]
     )
@@ -596,7 +684,7 @@ def main() -> int:
     ap.add_argument("--llm-judge", default="auto", choices=["auto", "on", "off"])
     ap.add_argument(
         "--oc-repo-root",
-        default="/mnt/shared-storage-user/auto-eval-pipeline/opencompass@f1e50d4/opencompass",
+        default=DEFAULT_OC_REPO_ROOT,
         help="OpenCompass repo root directory.",
     )
     ap.add_argument("--oc-root", default="", help="OC report root containing configs/ (optional).")
@@ -642,7 +730,12 @@ def main() -> int:
 
     oc_repo_root_resolved = _load_opencompass_repo(args.oc_repo_root)
     print(f"[oc] repo_root={oc_repo_root_resolved}", file=sys.stderr)
-    from datasets import Dataset  # type: ignore
+    try:
+        from datasets import Dataset  # type: ignore
+    except Exception as exc:
+        raise SystemExit(
+            "Missing python dependency 'datasets'. Run this script in the OpenCompass eval env, e.g. `conda activate oc`."
+        ) from exc
     try:
         from opencompass.openicl.icl_evaluator import compute_g_pass_at_k  # type: ignore
     except Exception:
@@ -767,6 +860,16 @@ def main() -> int:
         max_workers=int(args.judge_max_workers),
         batch_size=int(args.judge_batch_size),
     )
+
+    judge_no_proxy_hosts: List[str] = []
+    if args.llm_judge != "off":
+        judge_no_proxy_hosts = _collect_internal_no_proxy_hosts(judge_cfg, dataset_evaluator_cfg)
+        if judge_no_proxy_hosts:
+            _extend_no_proxy(judge_no_proxy_hosts)
+            print(
+                f"[env] extended NO_PROXY for llm-judge: {','.join(judge_no_proxy_hosts)}",
+                file=sys.stderr,
+            )
 
     enable_llm_judge = (args.llm_judge == "on") or (args.llm_judge == "auto" and judge_cfg is not None)
     if args.llm_judge == "off":
@@ -948,6 +1051,7 @@ def main() -> int:
         "llm_judge_out_dir": llm_eval_base_out_dir,
         "llm_judge_runtime_fallback": bool(llm_judge_runtime_fallback),
         "llm_judge_runtime_error": llm_judge_runtime_error,
+        "judge_no_proxy_hosts": judge_no_proxy_hosts,
         "llm_evaluated": int(llm_evaluated),
         "llm_correct": int(llm_correct),
         "require_oc_judge_prompt": int(args.require_oc_judge_prompt),

@@ -1294,6 +1294,13 @@ class RayPPOTrainer:
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+            if self.config.algorithm.adv_estimator == AdvantageEstimator.CO_GRPO:
+                raise NotImplementedError(
+                    "Co-GRPO is not compatible with actor_rollout_ref.rollout.mode='async'. "
+                    "AsyncLLMServerManager only supports standard generate_sequences via OpenAI-compatible "
+                    "chat completions and does not implement Co-GRPO dual-stream/by-step interventions. "
+                    "Please set actor_rollout_ref.rollout.mode='sync' for Co-GRPO runs."
+                )
 
     def _co_grpo_convert_control_output(self, output: DataProto) -> DataProto:
         """Convert a standard rollout output to Co-GRPO control_* fields."""
@@ -1788,6 +1795,18 @@ class RayPPOTrainer:
                                             (int, float, np.integer, np.floating),
                                         ):
                                             metrics[f"co_grpo/exp_{key}"] = float(value)
+                                    special_exp_metric_keys = {
+                                        "verifier_skipped_low_budget_count": "co_grpo/verifier_skipped_low_budget_count",
+                                        "verifier_skipped_low_budget_ratio": "co_grpo/verifier_skipped_low_budget_ratio",
+                                        "token_check_interval_effective_mean": "co_grpo/token_check_interval_effective_mean",
+                                    }
+                                    for key, metric_name in special_exp_metric_keys.items():
+                                        value = exp_rollout_metrics.get(key)
+                                        if isinstance(
+                                            value,
+                                            (int, float, np.integer, np.floating),
+                                        ):
+                                            metrics[metric_name] = float(value)
 
                                 timing_raw.update(
                                     {
@@ -1878,18 +1897,12 @@ class RayPPOTrainer:
                                     cf_branch_reward_tail_tokens=cf_branch_reward_tail_tokens,
                                 )
                             else:
-                                # For async mode, we need to handle differently
-                                # For now, fall back to regular generation
-                                log.warning(
-                                    "Co-GRPO dual-stream rollout not yet supported in async mode, using regular generation"
+                                raise NotImplementedError(
+                                    "Co-GRPO is not compatible with actor_rollout_ref.rollout.mode='async'. "
+                                    "AsyncLLMServerManager only supports standard generate_sequences via OpenAI-compatible "
+                                    "chat completions and does not implement Co-GRPO dual-stream/by-step interventions. "
+                                    "Please set actor_rollout_ref.rollout.mode='sync' for Co-GRPO runs."
                                 )
-                                self.async_rollout_manager.wake_up()
-                                gen_batch_output = (
-                                    self.async_rollout_manager.generate_sequences(
-                                        gen_batch_repeated
-                                    )
-                                )
-                                self.async_rollout_manager.sleep()
                         else:
                             # Regular rollout
                             if not self.async_rollout_mode:
@@ -1918,6 +1931,18 @@ class RayPPOTrainer:
                                             (int, float, np.integer, np.floating),
                                         ):
                                             metrics[f"co_grpo/exp_{key}"] = float(value)
+                                    special_exp_metric_keys = {
+                                        "verifier_skipped_low_budget_count": "co_grpo/verifier_skipped_low_budget_count",
+                                        "verifier_skipped_low_budget_ratio": "co_grpo/verifier_skipped_low_budget_ratio",
+                                        "token_check_interval_effective_mean": "co_grpo/token_check_interval_effective_mean",
+                                    }
+                                    for key, metric_name in special_exp_metric_keys.items():
+                                        value = exp_rollout_metrics.get(key)
+                                        if isinstance(
+                                            value,
+                                            (int, float, np.integer, np.floating),
+                                        ):
+                                            metrics[metric_name] = float(value)
                                 timing_raw.update(
                                     {
                                         k: v

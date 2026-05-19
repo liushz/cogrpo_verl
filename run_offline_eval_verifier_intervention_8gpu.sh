@@ -121,7 +121,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OC_ROOT="${OC_ROOT:-/mnt/shared-storage-user/liuhongwei/main_works/repos/repro/data/oc_eval}"
 OC_PRED_ABBR="${OC_PRED_ABBR:-qwen2_5_7b_baseline_s20}"  # used to extract prompts/gold
 OC_RES_ABBR="${OC_RES_ABBR:-${OC_PRED_ABBR}}"           # used as baseline in results/
-OC_REPO_ROOT="${OC_REPO_ROOT:-/mnt/shared-storage-user/auto-eval-pipeline/opencompass@f1e50d4/opencompass}"
+OC_REPO_ROOT="${OC_REPO_ROOT:-/mnt/shared-storage-user/opencompass-shared/qa-llm-cicd/opencompass-main2/opencompass}"
 OC_EVAL_CONFIG="${OC_EVAL_CONFIG:-}"
 OC_LLM_JUDGE="${OC_LLM_JUDGE:-auto}"                    # auto|on|off
 OC_JUDGE_BATCH_SIZE="${OC_JUDGE_BATCH_SIZE:-64}"        # force judge batching for faster OC-aligned scoring
@@ -129,6 +129,8 @@ OC_JUDGE_QPS="${OC_JUDGE_QPS:-0}"                       # 0 means keep OC config
 OC_JUDGE_MAX_WORKERS="${OC_JUDGE_MAX_WORKERS:-0}"       # 0 means keep OC config
 OC_JUDGE_REPLICA_WORKERS="${OC_JUDGE_REPLICA_WORKERS:-1}"  # parallel over repeat replicas
 OC_REQUIRE_JUDGE_PROMPT="${OC_REQUIRE_JUDGE_PROMPT:-1}"    # 1: require judge prompt from OC evaluator cfg
+DO_OC_PRED_DIFF="${DO_OC_PRED_DIFF:-1}"
+OC_DIFF_TOP_N="${OC_DIFF_TOP_N:-20}"
 
 _is_usable_oc_repo() {
   local p="$1"
@@ -139,9 +141,9 @@ _resolve_oc_repo_root() {
   local p
   for p in \
     "${OC_REPO_ROOT}" \
+    "/mnt/shared-storage-user/opencompass-shared/qa-llm-cicd/opencompass-main2/opencompass" \
     "/mnt/shared-storage-user/auto-eval-pipeline/opencompass@f1e50d4/opencompass" \
     "/mnt/shared-storage-user/auto-eval-pipeline/opencompass@f1e50d4.bak20260226-new/opencompass" \
-    "/mnt/shared-storage-user/opencompass-shared/qa-llm-cicd/opencompass-main2/opencompass" \
     "/mnt/shared-storage-user/opencompass-shared/liushudong/opencompass/opencompass"
   do
     if _is_usable_oc_repo "${p}"; then
@@ -181,16 +183,40 @@ _ensure_writable_env_dir HF_DATASETS_CACHE "${OC_RUNTIME_CACHE_ROOT}/datasets"
 HF_HUB_CACHE_PREFERRED="${HF_HUB_CACHE_PREFERRED:-/mnt/shared-storage-user/large-model-center-share-weights/hf_hub}"
 _ensure_readable_or_local_env_dir HF_HUB_CACHE "${HF_HOME}/hub" "${HF_HUB_CACHE_PREFERRED}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HUB_CACHE}}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+export HF_EVALUATE_OFFLINE="${HF_EVALUATE_OFFLINE:-1}"
+TIKTOKEN_CACHE_PREFERRED="${TIKTOKEN_CACHE_PREFERRED:-/mnt/shared-storage-user/auto-eval-pipeline/opencompass/llmeval/share_tiktoken}"
+if [[ -d "${TIKTOKEN_CACHE_PREFERRED}" && -r "${TIKTOKEN_CACHE_PREFERRED}" ]]; then
+  export TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-${TIKTOKEN_CACHE_PREFERRED}}"
+else
+  _ensure_writable_env_dir TIKTOKEN_CACHE_DIR "${OC_RUNTIME_CACHE_ROOT}/tiktoken"
+fi
 echo "[cache] OC_RUNTIME_CACHE_ROOT=${OC_RUNTIME_CACHE_ROOT}"
 echo "[cache] HF_HUB_CACHE=${HF_HUB_CACHE}"
 echo "[cache] HF_MODULES_CACHE=${HF_MODULES_CACHE}"
+echo "[cache] TIKTOKEN_CACHE_DIR=${TIKTOKEN_CACHE_DIR}"
 
 # --------------------------
 # Eval runner knobs
 # --------------------------
 export BACKEND="${BACKEND:-lmdeploy}"
-export CONDA_ENV="${CONDA_ENV:-oc}"
+REQUIRE_IMAGE_ENV="${REQUIRE_IMAGE_ENV:-0}"            # 1: disallow user conda override; require image env
+case "${REQUIRE_IMAGE_ENV}" in
+  0|1) ;;
+  *) _die "Invalid REQUIRE_IMAGE_ENV=${REQUIRE_IMAGE_ENV} (expected: 0|1)" ;;
+esac
+
+_default_conda_env="oc"
+if [[ "${REQUIRE_IMAGE_ENV}" == "1" ]]; then
+  _default_conda_env="none"
+fi
+export CONDA_ENV="${CONDA_ENV:-${_default_conda_env}}"
 CONDA_SH="${CONDA_SH:-/mnt/shared-storage-user/liuhongwei/miniconda3/etc/profile.d/conda.sh}"
+if [[ "${REQUIRE_IMAGE_ENV}" == "1" && "${CONDA_ENV}" != "none" ]]; then
+  _die "REQUIRE_IMAGE_ENV=1 forbids CONDA_ENV=${CONDA_ENV} (would override image env). Set CONDA_ENV=none."
+fi
 if [[ "${CONDA_ENV}" != "none" ]]; then
   [[ -f "${CONDA_SH}" ]] || _die "conda.sh not found at ${CONDA_SH} (set CONDA_ENV=none to skip activation)"
   # shellcheck disable=SC1090
@@ -198,7 +224,17 @@ if [[ "${CONDA_ENV}" != "none" ]]; then
   conda activate "${CONDA_ENV}"
 fi
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+OC_SUMMARY_PYTHON="${OC_SUMMARY_PYTHON:-/mnt/shared-storage-user/liuhongwei/miniconda3/envs/oc/bin/python}"
+if [[ ! -x "${OC_SUMMARY_PYTHON}" ]]; then
+  OC_SUMMARY_PYTHON="${PYTHON_BIN}"
+fi
 echo "[env] conda_env=${CONDA_ENV} python=$("${PYTHON_BIN}" -c 'import sys; print(sys.executable)')"
+echo "[env] oc_summary_python=${OC_SUMMARY_PYTHON}"
+
+if [[ "${REQUIRE_IMAGE_ENV}" == "1" ]]; then
+  "${PYTHON_BIN}" "${REPO_ROOT}/scripts/assert_oc_image_env.py" --require-image-env >/dev/null
+  echo "[env] image_env_guard=ok (no user conda override detected)"
+fi
 
 export USE_VERIFIER_SYSTEM_PROMPT="${USE_VERIFIER_SYSTEM_PROMPT:-1}"
 export ONLINE_MATH_PROMPT="${ONLINE_MATH_PROMPT:-0}"
@@ -208,9 +244,15 @@ export LMDEPLOY_SESSION_LEN="${LMDEPLOY_SESSION_LEN:-65536}"
 export TEMPERATURE="${TEMPERATURE:-0.7}"
 export TOP_P="${TOP_P:-1.0}"
 export TOP_K="${TOP_K:-40}"
+_USER_ACTOR_API_MODE="${ACTOR_API_MODE:-}"
+_USER_ACTOR_DISABLE_THINKING="${ACTOR_DISABLE_THINKING:-}"
+_USER_ACTOR_OC_REQUEST_EXACT="${ACTOR_OC_REQUEST_EXACT:-}"
 export ACTOR_TRANSPORT="${ACTOR_TRANSPORT:-openai}"     # openai|pipeline
 export ACTOR_API_BASE="${ACTOR_API_BASE:-}"
+export ACTOR_API_KEY="${ACTOR_API_KEY:-}"
 export ACTOR_API_TIMEOUT="${ACTOR_API_TIMEOUT:-600}"
+export ACTOR_OPENAI_CLIENT="${ACTOR_OPENAI_CLIENT:-oc_sdk}"
+export ACTOR_OC_REPO_PARENT="${ACTOR_OC_REPO_PARENT:-/mnt/shared-storage-user/auto-eval-pipeline/opencompass@f1e50d4}"
 export ACTOR_API_MODE="${ACTOR_API_MODE:-auto}"        # auto|completions|chat
 export START_ACTOR_API_SERVER="${START_ACTOR_API_SERVER:-0}"
 export ACTOR_API_PORT="${ACTOR_API_PORT:-0}"
@@ -220,11 +262,36 @@ export ACTOR_API_EXTRA_CLI="${ACTOR_API_EXTRA_CLI:-}"
 export ACTOR_SERVER_POOL="${ACTOR_SERVER_POOL:-auto}"  # auto|0|1
 export ACTOR_API_PORT_BASE="${ACTOR_API_PORT_BASE:-0}"
 export ACTOR_DISABLE_THINKING="${ACTOR_DISABLE_THINKING:-0}"
+export ACTOR_OC_REQUEST_EXACT="${ACTOR_OC_REQUEST_EXACT:-0}"
+export TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 OC_ALIGN_STRICT="${OC_ALIGN_STRICT:-1}"                # 1: fail fast when OC alignment preconditions are broken
 case "${OC_ALIGN_STRICT}" in
   0|1) ;;
   *) _die "Invalid OC_ALIGN_STRICT=${OC_ALIGN_STRICT} (expected: 0|1)" ;;
 esac
+
+if [[ "${OC_ALIGN_STRICT}" == "1" ]]; then
+  # OpenCompass OpenAISDK in this setup is chat-style and does not pass extra_body.enable_thinking.
+  if [[ -z "${ACTOR_API_KEY}" ]]; then
+    export ACTOR_API_KEY="sk-admin"
+  fi
+  if [[ "${_USER_ACTOR_API_MODE}" == "" || "${ACTOR_API_MODE}" == "auto" ]]; then
+    export ACTOR_API_MODE="chat"
+  fi
+  if [[ "${_USER_ACTOR_DISABLE_THINKING}" == "" ]]; then
+    export ACTOR_DISABLE_THINKING=1
+  fi
+  if [[ "${_USER_ACTOR_OC_REQUEST_EXACT}" == "" ]]; then
+    export ACTOR_OC_REQUEST_EXACT=1
+  fi
+  if [[ "${START_ACTOR_API_SERVER}" == "1" && -z "${ACTOR_API_EXTRA_CLI}" ]]; then
+    export ACTOR_API_EXTRA_CLI="--backend pytorch --session-len ${MAX_SEQ_LEN} --max-batch-size 1024"
+  fi
+  if [[ -z "${TOKENIZER_PATH}" ]]; then
+    _die "OC_ALIGN_STRICT=1 requires TOKENIZER_PATH for auditable tokenizer parity (expected OC tokenizer_path)."
+  fi
+  [[ -d "${TOKENIZER_PATH}" ]] || _die "TOKENIZER_PATH not found: ${TOKENIZER_PATH}"
+fi
 
 if [[ "${ACTOR_TRANSPORT}" == "openai" && "${START_ACTOR_API_SERVER}" != "1" && -z "${ACTOR_API_BASE}" ]]; then
   echo "[auto] ACTOR_TRANSPORT=openai but ACTOR_API_BASE is empty; auto enable START_ACTOR_API_SERVER=1"
@@ -234,6 +301,10 @@ case "${ACTOR_API_MODE}" in
   auto|completions|chat) ;;
   *) _die "Invalid ACTOR_API_MODE=${ACTOR_API_MODE} (expected: auto|completions|chat)" ;;
 esac
+if [[ "${OC_ALIGN_STRICT}" == "1" ]]; then
+  [[ "${ACTOR_API_MODE}" == "chat" ]] || _die "OC_ALIGN_STRICT=1 requires ACTOR_API_MODE=chat."
+  [[ "${ACTOR_DISABLE_THINKING}" == "1" ]] || _die "OC_ALIGN_STRICT=1 requires ACTOR_DISABLE_THINKING=1."
+fi
 case "${ACTOR_SERVER_POOL}" in
   auto|0|1) ;;
   *) _die "Invalid ACTOR_SERVER_POOL=${ACTOR_SERVER_POOL} (expected: auto|0|1)" ;;
@@ -331,6 +402,7 @@ BUILD_DS_PY="${REPO_ROOT}/scripts/build_oc_dataset_jsonl.py"
 SUM_CV_PYK="${REPO_ROOT}/scripts/summarize_passk_cv_scored_jsonl.py"
 SUM_DIAG_PY="${REPO_ROOT}/scripts/summarize_generation_diagnostics.py"
 SUM_OC_PY="${REPO_ROOT}/scripts/summarize_oc_cascade_metrics.py"
+DIFF_OC_PY="${REPO_ROOT}/scripts/compare_offline_run_with_oc_predictions.py"
 REPORT_PY="${REPO_ROOT}/scripts/report_offline_alignment.py"
 
 [[ -f "${RUNNER_SH}" ]] || _die "Missing runner: ${RUNNER_SH}"
@@ -338,6 +410,7 @@ REPORT_PY="${REPO_ROOT}/scripts/report_offline_alignment.py"
 [[ -f "${SUM_CV_PYK}" ]] || _die "Missing script: ${SUM_CV_PYK}"
 [[ -f "${SUM_DIAG_PY}" ]] || _die "Missing script: ${SUM_DIAG_PY}"
 [[ -f "${SUM_OC_PY}" ]] || _die "Missing script: ${SUM_OC_PY}"
+[[ -f "${DIFF_OC_PY}" ]] || _die "Missing script: ${DIFF_OC_PY}"
 [[ -f "${REPORT_PY}" ]] || _die "Missing script: ${REPORT_PY}"
 
 # --------------------------
@@ -347,6 +420,11 @@ DATASETS="${DATASETS:-GPQA_diamond,aime2024,aime2025}"
 DATASETS="${DATASETS// /,}"
 read -r -a DATASET_ARR <<<"${DATASETS//,/ }"
 [[ "${#DATASET_ARR[@]}" -gt 0 ]] || _die "Empty DATASETS (supported: GPQA_diamond,aime2024,aime2025)"
+
+AIME2024_PATH_OVERRIDE="${AIME2024_PATH_OVERRIDE:-}"
+if [[ -n "${AIME2024_PATH_OVERRIDE}" ]]; then
+  [[ -f "${AIME2024_PATH_OVERRIDE}" ]] || _die "AIME2024_PATH_OVERRIDE not found: ${AIME2024_PATH_OVERRIDE}"
+fi
 
 _want_ds() {
   local want="$1"
@@ -374,9 +452,14 @@ if _want_ds "GPQA_diamond"; then
     --out-jsonl "${DATASET_DIR}/GPQA_diamond.jsonl" >/dev/null
 fi
 if _want_ds "aime2024"; then
-  "${PYTHON_BIN}" "${BUILD_DS_PY}" \
-    --oc-root "${OC_ROOT}" --pred-abbr "${OC_PRED_ABBR}" --dataset aime2024 \
-    --out-jsonl "${DATASET_DIR}/aime2024.jsonl" >/dev/null
+  if [[ -n "${AIME2024_PATH_OVERRIDE}" ]]; then
+    cp -f "${AIME2024_PATH_OVERRIDE}" "${DATASET_DIR}/aime2024.jsonl"
+    echo "[oc] aime2024 override -> ${DATASET_DIR}/aime2024.jsonl (src=${AIME2024_PATH_OVERRIDE})"
+  else
+    "${PYTHON_BIN}" "${BUILD_DS_PY}" \
+      --oc-root "${OC_ROOT}" --pred-abbr "${OC_PRED_ABBR}" --dataset aime2024 \
+      --out-jsonl "${DATASET_DIR}/aime2024.jsonl" >/dev/null
+  fi
 fi
 if _want_ds "aime2025"; then
   "${PYTHON_BIN}" "${BUILD_DS_PY}" \
@@ -505,22 +588,24 @@ _run_one() {
   echo "============================================================"
   echo "[run] dataset=${dataset} arm=${arm} mode=${mode_arm} repeat=${repeat}"
   echo "[run] out_root=${OUT_ROOT} tag=${tag} run_id=${run_id}"
-  echo "[run] actor_transport=${ACTOR_TRANSPORT} actor_api_model=${ACTOR_API_MODEL:-<auto>} actor_api_mode=${ACTOR_API_MODE} actor_server_pool=${ACTOR_SERVER_POOL} token_check_interval=${interval_arm} resume_from_tmp=${RESUME_FROM_TMP} do_cv=${DO_CV_EVAL_RUN}"
+  echo "[run] actor_transport=${ACTOR_TRANSPORT} actor_api_model=${ACTOR_API_MODEL:-<auto>} actor_api_mode=${ACTOR_API_MODE} actor_openai_client=${ACTOR_OPENAI_CLIENT} actor_disable_thinking=${ACTOR_DISABLE_THINKING} actor_oc_request_exact=${ACTOR_OC_REQUEST_EXACT} actor_server_pool=${ACTOR_SERVER_POOL} token_check_interval=${interval_arm} tokenizer_path=${TOKENIZER_PATH:-<base-model>} resume_from_tmp=${RESUME_FROM_TMP} do_cv=${DO_CV_EVAL_RUN}"
 
   OUT_ROOT="${OUT_ROOT}" TAG="${tag}" RUN_ID="${run_id}" \
   DATA_JSONL="${jsonl}" PROMPT_KEY="question" REPEAT="${repeat}" \
   MODE="${mode_arm}" TOKEN_CHECK_INTERVAL="${interval_arm}" \
   DO_CV_EVAL="${DO_CV_EVAL_RUN}" \
-  ACTOR_TRANSPORT="${ACTOR_TRANSPORT}" ACTOR_API_BASE="${ACTOR_API_BASE}" \
+  ACTOR_TRANSPORT="${ACTOR_TRANSPORT}" ACTOR_API_BASE="${ACTOR_API_BASE}" ACTOR_API_KEY="${ACTOR_API_KEY}" \
   ACTOR_API_MODEL="${ACTOR_API_MODEL}" \
   ACTOR_API_MODE="${ACTOR_API_MODE}" \
-  ACTOR_API_TIMEOUT="${ACTOR_API_TIMEOUT}" \
+  ACTOR_API_TIMEOUT="${ACTOR_API_TIMEOUT}" ACTOR_OPENAI_CLIENT="${ACTOR_OPENAI_CLIENT}" ACTOR_OC_REPO_PARENT="${ACTOR_OC_REPO_PARENT}" \
   START_ACTOR_API_SERVER="${START_ACTOR_API_SERVER}" \
   ACTOR_API_PORT="${ACTOR_API_PORT}" ACTOR_API_TP="${ACTOR_API_TP}" \
   ACTOR_API_WORKER_NUM="${ACTOR_API_WORKER_NUM}" \
   ACTOR_API_EXTRA_CLI="${ACTOR_API_EXTRA_CLI}" \
   ACTOR_SERVER_POOL="${ACTOR_SERVER_POOL}" ACTOR_API_PORT_BASE="${ACTOR_API_PORT_BASE}" \
   ACTOR_DISABLE_THINKING="${ACTOR_DISABLE_THINKING}" \
+  ACTOR_OC_REQUEST_EXACT="${ACTOR_OC_REQUEST_EXACT}" \
+  TOKENIZER_PATH="${TOKENIZER_PATH}" \
   RESUME_FROM_TMP="${RESUME_FROM_TMP}" \
   bash "${RUNNER_SH}"
 
@@ -593,7 +678,26 @@ _run_one() {
     if [[ -n "${OC_EVAL_CONFIG}" ]]; then
       oc_args+=(--oc-eval-config "${OC_EVAL_CONFIG}")
     fi
-    "${PYTHON_BIN}" "${SUM_OC_PY}" "${oc_args[@]}" >/dev/null
+    "${OC_SUMMARY_PYTHON}" "${SUM_OC_PY}" "${oc_args[@]}" >/dev/null
+
+    if [[ "${DO_OC_PRED_DIFF}" == "1" && -n "${OC_PRED_ABBR}" ]]; then
+      local oc_diff_json="${run_dir}/oc_pred_diff.${arm}.json"
+      local oc_diff_jsonl="${run_dir}/oc_pred_diff_top.${arm}.jsonl"
+      if ! "${PYTHON_BIN}" "${DIFF_OC_PY}" \
+        --in-jsonl "${run_dir}/merged.jsonl" \
+        --dataset "${dataset}" \
+        --side "${side_arm}" \
+        --oc-root "${OC_ROOT}" \
+        --oc-pred-abbr "${OC_PRED_ABBR}" \
+        --prompt-key "question" \
+        --answer-key "answer" \
+        --top-diff-n "${OC_DIFF_TOP_N}" \
+        --out-json "${oc_diff_json}" \
+        --out-jsonl "${oc_diff_jsonl}" >/dev/null
+      then
+        echo "[warn] skip oc prediction diff for ${dataset}/${arm}" >&2
+      fi
+    fi
   fi
 }
 
@@ -631,7 +735,7 @@ done
 
 [[ "${#REPORT_RUN_ARGS[@]}" -gt 0 ]] || _die "No runs completed; nothing to report."
 
-"${PYTHON_BIN}" "${REPORT_PY}" \
+"${OC_SUMMARY_PYTHON}" "${REPORT_PY}" \
   --oc-root "${OC_ROOT}" \
   --oc-model-abbr "${OC_RES_ABBR}" \
   "${REPORT_RUN_ARGS[@]}" \
